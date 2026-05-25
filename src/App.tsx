@@ -1,0 +1,1713 @@
+import { useCallback, useEffect, useRef, useState } from "react";
+
+/** Run `fn` exactly once for the lifetime of this module. We can't use a
+ *  React ref because StrictMode unmounts/remounts; we need a process-wide
+ *  guard so the second mount becomes a no-op. */
+let _bootStarted: Promise<void> | null = null;
+function bootOnce(fn: () => Promise<void>): Promise<void> {
+  if (!_bootStarted) _bootStarted = fn();
+  return _bootStarted;
+}
+
+/**
+ * Walk all known diagnostics in a deterministic order (uri then position),
+ * pick the next/previous one relative to the current editor cursor, and
+ * jump to it. Used by F8 / Shift+F8 so the user can sweep through problems
+ * with keyboard only — the same gesture VS Code's Problem nav uses.
+ */
+/** Polyfill for crypto.randomUUID when running in older webviews
+ *  that don't expose it (rare on modern Tauri, but cheap to keep). */
+function fallbackUuid(): string {
+  const rnd = () => Math.floor(Math.random() * 0xffff).toString(16).padStart(4, "0");
+  return `${rnd()}${rnd()}-${rnd()}-${rnd()}-${rnd()}-${rnd()}${rnd()}${rnd()}`;
+}
+
+function navigateProblem(direction: "next" | "prev") {
+  const byUri = useDiagnostics.getState().byUri;
+  const flat: Diagnostic[] = [];
+  for (const list of Object.values(byUri)) flat.push(...list);
+  if (flat.length === 0) {
+    void import("@/components/Toast").then(({ toast }) =>
+      toast.info("No problems to navigate"),
+    );
+    return;
+  }
+  flat.sort((a, b) => {
+    if (a.uri !== b.uri) return a.uri.localeCompare(b.uri);
+    if (a.startLine !== b.startLine) return a.startLine - b.startLine;
+    return a.startCol - b.startCol;
+  });
+  const ed = useEditorStore.getState();
+  const current = ed.cursor;
+  const activeUri = ed.activePath ? `file://${ed.activePath}` : null;
+  // Find the diagnostic strictly after / before the current cursor;
+  // when none qualify, wrap around to the first / last so the
+  // shortcut always lands somewhere useful.
+  let target: Diagnostic | null = null;
+  if (direction === "next") {
+    target =
+      flat.find((d) =>
+        activeUri && current
+          ? d.uri === activeUri
+            ? d.startLine > current.line ||
+              (d.startLine === current.line && d.startCol > current.column)
+            : d.uri > activeUri
+          : true,
+      ) ?? flat[0]!;
+  } else {
+    const reversed = [...flat].reverse();
+    target =
+      reversed.find((d) =>
+        activeUri && current
+          ? d.uri === activeUri
+            ? d.startLine < current.line ||
+              (d.startLine === current.line && d.startCol < current.column)
+            : d.uri < activeUri
+          : true,
+      ) ?? reversed[0]!;
+  }
+  if (!target) return;
+  const path = target.uri
+    .replace(/^file:\/\//, "")
+    .replace(/^\/([A-Za-z]):/, "$1:");
+  useEditorStore
+    .getState()
+    .revealAt(path, target.startLine, target.startCol)
+    .catch(() => {});
+}
+import { Clock, Folder, Sparkles, X } from "lucide-react";
+import { Titlebar } from "@/components/Titlebar";
+import { FileTree } from "@/components/FileTree";
+import { Outline } from "@/components/Outline";
+import { Tabs } from "@/components/Tabs";
+import { Breadcrumbs } from "@/components/Breadcrumbs";
+import { Editor } from "@/components/Editor";
+import { DiffView } from "@/components/DiffView";
+import { OpenRecentPicker } from "@/components/OpenRecentPicker";
+import { MarkdownView } from "@/components/MarkdownView";
+import { WorkspaceSymbols } from "@/components/WorkspaceSymbols";
+import { NotificationCenter } from "@/components/NotificationCenter";
+import { TasksPicker } from "@/components/TasksPicker";
+import { BookmarksPicker } from "@/components/BookmarksPicker";
+import { LanguagePicker } from "@/components/LanguagePicker";
+import { TerminalPanel } from "@/components/Terminal/TerminalPanel";
+import { useTerminals, nextTerminalTitle } from "@/store/terminal";
+import { ProblemsPanel } from "@/components/Problems/ProblemsPanel";
+import { StatusBar } from "@/components/StatusBar";
+import { CommandPalette } from "@/components/CommandPalette";
+import { FileFinder } from "@/components/FileFinder";
+import { FindInFiles } from "@/components/FindInFiles";
+import { Onboarding } from "@/components/Onboarding/Wizard";
+import { RightDock } from "@/components/RightDock";
+import { SystemMonitor } from "@/components/SystemMonitor";
+import { ShortcutsHelp } from "@/components/ShortcutsHelp";
+import { SettingsPage } from "@/components/SettingsPage";
+import { ToastHost, toast } from "@/components/Toast";
+import { RefactorSuggestion } from "@/components/RefactorSuggestion";
+import { createRefactorWatcher } from "@/lib/refactorWatcher";
+import { useWorkspace } from "@/store/workspace";
+import { useGit } from "@/store/git";
+import {
+  useSettings,
+  isFeatureUsable,
+  featureBlockReason,
+  effectiveAssignedModel,
+} from "@/store/settings";
+import { useEditorStore, autoSaveOnFocusLoss } from "@/store/editor";
+import { useDiffViewer } from "@/store/diffViewer";
+import { useDiagnostics, type Diagnostic } from "@/store/diagnostics";
+import { useSession } from "@/store/session";
+import { useAssistant } from "@/store/assistant";
+import { dispatchAction, onAction, type ActionId } from "@/lib/actions";
+import { ipc, listenEvent } from "@/lib/ipc";
+import { useConfirm, ConfirmModalHost } from "@/components/Confirm";
+import { open as shellOpen } from "@tauri-apps/plugin-shell";
+
+export default function App() {
+  const [showPalette, setShowPalette] = useState(false);
+  const [showFinder, setShowFinder] = useState(false);
+  const [showFindInFiles, setShowFindInFiles] = useState(false);
+  const [showMonitor, setShowMonitor] = useState(false);
+  const [showProblems, setShowProblems] = useState(false);
+  const [showOnboarding, setShowOnboarding] = useState(false);
+  const [showShortcutsHelp, setShowShortcutsHelp] = useState(false);
+  const [showSettings, setShowSettings] = useState(false);
+  const [showOpenRecent, setShowOpenRecent] = useState(false);
+  const [showWorkspaceSymbols, setShowWorkspaceSymbols] = useState(false);
+  const [showNotifications, setShowNotifications] = useState(false);
+  const [showTasks, setShowTasks] = useState(false);
+  const [showBookmarks, setShowBookmarks] = useState(false);
+  const [showLanguagePicker, setShowLanguagePicker] = useState(false);
+  const [sidebarView, setSidebarView] = useState<"files" | "outline">("files");
+  // Markdown preview state keyed by tab path. Each file picks its own
+  // mode independently: "preview" = full pane, "split" = source +
+  // preview side by side. `null` (or absent) means "show source only".
+  const [mdPreview, setMdPreview] = useState<Record<string, "preview" | "split" | null>>({});
+
+  const initSettings = useSettings((s) => s.init);
+  const markOnboarded = useSettings((s) => s.markOnboarded);
+  const settingsHydrated = useSettings((s) => s.hydrated);
+  const reduceMotion = useSettings((s) => s.reduceMotion);
+  const appTheme = useSettings((s) => s.appTheme);
+
+  // Apply two body-level flags so global CSS can react: the
+  // reduce-motion flag suppresses transitions everywhere, and the
+  // theme flag swaps the color palette (Pointer Noir vs Light).
+  useEffect(() => {
+    const cls = document.body.classList;
+    cls.toggle("pn-reduce-motion", !!reduceMotion);
+    if (appTheme === "light") {
+      cls.add("pn-theme-light");
+      cls.remove("pn-theme-noir");
+    } else {
+      cls.add("pn-theme-noir");
+      cls.remove("pn-theme-light");
+    }
+  }, [reduceMotion, appTheme]);
+
+  const initSession = useSession((s) => s.init);
+  const sessionHydrated = useSession((s) => s.hydrated);
+  const dockView = useSession((s) => s.dockView);
+  const noteDockView = useSession((s) => s.noteDockView);
+  const recents = useSession((s) => s.recents);
+  const removeRecent = useSession((s) => s.removeRecent);
+  const treeCollapsed = useSession((s) => s.treeCollapsed);
+  const zenMode = useSession((s) => s.zenMode ?? false);
+  const noteTreeCollapsed = useSession((s) => s.noteTreeCollapsed);
+  const fileTreeWidth = useSession((s) => s.fileTreeWidth);
+
+  // ⌘L toggles the unified Assistant view; ⌘, toggles AI control view.
+  // If the dock is collapsed (or showing a different view) the toggle
+  // expands to the requested view first.
+  const toggleDockView = (target: "assistant" | "history" | "ai") => {
+    noteDockView(dockView === target ? null : target);
+  };
+  const showDockView = (target: "assistant" | "history" | "ai") => {
+    if (dockView !== target) noteDockView(target);
+  };
+
+  const root = useWorkspace((s) => s.root);
+  const setRoot = useWorkspace((s) => s.setRoot);
+  const openFolder = useWorkspace((s) => s.openFolder);
+
+  const openFile = useEditorStore((s) => s.openFile);
+  const setActive = useEditorStore((s) => s.setActive);
+  const saveActive = useEditorStore((s) => s.saveActive);
+  const saveAll = useEditorStore((s) => s.saveAll);
+  const setFimEnabled = useSettings((s) => s.setFimEnabled);
+  const setChatEnabled = useSettings((s) => s.setChatEnabled);
+  const setAgentEnabled = useSettings((s) => s.setAgentEnabled);
+  const setInlineEditEnabled = useSettings((s) => s.setInlineEditEnabled);
+  const setIndexingEnabled = useSettings((s) => s.setIndexingEnabled);
+
+  const askConfirm = useConfirm();
+
+  // Boot sequence: hydrate persisted state, restore session, then decide whether
+  // to show the onboarding wizard.
+  //
+  // React StrictMode runs effects twice in dev — both invocations would race
+  // through `openFile(path)`, both pass the "tab already open?" check before
+  // either has set state, and we'd end up with the same file tabbed twice. A
+  // module-level boot promise pins this to exactly one execution.
+  useEffect(() => {
+    bootOnce(async () => {
+      await Promise.all([initSettings(), initSession()]);
+      // Restore bookmarks lazily — they're orthogonal to the
+      // session boot path, so we don't block hydrate-readiness on
+      // them. Worst case the gutter glyphs flash in a tick late.
+      void (async () => {
+        try {
+          const { useBookmarks } = await import("@/store/bookmarks");
+          await useBookmarks.getState().init();
+        } catch {
+          /* persistence missing — ignore */
+        }
+      })();
+      // Honour the user's autostart preference: only fire the daemon when
+      // they've opted in. The Ollama status poll will reflect either way.
+      try {
+        const st = useSettings.getState();
+        if (st.ollamaAutostart && !st.ollamaReady) {
+          ipc.ollamaStart().catch(() => {
+            /* surfaced via status poll + AI panel */
+          });
+        }
+      } catch {
+        /* ignore */
+      }
+      const sess = useSession.getState();
+      if (sess.root) {
+        try {
+          await setRoot(sess.root);
+          // Dedup paths before replay in case a stale session.v1 wrote
+          // duplicates from before this fix shipped.
+          const seen = new Set<string>();
+          for (const p of sess.openTabs ?? []) {
+            if (!p || seen.has(p)) continue;
+            seen.add(p);
+            try {
+              await openFile(p);
+            } catch {
+              /* file may have been deleted while we were gone */
+            }
+          }
+          if (sess.activePath) setActive(sess.activePath);
+        } catch (e) {
+          console.warn("session restore failed", e);
+        }
+      }
+      if (!useSettings.getState().onboarded) setShowOnboarding(true);
+    });
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  // Git status: track the open workspace and poll on a coarse interval.
+  // The poll is deliberately slow (5s) because the FileTree dot only needs
+  // soft-real-time accuracy. Explicit refreshes happen on save and on
+  // window focus so the user always sees an up-to-date dot after their
+  // own actions.
+  useEffect(() => {
+    const git = useGit.getState();
+    git.setWorkspace(root || "");
+    if (!root) return;
+    const id = window.setInterval(() => {
+      useGit.getState().refresh();
+    }, 5000);
+    const onFocus = () => useGit.getState().refresh();
+    window.addEventListener("focus", onFocus);
+    return () => {
+      window.clearInterval(id);
+      window.removeEventListener("focus", onFocus);
+    };
+  }, [root]);
+
+  // Also refresh git status whenever the editor finishes a save. That's
+  // the single highest-signal moment for "the dirty set probably changed",
+  // and far cheaper than reacting to every fs:change event from the watcher.
+  useEffect(() => {
+    const unsub = useEditorStore.subscribe((state, prev) => {
+      // Compare the count of dirty tabs to detect clean->dirty transitions
+      // and save events (dirty->clean). Either way we want to re-poll git.
+      const a = state.tabs.filter((t) => t.dirty).length;
+      const b = prev.tabs.filter((t) => t.dirty).length;
+      if (a !== b) useGit.getState().refresh();
+    });
+    return unsub;
+  }, []);
+
+  // Refactor watcher: listens for editor content changes and, when
+  // the user pauses typing, asks "did you just rename a single
+  // identifier?". If so + the rest of the workspace still references
+  // the old name, we surface a "apply rename everywhere?" card. The
+  // watcher is constructed once and torn down on unmount.
+  useEffect(() => {
+    const watcher = createRefactorWatcher({
+      search: (q, l) => ipc.searchText(q, l),
+    });
+    const unsub = useEditorStore.subscribe((state, prev) => {
+      // Find tabs whose content changed since the previous state.
+      // We diff the maps cheaply by walking the new tabs and
+      // comparing pointers / content.
+      const prevByPath = new Map(prev.tabs.map((t) => [t.path, t.content]));
+      for (const tab of state.tabs) {
+        const before = prevByPath.get(tab.path);
+        if (before === tab.content) continue;
+        watcher.observe(tab.path, tab.content);
+      }
+    });
+    return () => {
+      unsub();
+      watcher.dispose();
+    };
+  }, []);
+
+  /**
+   * Spawn a terminal in the workspace root with a default title. Lives at
+   * App scope because the ⌘` shortcut, the View menu, and the empty-state
+   * button all call into the same code path.
+   */
+  const spawnTerminalFromShortcut = useCallback(async () => {
+    const ws = useWorkspace.getState().root;
+    const { id, title } = nextTerminalTitle();
+    try {
+      const result = await ipc.terminalOpen(id, ws, 100, 24);
+      useTerminals.getState().add({
+        id,
+        title,
+        shell: result.shell,
+        cwd: ws || "",
+        exited: false,
+        exitCode: null,
+      });
+    } catch (e: any) {
+      toast.error(`Failed to start terminal: ${e?.message ?? e}`);
+    }
+  }, []);
+
+  /** Close the active tab; if dirty, prompt to save / discard. */
+  const closeActiveTab = useCallback(async () => {
+    const editor = useEditorStore.getState();
+    const tab = editor.tabs.find((t) => t.path === editor.activePath);
+    if (!tab) return;
+    if (tab.dirty) {
+      const save = await askConfirm({
+        title: `Save changes to ${tab.name}?`,
+        body: "This file has unsaved edits. Closing without saving will lose them.",
+        confirmLabel: "Save & close",
+        cancelLabel: "Discard",
+      });
+      if (save) {
+        await editor.saveActive();
+      }
+      // Cancel here means "discard and close" — the user chose the secondary
+      // path on a save-flavoured confirm. Either way, we proceed to close.
+    }
+    editor.closeTab(tab.path);
+  }, [askConfirm]);
+
+  /** ⌘K chord state. After ⌘K is pressed without a follow-up
+   *  modifier, we enter "chord mode" and wait up to 1.5s for a
+   *  second keystroke. This mirrors VS Code's binding semantics so
+   *  shortcuts like ⌘K Z (Zen), ⌘K ⌘S (Keyboard Shortcuts), etc.
+   *  feel natural to users coming from VS Code. */
+  const chordTimerRef = useRef<number | null>(null);
+  const inChordRef = useRef<boolean>(false);
+  const clearChord = useCallback(() => {
+    inChordRef.current = false;
+    if (chordTimerRef.current != null) {
+      window.clearTimeout(chordTimerRef.current);
+      chordTimerRef.current = null;
+    }
+  }, []);
+  const armChord = useCallback(() => {
+    inChordRef.current = true;
+    if (chordTimerRef.current != null)
+      window.clearTimeout(chordTimerRef.current);
+    chordTimerRef.current = window.setTimeout(clearChord, 1500);
+  }, [clearChord]);
+
+  const handleKey = useCallback(
+    (e: KeyboardEvent) => {
+      const mod = e.metaKey || e.ctrlKey;
+      // Chord-second-key handling first. Once armed, we consume the
+      // next non-modifier keypress regardless of whether it matches
+      // a known chord — that's what users expect; otherwise the
+      // editor would receive a stray Z, M, etc.
+      if (inChordRef.current) {
+        if (e.key === "Shift" || e.key === "Meta" || e.key === "Control" || e.key === "Alt") {
+          return;
+        }
+        e.preventDefault();
+        const k = e.key.toLowerCase();
+        clearChord();
+        if (k === "z") dispatchAction("view:toggle_zen");
+        else if (k === "s" && !e.shiftKey)
+          dispatchAction("file:save_without_formatting");
+        else if (k === "s" && e.shiftKey) dispatchAction("help:shortcuts");
+        else if (k === "m") dispatchAction("view:toggle_minimap");
+        else if (k === "w") dispatchAction("view:toggle_word_wrap");
+        else if (k === "t") dispatchAction("view:toggle_terminal");
+        else if (k === "o") openFolder();
+        // Any other key just consumes the chord and is a no-op.
+        return;
+      }
+      if (mod && !e.shiftKey && !e.altKey && (e.key === "k" || e.key === "K")) {
+        // Arm the ⌘K chord. We don't preventDefault here for the
+        // first keystroke — Monaco needs to know if the user
+        // actually meant a single-stroke ⌘K (delete line in some
+        // bindings) — but we set up a window to capture the next
+        // key globally.
+        e.preventDefault();
+        armChord();
+        return;
+      }
+      if (mod && e.shiftKey && (e.key === "p" || e.key === "P")) {
+        e.preventDefault();
+        setShowPalette(true);
+        setShowFinder(false);
+      } else if (mod && !e.shiftKey && (e.key === "p" || e.key === "P")) {
+        e.preventDefault();
+        setShowFinder(true);
+        setShowPalette(false);
+      } else if (mod && (e.key === "o" || e.key === "O")) {
+        e.preventDefault();
+        openFolder();
+      } else if (mod && !e.shiftKey && (e.key === "s" || e.key === "S")) {
+        e.preventDefault();
+        saveActive();
+      } else if (mod && e.altKey && (e.key === "s" || e.key === "S")) {
+        e.preventDefault();
+        saveAll();
+      } else if (mod && (e.key === "w" || e.key === "W")) {
+        e.preventDefault();
+        closeActiveTab();
+      } else if (mod && (e.key === "b" || e.key === "B")) {
+        e.preventDefault();
+        noteTreeCollapsed(!treeCollapsed);
+      } else if (mod && (e.key === "l" || e.key === "L")) {
+        e.preventDefault();
+        toggleDockView("assistant");
+      } else if (mod && e.shiftKey && e.key === ",") {
+        // ⌘⇧, → AI Control Panel. The old single-key gesture is
+        // reclaimed for the dedicated Settings page below.
+        e.preventDefault();
+        toggleDockView("ai");
+      } else if (mod && e.key === ",") {
+        // ⌘, → Settings (VS Code / macOS parity).
+        e.preventDefault();
+        setShowSettings(true);
+      } else if (mod && e.shiftKey && (e.key === "m" || e.key === "M")) {
+        e.preventDefault();
+        setShowMonitor((v) => !v);
+      } else if (mod && e.shiftKey && (e.key === "f" || e.key === "F")) {
+        e.preventDefault();
+        setShowFindInFiles((v) => !v);
+      } else if (mod && e.shiftKey && (e.key === "t" || e.key === "T")) {
+        // NOTE: ⌘J (Toggle Terminal) and ⌘` (New Terminal) used to be
+        // intercepted here too, but the native menu in
+        // `src-tauri/src/menu.rs` already registers those same
+        // accelerators. On macOS BOTH paths fire for one keystroke —
+        // the menu emits `menu:action` → action handler spawns, AND
+        // this JS keydown also runs and spawns. The two spawns race on
+        // `nextTerminalTitle()` (which reads `tabs.length === 0` both
+        // times because neither `ipc.terminalOpen` has returned yet),
+        // so the user sees two tabs both labelled "Terminal 1". The
+        // menu accelerator is now the sole path — the action handler
+        // at `onAction("view:toggle_terminal" / "view:new_terminal")`
+        // below does the right thing in both cases.
+        // ⌘⇧T — reopen the most recently closed tab. Matches every
+        // major editor and is the #1 ask after the user accidentally
+        // ⌘W's the wrong file.
+        e.preventDefault();
+        dispatchAction("tabs:reopen_closed");
+      } else if (mod && e.altKey && (e.key === "ArrowRight")) {
+        e.preventDefault();
+        dispatchAction("tabs:next");
+      } else if (mod && e.altKey && (e.key === "ArrowLeft")) {
+        e.preventDefault();
+        dispatchAction("tabs:prev");
+      } else if (mod && e.shiftKey && (e.key === "b" || e.key === "B")) {
+        // ⌘⇧B — Run task (VS Code parity for "Run Build Task").
+        e.preventDefault();
+        dispatchAction("tasks:run");
+      } else if (mod && e.altKey && (e.key === "k" || e.key === "K")) {
+        // ⌘⌥K — toggle bookmark on the current line. Modeled on the
+        // Bookmarks extension binding for VS Code; not in use
+        // elsewhere in our keymap.
+        e.preventDefault();
+        dispatchAction("bookmark:toggle");
+      } else if (mod && e.altKey && (e.key === "." || e.key === ">")) {
+        // ⌘⌥. — next bookmark in this file.
+        e.preventDefault();
+        dispatchAction("bookmark:next");
+      } else if (mod && e.altKey && (e.key === "," || e.key === "<")) {
+        // ⌘⌥, — previous bookmark in this file.
+        e.preventDefault();
+        dispatchAction("bookmark:prev");
+      } else if (mod && (e.key === "g" || e.key === "G")) {
+        e.preventDefault();
+        dispatchAction("editor:goto_line");
+      } else if (mod && e.shiftKey && (e.key === "o" || e.key === "O")) {
+        // Free up ⌘⇧O for Goto Symbol — ⌘O already opens folder.
+        e.preventDefault();
+        dispatchAction("editor:goto_symbol_file");
+      } else if (mod && (e.key === "t" || e.key === "T") && !e.shiftKey) {
+        // ⌘T — workspace symbol search (matches VS Code).
+        e.preventDefault();
+        dispatchAction("editor:goto_symbol_workspace");
+      } else if (mod && e.key === "?") {
+        // ⌘? — keyboard cheat sheet. Easier-to-reach version of the
+        // VS Code F1 / menu Help → Keyboard.
+        e.preventDefault();
+        dispatchAction("help:shortcuts");
+      } else if (mod && e.shiftKey && (e.key === "i" || e.key === "I")) {
+        // ⌘⇧I — format document (mirrors VS Code's ⇧⌥F when alt is
+        // hard to reach with the rest of the keyboard).
+        e.preventDefault();
+        dispatchAction("editor:format_document");
+      } else if (mod && (e.key === "+" || e.key === "=")) {
+        // ⌘+ (or ⌘= since "+" requires shift on US layouts) — zoom in.
+        e.preventDefault();
+        dispatchAction("view:font_zoom_in");
+      } else if (mod && e.key === "-") {
+        e.preventDefault();
+        dispatchAction("view:font_zoom_out");
+      } else if (mod && e.key === "0") {
+        e.preventDefault();
+        dispatchAction("view:font_zoom_reset");
+      } else if (e.altKey && !mod && (e.key === "z" || e.key === "Z")) {
+        // ⌥Z — toggle word wrap (VS Code parity). Skip when the
+        // editor is focused so users typing Z don't lose the toggle.
+        const target = e.target as HTMLElement | null;
+        const inField =
+          target?.tagName === "INPUT" ||
+          target?.tagName === "TEXTAREA" ||
+          (target as { isContentEditable?: boolean } | null)?.isContentEditable;
+        if (!inField) {
+          e.preventDefault();
+          dispatchAction("view:toggle_word_wrap");
+        }
+      } else if (mod && e.shiftKey && (e.key === "e" || e.key === "E")) {
+        // ⌘⇧E — focus the file tree's filter. Matches the VS Code
+        // "Focus Explorer" gesture closely enough for muscle memory.
+        e.preventDefault();
+        if (treeCollapsed) noteTreeCollapsed(false);
+        dispatchAction("tree:focus_filter");
+      } else if (mod && e.shiftKey && (e.key === "g" || e.key === "G")) {
+        // ⌘⇧G — open the Source Control panel (VS Code parity).
+        e.preventDefault();
+        dispatchAction("git:show_panel");
+      } else if (mod && (e.key === "r" || e.key === "R") && !e.shiftKey) {
+        // ⌘R — Open Recent picker (VS Code parity). The browser's
+        // "reload page" gesture has no meaning inside Tauri, so we
+        // can reclaim it.
+        e.preventDefault();
+        dispatchAction("file:open_recent");
+      } else if (e.key === "F8" && !e.shiftKey) {
+        e.preventDefault();
+        dispatchAction("editor:next_problem");
+      } else if (e.key === "F8" && e.shiftKey) {
+        e.preventDefault();
+        dispatchAction("editor:prev_problem");
+      } else if (mod && e.shiftKey && (e.key === "v" || e.key === "V")) {
+        // ⌘⇧V — toggle Markdown preview for the active file
+        // (VS Code parity). The editor knows whether the file is
+        // Markdown — non-md tabs surface a hint and a no-op.
+        e.preventDefault();
+        dispatchAction("md:toggle_preview");
+      } else if (mod && e.altKey && e.key === "[") {
+        // ⌘⌥[ — fold the section at the cursor (VS Code parity).
+        e.preventDefault();
+        dispatchAction("editor:fold");
+      } else if (mod && e.altKey && e.key === "]") {
+        // ⌘⌥] — unfold at the cursor.
+        e.preventDefault();
+        dispatchAction("editor:unfold");
+      } else if (e.ctrlKey && !e.metaKey && !e.shiftKey && e.key === "-") {
+        // Ctrl+- — navigate back through cursor history (VS Code parity
+        // on macOS; we use Ctrl on all platforms because Alt-Left is
+        // already wired to "move word" inside Monaco).
+        e.preventDefault();
+        dispatchAction("editor:nav_back");
+      } else if (e.ctrlKey && !e.metaKey && e.shiftKey && e.key === "_") {
+        // Ctrl+Shift+- — forward through history. `_` is the shifted
+        // form of `-` on US keyboards, so we match either form.
+        e.preventDefault();
+        dispatchAction("editor:nav_forward");
+      } else if (e.ctrlKey && !e.metaKey && e.shiftKey && e.key === "-") {
+        e.preventDefault();
+        dispatchAction("editor:nav_forward");
+      } else if (e.key === "Escape") {
+        setShowPalette(false);
+        setShowFinder(false);
+        setShowFindInFiles(false);
+        // Close the diff overlay too — Esc is the standard close
+        // gesture and the user expects it to work uniformly across
+        // every transient surface.
+        if (useDiffViewer.getState().spec) {
+          useDiffViewer.getState().close();
+        }
+      }
+    },
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [openFolder, saveActive, saveAll, closeActiveTab, dockView, treeCollapsed],
+  );
+
+  useEffect(() => {
+    window.addEventListener("keydown", handleKey);
+    return () => window.removeEventListener("keydown", handleKey);
+  }, [handleKey]);
+
+  // Auto-save on focus loss when the user opts in. The blur event
+  // fires for every tab/dock change inside the window too, but we
+  // gate inside autoSaveOnFocusLoss on the persisted setting so
+  // unrelated focus juggling is cheap (one settings read).
+  useEffect(() => {
+    const onBlur = () => {
+      autoSaveOnFocusLoss().catch(() => {});
+    };
+    window.addEventListener("blur", onBlur);
+    return () => window.removeEventListener("blur", onBlur);
+  }, []);
+
+  // Native OS drag-and-drop. The Tauri window event gives us absolute
+  // paths (HTML5 dnd does not), which is what we need to open files
+  // and folders. Heuristic: a single folder = open as workspace,
+  // otherwise open every dropped file in a tab.
+  useEffect(() => {
+    let unlisten: undefined | (() => void);
+    void (async () => {
+      try {
+        const { getCurrentWindow } = await import("@tauri-apps/api/window");
+        const win = getCurrentWindow();
+        unlisten = await win.onDragDropEvent(async (event) => {
+          if (event.payload.type !== "drop") return;
+          const paths = event.payload.paths;
+          if (!paths || paths.length === 0) return;
+          if (paths.length === 1) {
+            // If it's a folder, treat as "open workspace". We
+            // dynamic-import the FS plugin so this is cost-free for
+            // users who never drag anything.
+            try {
+              const { stat } = await import("@tauri-apps/plugin-fs");
+              const meta = await stat(paths[0]);
+              if (meta.isDirectory) {
+                await useWorkspace.getState().setRoot(paths[0]);
+                return;
+              }
+            } catch {
+              /* fall through to "open as file" */
+            }
+          }
+          for (const p of paths) {
+            try {
+              await useEditorStore.getState().openFile(p);
+            } catch (e) {
+              console.warn("drag-open failed", p, e);
+            }
+          }
+        });
+      } catch (e) {
+        console.warn("dnd listener failed", e);
+      }
+    })();
+    return () => {
+      try {
+        unlisten?.();
+      } catch {
+        /* no-op */
+      }
+    };
+  }, []);
+
+  // Bridge: the native macOS menu emits `menu:action` from Rust. Re-dispatch
+  // each one through the same action bus the in-app shortcuts use — so File →
+  // Save (menu), ⌘S (keyboard), and the palette all hit one code path.
+  useEffect(() => {
+    let off: (() => void) | undefined;
+    listenEvent<{ id: ActionId }>("menu:action", (p) => {
+      if (p?.id) dispatchAction(p.id);
+    }).then((u) => (off = u));
+    return () => off?.();
+  }, []);
+
+  // Bridge "New File / New Folder" from the menu, palette, etc. into the
+  // workspace store. The FileTree component watches `pendingCreate` and
+  // renders the inline input. If no folder is open yet we tell the user
+  // instead of silently doing nothing — which is what the bug audit caught.
+  const beginCreateFromMenu = useCallback(
+    (kind: "file" | "folder") => {
+      const ws = useWorkspace.getState();
+      if (!ws.root) {
+        toast.warn("Open a folder first", {
+          body: "Use File → Open Folder (⌘O) to pick a workspace.",
+        });
+        return;
+      }
+      // The tree must be visible for the user to actually see the new-name
+      // input. Expand it if collapsed.
+      if (useSession.getState().treeCollapsed) {
+        noteTreeCollapsed(false);
+      }
+      ws.requestCreate(kind, ws.root);
+    },
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [],
+  );
+
+  // Action subscriptions for the things that live in App.tsx scope.
+  useEffect(() => {
+    const subs: Array<() => void> = [
+      // App-level "preferences" (⌘,) now opens the dedicated
+      // Settings page rather than the AI panel — VS Code parity.
+      // The AI panel still has its own opener (ai:show_ai / ⌘L et al).
+      onAction("app:preferences", () => setShowSettings(true)),
+      onAction("app:onboarding", () => setShowOnboarding(true)),
+      onAction("file:new", () => beginCreateFromMenu("file")),
+      onAction("file:new_folder", () => beginCreateFromMenu("folder")),
+      onAction("file:open_folder", () => openFolder()),
+      onAction("file:find_file", () => setShowFinder(true)),
+      onAction("file:save", () => saveActive()),
+      onAction("file:save_all", () => saveAll()),
+      onAction("file:save_without_formatting", () =>
+        useEditorStore.getState().saveActiveRaw(),
+      ),
+      onAction("file:revert", async () => {
+        // Drop in-memory edits for the active tab and re-read from
+        // disk. Mirrors VS Code's "Revert File" — destructive, so
+        // we require a confirm when the buffer is dirty.
+        const ed = useEditorStore.getState();
+        const tab = ed.tabs.find((t) => t.path === ed.activePath);
+        if (!tab) return;
+        if (tab.dirty) {
+          const ok = await askConfirm({
+            title: `Discard changes to ${tab.name}?`,
+            body: "Reload the file from disk. Unsaved edits will be lost.",
+            confirmLabel: "Revert",
+            danger: true,
+          });
+          if (!ok) return;
+        }
+        try {
+          const fresh = await ipc.readTextFile(tab.path);
+          useEditorStore.setState((s) => ({
+            tabs: s.tabs.map((t) =>
+              t.path === tab.path
+                ? { ...t, content: fresh, dirty: false, externalContent: null }
+                : t,
+            ),
+          }));
+          useSession.getState().noteHotExit(tab.path, null);
+          toast.info("File reverted");
+        } catch (e) {
+          toast.error("Couldn't revert", {
+            body: e instanceof Error ? e.message : String(e),
+          });
+        }
+      }),
+      onAction("file:close_tab", () => closeActiveTab()),
+      onAction("edit:palette", () => setShowPalette(true)),
+      onAction("edit:find_in_files", () => setShowFindInFiles(true)),
+      onAction("ai:toggle_assistant", () => toggleDockView("assistant")),
+      onAction("ai:assistant_ask", () => {
+        showDockView("assistant");
+        const active = useAssistant.getState().getActive();
+        if (active) useAssistant.getState().setSessionMode(active.id, "ask");
+      }),
+      onAction("ai:assistant_plan", () => {
+        showDockView("assistant");
+        const active = useAssistant.getState().getActive();
+        if (active) useAssistant.getState().setSessionMode(active.id, "plan");
+      }),
+      onAction("ai:assistant_agent", () => {
+        showDockView("assistant");
+        const active = useAssistant.getState().getActive();
+        if (active) useAssistant.getState().setSessionMode(active.id, "agent");
+      }),
+      onAction("ai:show_history", () => showDockView("history")),
+      onAction("ai:show_ai", () => showDockView("ai")),
+      onAction("ai:toggle_fim", () => {
+        const next = !useSettings.getState().fimEnabled;
+        setFimEnabled(next);
+        toast.info(`Tab completion ${next ? "enabled" : "disabled"}`);
+      }),
+      onAction("ai:toggle_feature_chat", () => {
+        const next = !useSettings.getState().chatEnabled;
+        setChatEnabled(next);
+        toast.info(`Chat ${next ? "enabled" : "disabled"}`);
+      }),
+      onAction("ai:toggle_feature_agent", () => {
+        const next = !useSettings.getState().agentEnabled;
+        setAgentEnabled(next);
+        toast.info(`Agent ${next ? "enabled" : "disabled"}`);
+      }),
+      onAction("ai:toggle_feature_inline_edit", () => {
+        const next = !useSettings.getState().inlineEditEnabled;
+        setInlineEditEnabled(next);
+        toast.info(`Inline edit ${next ? "enabled" : "disabled"}`);
+      }),
+      onAction("ai:toggle_feature_indexing", () => {
+        const next = !useSettings.getState().indexingEnabled;
+        setIndexingEnabled(next);
+        toast.info(`Codebase indexing ${next ? "enabled" : "disabled"}`);
+      }),
+      onAction("ai:toggle_ollama", async () => {
+        const ready = useSettings.getState().ollamaReady;
+        try {
+          if (ready) {
+            const r = await ipc.ollamaStop();
+            if (r.still_running) {
+              toast.warn("Couldn't stop Ollama", {
+                body:
+                  "Likely a launchd / menu-bar Ollama is respawning it. Quit it from there, or use the system monitor.",
+                sticky: true,
+              });
+            } else if (r.killed_foreign_pids.length > 0) {
+              toast.success(
+                `Ollama stopped (PIDs ${r.killed_foreign_pids.join(", ")})`,
+              );
+            } else {
+              toast.success("Ollama stopped");
+            }
+          } else {
+            await ipc.ollamaStart();
+            toast.success("Ollama starting…");
+          }
+        } catch (e) {
+          toast.error("Couldn't toggle Ollama", {
+            body: e instanceof Error ? e.message : String(e),
+          });
+        }
+      }),
+      onAction("ai:index_workspace", () => {
+        const r = useWorkspace.getState().root;
+        if (!r) {
+          toast.warn("Open a folder first", {
+            body: "Indexing needs a workspace root.",
+          });
+          return;
+        }
+        // Single, consistent gate. Covers: indexing toggle, ollama running,
+        // models installed, embed model picked, embed model still
+        // installed. The body surfaces the precise reason.
+        if (!isFeatureUsable("indexing")) {
+          toast.warn("Codebase indexing isn't ready", {
+            body: featureBlockReason("indexing"),
+          });
+          return;
+        }
+        const em = useSettings.getState().embedModel;
+        ipc.indexWorkspace({ root: r, embed_model: em }).catch((e) =>
+          toast.error("Indexing failed to start", {
+            body: e instanceof Error ? e.message : String(e),
+          }),
+        );
+        toast.info("Indexing started");
+      }),
+      onAction("view:toggle_tree", () =>
+        noteTreeCollapsed(!useSession.getState().treeCollapsed),
+      ),
+      onAction("view:toggle_dock", () => {
+        const cur = useSession.getState().dockView;
+        noteDockView(cur === null ? "assistant" : null);
+      }),
+      onAction("view:toggle_terminal", () => {
+        const st = useTerminals.getState();
+        // Convenience: opening the panel with no terminals is jarring,
+        // so we auto-spawn one as part of the toggle-open transition.
+        if (!st.open && st.tabs.length === 0) {
+          spawnTerminalFromShortcut().then(() => {
+            useTerminals.getState().setOpen(true);
+          });
+        } else {
+          st.toggleOpen();
+        }
+      }),
+      onAction("view:new_terminal", () => {
+        void spawnTerminalFromShortcut();
+      }),
+      onAction("view:toggle_problems", () => setShowProblems((v) => !v)),
+      onAction("view:toggle_zen", () => {
+        const cur = useSession.getState().zenMode ?? false;
+        useSession.getState().noteZenMode(!cur);
+      }),
+      onAction("view:system_monitor", () => setShowMonitor((v) => !v)),
+      onAction("help:onboarding", () => setShowOnboarding(true)),
+      onAction("help:docs", () => {
+        shellOpen("https://github.com").catch(() => {});
+      }),
+      onAction("help:shortcuts", () => setShowShortcutsHelp(true)),
+      onAction("settings:open", () => setShowSettings(true)),
+      onAction("settings:open_workspace", async () => {
+        const root = useWorkspace.getState().root;
+        if (!root) {
+          toast.info("Open a folder first");
+          return;
+        }
+        try {
+          const { ensureWorkspaceSettingsFile } = await import(
+            "@/lib/workspaceSettings"
+          );
+          const path = await ensureWorkspaceSettingsFile(root);
+          await useEditorStore.getState().openFile(path);
+        } catch (e) {
+          toast.error("Couldn't open workspace settings", {
+            body: e instanceof Error ? e.message : String(e),
+          });
+        }
+      }),
+      onAction("settings:open_snippets", async () => {
+        const root = useWorkspace.getState().root;
+        if (!root) {
+          toast.info("Open a folder first");
+          return;
+        }
+        try {
+          const { ensureSnippetsFile } = await import("@/lib/snippets");
+          const path = await ensureSnippetsFile(root);
+          await useEditorStore.getState().openFile(path);
+        } catch (e) {
+          toast.error("Couldn't open snippets file", {
+            body: e instanceof Error ? e.message : String(e),
+          });
+        }
+      }),
+      onAction("settings:keybindings", () => setShowShortcutsHelp(true)),
+      onAction("tabs:reopen_closed", () => {
+        useEditorStore.getState().reopenLastClosed();
+      }),
+      onAction("tabs:close_others", () => {
+        const ed = useEditorStore.getState();
+        const active = ed.activePath;
+        if (!active) return;
+        for (const t of [...ed.tabs]) {
+          if (t.path !== active) ed.closeTab(t.path);
+        }
+      }),
+      onAction("tabs:close_to_right", () => {
+        const ed = useEditorStore.getState();
+        const i = ed.tabs.findIndex((t) => t.path === ed.activePath);
+        if (i < 0) return;
+        for (const t of ed.tabs.slice(i + 1)) ed.closeTab(t.path);
+      }),
+      onAction("tabs:close_all", () => {
+        const ed = useEditorStore.getState();
+        for (const t of [...ed.tabs]) ed.closeTab(t.path);
+      }),
+      onAction("tabs:next", () => {
+        const ed = useEditorStore.getState();
+        const i = ed.tabs.findIndex((t) => t.path === ed.activePath);
+        if (i < 0 || ed.tabs.length < 2) return;
+        const next = ed.tabs[(i + 1) % ed.tabs.length];
+        if (next) ed.setActive(next.path);
+      }),
+      onAction("tabs:prev", () => {
+        const ed = useEditorStore.getState();
+        const i = ed.tabs.findIndex((t) => t.path === ed.activePath);
+        if (i < 0 || ed.tabs.length < 2) return;
+        const prev = ed.tabs[(i - 1 + ed.tabs.length) % ed.tabs.length];
+        if (prev) ed.setActive(prev.path);
+      }),
+      onAction("editor:goto_line", () => {
+        window.dispatchEvent(new CustomEvent("pointer:editor_command", {
+          detail: { id: "editor.action.gotoLine" },
+        }));
+      }),
+      onAction("editor:goto_symbol_file", () => {
+        window.dispatchEvent(new CustomEvent("pointer:editor_command", {
+          detail: { id: "editor.action.quickOutline" },
+        }));
+      }),
+      onAction("editor:format_document", () => {
+        window.dispatchEvent(new CustomEvent("pointer:editor_command", {
+          detail: { id: "editor.action.formatDocument" },
+        }));
+      }),
+      onAction("editor:format_selection", () => {
+        window.dispatchEvent(new CustomEvent("pointer:editor_command", {
+          detail: { id: "editor.action.formatSelection" },
+        }));
+      }),
+      onAction("editor:transpose_chars", () => {
+        window.dispatchEvent(new CustomEvent("pointer:editor_command", {
+          detail: { id: "editor.action.transposeLetters" },
+        }));
+      }),
+      onAction("editor:rename_symbol", () => {
+        window.dispatchEvent(new CustomEvent("pointer:editor_command", {
+          detail: { id: "editor.action.rename" },
+        }));
+      }),
+      onAction("editor:fold", () => {
+        window.dispatchEvent(new CustomEvent("pointer:editor_command", {
+          detail: { id: "editor.fold" },
+        }));
+      }),
+      onAction("editor:duplicate_line", () => {
+        window.dispatchEvent(new CustomEvent("pointer:editor_command", {
+          detail: { id: "editor.action.copyLinesDownAction" },
+        }));
+      }),
+      onAction("editor:toggle_line_comment", () => {
+        window.dispatchEvent(new CustomEvent("pointer:editor_command", {
+          detail: { id: "editor.action.commentLine" },
+        }));
+      }),
+      onAction("editor:toggle_block_comment", () => {
+        window.dispatchEvent(new CustomEvent("pointer:editor_command", {
+          detail: { id: "editor.action.blockComment" },
+        }));
+      }),
+      onAction("editor:join_lines", () => {
+        window.dispatchEvent(new CustomEvent("pointer:editor_command", {
+          detail: { id: "editor.action.joinLines" },
+        }));
+      }),
+      onAction("editor:sort_lines_asc", () => {
+        window.dispatchEvent(new CustomEvent("pointer:editor_command", {
+          detail: { id: "editor.action.sortLinesAscending" },
+        }));
+      }),
+      onAction("editor:sort_lines_desc", () => {
+        window.dispatchEvent(new CustomEvent("pointer:editor_command", {
+          detail: { id: "editor.action.sortLinesDescending" },
+        }));
+      }),
+      onAction("editor:trim_trailing_whitespace", () => {
+        window.dispatchEvent(new CustomEvent("pointer:editor_command", {
+          detail: { id: "editor.action.trimTrailingWhitespace" },
+        }));
+      }),
+      onAction("editor:upper_case", () => {
+        window.dispatchEvent(new CustomEvent("pointer:editor_command", {
+          detail: { id: "editor.action.transformToUppercase" },
+        }));
+      }),
+      onAction("editor:lower_case", () => {
+        window.dispatchEvent(new CustomEvent("pointer:editor_command", {
+          detail: { id: "editor.action.transformToLowercase" },
+        }));
+      }),
+      onAction("editor:title_case", () => {
+        window.dispatchEvent(new CustomEvent("pointer:editor_command", {
+          detail: { id: "editor.action.transformToTitlecase" },
+        }));
+      }),
+      onAction("editor:insert_uuid", () => {
+        const uuid = (
+          (crypto as Crypto & { randomUUID?: () => string }).randomUUID?.() ??
+          fallbackUuid()
+        );
+        window.dispatchEvent(new CustomEvent("pointer:editor_insert", {
+          detail: { text: uuid },
+        }));
+      }),
+      onAction("editor:insert_datetime", () => {
+        // ISO-8601 in local time, second precision — what most
+        // changelogs / commit messages want. Format chosen to be
+        // unambiguous regardless of locale.
+        const d = new Date();
+        const pad = (n: number) => String(n).padStart(2, "0");
+        const text = `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}`;
+        window.dispatchEvent(new CustomEvent("pointer:editor_insert", {
+          detail: { text },
+        }));
+      }),
+      onAction("editor:unfold", () => {
+        window.dispatchEvent(new CustomEvent("pointer:editor_command", {
+          detail: { id: "editor.unfold" },
+        }));
+      }),
+      onAction("editor:fold_all", () => {
+        window.dispatchEvent(new CustomEvent("pointer:editor_command", {
+          detail: { id: "editor.foldAll" },
+        }));
+      }),
+      onAction("editor:unfold_all", () => {
+        window.dispatchEvent(new CustomEvent("pointer:editor_command", {
+          detail: { id: "editor.unfoldAll" },
+        }));
+      }),
+      onAction("editor:toggle_indent", () => {
+        const s = useSettings.getState();
+        s.setEditorInsertSpaces(!s.editorInsertSpaces);
+        toast.info(
+          `Indent: ${!s.editorInsertSpaces ? "Spaces" : "Tabs"} (${s.editorTabSize})`,
+        );
+      }),
+      onAction("editor:change_language", () => setShowLanguagePicker(true)),
+      onAction("editor:change_eol", async () => {
+        // Toggle between LF and CRLF for the active buffer. We do
+        // this by rewriting the in-memory content so save persists
+        // the new sequence — no separate "EOL setting" to manage.
+        const ed = useEditorStore.getState();
+        const tab = ed.tabs.find((t) => t.path === ed.activePath);
+        if (!tab) return;
+        const hasCRLF = /\r\n/.test(tab.content);
+        const target = hasCRLF ? "LF" : "CRLF";
+        const ok = await askConfirm({
+          title: `Switch this file to ${target}?`,
+          body:
+            target === "CRLF"
+              ? "Replace every newline with \\r\\n. Saves immediately."
+              : "Replace every \\r\\n with \\n. Saves immediately.",
+          confirmLabel: target,
+        });
+        if (!ok) return;
+        const next =
+          target === "LF"
+            ? tab.content.replace(/\r\n/g, "\n")
+            : tab.content.replace(/\r?\n/g, "\r\n");
+        useEditorStore.getState().updateContent(tab.path, next);
+        await useEditorStore.getState().saveActive();
+        toast.info(`Line endings: ${target}`);
+      }),
+      onAction("edit:replace_in_files", () => setShowFindInFiles(true)),
+      onAction("editor:goto_symbol_workspace", () =>
+        setShowWorkspaceSymbols(true),
+      ),
+      onAction("view:toggle_minimap", () => {
+        const s = useSettings.getState();
+        s.setEditorMinimap(!s.editorMinimap);
+        toast.info(`Minimap ${!s.editorMinimap ? "shown" : "hidden"}`);
+      }),
+      onAction("view:toggle_word_wrap", () => {
+        const s = useSettings.getState();
+        s.setEditorWordWrap(!s.editorWordWrap);
+        toast.info(`Word wrap ${!s.editorWordWrap ? "on" : "off"}`);
+      }),
+      onAction("view:font_zoom_in", () => {
+        const s = useSettings.getState();
+        s.setEditorFontSize(Math.min(32, (s.editorFontSize || 14) + 1));
+      }),
+      onAction("view:font_zoom_out", () => {
+        const s = useSettings.getState();
+        s.setEditorFontSize(Math.max(8, (s.editorFontSize || 14) - 1));
+      }),
+      onAction("view:font_zoom_reset", () => {
+        useSettings.getState().setEditorFontSize(14);
+      }),
+      onAction("view:reveal_in_tree", () => {
+        const active = useEditorStore.getState().activePath;
+        if (!active) {
+          toast.info("No active file to reveal.");
+          return;
+        }
+        window.dispatchEvent(
+          new CustomEvent("pointer:reveal_in_tree", { detail: { path: active } }),
+        );
+      }),
+      onAction("tree:focus_filter", () => {
+        window.dispatchEvent(new CustomEvent("pointer:focus_tree_filter"));
+      }),
+      onAction("tree:collapse_all", () => {
+        window.dispatchEvent(new CustomEvent("pointer:collapse_tree"));
+      }),
+      onAction("git:show_panel", () => noteDockView("scm")),
+      onAction("git:fetch", () => {
+        const r = useWorkspace.getState().root;
+        if (!r) {
+          toast.warn("Open a folder first");
+          return;
+        }
+        ipc.gitFetch(r).then(
+          () => toast.success("Fetched"),
+          (e) => toast.error("Fetch failed", { body: String(e) }),
+        );
+      }),
+      onAction("git:pull", () => {
+        const r = useWorkspace.getState().root;
+        if (!r) {
+          toast.warn("Open a folder first");
+          return;
+        }
+        ipc.gitPull(r).then(
+          () => toast.success("Pulled"),
+          (e) => toast.error("Pull failed", { body: String(e) }),
+        );
+      }),
+      onAction("git:push", () => {
+        const r = useWorkspace.getState().root;
+        if (!r) {
+          toast.warn("Open a folder first");
+          return;
+        }
+        ipc.gitPush(r).then(
+          () => toast.success("Pushed"),
+          (e) => toast.error("Push failed", { body: String(e) }),
+        );
+      }),
+      onAction("file:open_recent", () => setShowOpenRecent(true)),
+      onAction("file:new_untitled", () => {
+        void useEditorStore.getState().openUntitled();
+      }),
+      onAction("help:notifications", () => setShowNotifications(true)),
+      onAction("tasks:run", () => setShowTasks(true)),
+      onAction("bookmark:toggle", async () => {
+        const ed = useEditorStore.getState();
+        const path = ed.activePath;
+        if (!path) return;
+        const line = ed.cursor?.line ?? 1;
+        const tab = ed.tabs.find((t) => t.path === path);
+        const preview = tab
+          ? tab.content.split("\n")[line - 1]?.trim().slice(0, 120) ?? ""
+          : "";
+        const { useBookmarks } = await import("@/store/bookmarks");
+        const present = useBookmarks
+          .getState()
+          .toggle({ path, line, preview, ts: Date.now() });
+        toast.info(present ? `Bookmark added · line ${line}` : "Bookmark removed");
+      }),
+      onAction("bookmark:next", async () => {
+        const ed = useEditorStore.getState();
+        const path = ed.activePath;
+        if (!path) return;
+        const { useBookmarks } = await import("@/store/bookmarks");
+        const marks = useBookmarks.getState().forFile(path);
+        if (marks.length === 0) return;
+        const cur = ed.cursor?.line ?? 1;
+        const next = marks.find((m) => m.line > cur) ?? marks[0];
+        ed.revealAt(path, next.line, 1);
+      }),
+      onAction("bookmark:prev", async () => {
+        const ed = useEditorStore.getState();
+        const path = ed.activePath;
+        if (!path) return;
+        const { useBookmarks } = await import("@/store/bookmarks");
+        const marks = useBookmarks.getState().forFile(path);
+        if (marks.length === 0) return;
+        const cur = ed.cursor?.line ?? 1;
+        const prev = [...marks].reverse().find((m) => m.line < cur) ??
+          marks[marks.length - 1];
+        ed.revealAt(path, prev.line, 1);
+      }),
+      onAction("bookmark:list", () => setShowBookmarks(true)),
+      onAction("bookmark:clear_file", async () => {
+        const path = useEditorStore.getState().activePath;
+        if (!path) return;
+        const { useBookmarks } = await import("@/store/bookmarks");
+        useBookmarks.getState().clearFile(path);
+        toast.info("Bookmarks cleared for this file");
+      }),
+      onAction("bookmark:clear_all", async () => {
+        const { useBookmarks } = await import("@/store/bookmarks");
+        useBookmarks.getState().clearAll();
+        toast.info("All bookmarks cleared");
+      }),
+      onAction("tasks:edit", async () => {
+        const root = useWorkspace.getState().root;
+        if (!root) {
+          toast.error("Open a folder first");
+          return;
+        }
+        try {
+          const { ensureWorkspaceTasksFile } = await import("@/lib/tasks");
+          const file = await ensureWorkspaceTasksFile(root);
+          await useEditorStore.getState().openFile(file);
+        } catch (e) {
+          toast.error("Couldn't open tasks.json", {
+            body: e instanceof Error ? e.message : String(e),
+          });
+        }
+      }),
+      onAction("help:about", () => {
+        toast.info("Pointer", { body: "An AI-first code editor — local models, zero cloud." });
+      }),
+      onAction("editor:next_problem", () => navigateProblem("next")),
+      onAction("editor:prev_problem", () => navigateProblem("prev")),
+      onAction("editor:nav_back", async () => {
+        const { useNavHistory } = await import("@/store/navHistory");
+        const entry = useNavHistory.getState().back();
+        if (entry) {
+          // Note: don't go through revealAt — that would push a *new*
+          // history entry, defeating the back walk. Open + reveal
+          // directly via the same pendingReveal channel.
+          await useEditorStore.getState().openFile(entry.path);
+          useEditorStore.setState({
+            pendingReveal: {
+              path: entry.path,
+              line: entry.line,
+              column: entry.column,
+              nonce: Date.now(),
+            },
+          });
+        }
+      }),
+      onAction("editor:nav_forward", async () => {
+        const { useNavHistory } = await import("@/store/navHistory");
+        const entry = useNavHistory.getState().forward();
+        if (entry) {
+          await useEditorStore.getState().openFile(entry.path);
+          useEditorStore.setState({
+            pendingReveal: {
+              path: entry.path,
+              line: entry.line,
+              column: entry.column,
+              nonce: Date.now(),
+            },
+          });
+        }
+      }),
+      onAction("md:toggle_preview", () => {
+        const active = useEditorStore.getState().activePath;
+        if (!active || !/\.(md|markdown|mdx)$/i.test(active)) {
+          toast.info("Open a Markdown file first");
+          return;
+        }
+        setMdPreview((prev) => {
+          const cur = prev[active] ?? null;
+          return { ...prev, [active]: cur === "preview" ? null : "preview" };
+        });
+      }),
+      onAction("md:open_preview_side", () => {
+        const active = useEditorStore.getState().activePath;
+        if (!active || !/\.(md|markdown|mdx)$/i.test(active)) {
+          toast.info("Open a Markdown file first");
+          return;
+        }
+        setMdPreview((prev) => ({ ...prev, [active]: "split" }));
+      }),
+    ];
+    return () => {
+      for (const u of subs) u();
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  const ready = settingsHydrated && sessionHydrated;
+
+  return (
+    <div className="h-screen w-screen flex flex-col bg-noir-canvas text-noir-text overflow-hidden">
+      {!zenMode && <Titlebar onOpenAIPanel={() => noteDockView("ai")} />}
+      <div className="flex-1 min-h-0 flex">
+        {!treeCollapsed && !zenMode && (
+          <aside
+            className="shrink-0 relative border-r border-noir-line bg-noir-panel/80 backdrop-blur-xs flex flex-col"
+            style={{ width: fileTreeWidth ?? 256 }}
+          >
+            {/* Sidebar view selector — Files vs Outline. Lightweight
+                tab strip; clicking switches the pane in-place. */}
+            <div className="flex shrink-0 border-b border-noir-line/60 text-[10px] uppercase tracking-wider">
+              <button
+                onClick={() => setSidebarView("files")}
+                className={`flex-1 h-7 ${
+                  sidebarView === "files"
+                    ? "text-noir-text bg-noir-chrome/40"
+                    : "text-noir-mute hover:text-noir-text"
+                }`}
+              >
+                Files
+              </button>
+              <button
+                onClick={() => setSidebarView("outline")}
+                className={`flex-1 h-7 border-l border-noir-line/60 ${
+                  sidebarView === "outline"
+                    ? "text-noir-text bg-noir-chrome/40"
+                    : "text-noir-mute hover:text-noir-text"
+                }`}
+              >
+                Outline
+              </button>
+            </div>
+            {sidebarView === "files" ? <FileTree /> : <Outline />}
+            {/* Drag handle for the file tree. Lives on the RIGHT
+                edge so users can grab it without overshooting into
+                the editor. Min 160px so the tree never collapses to
+                nothing; max 600px so it can't eat the editor. */}
+            <div
+              onMouseDown={(e) => {
+                e.preventDefault();
+                const startX = e.clientX;
+                const startW = fileTreeWidth ?? 256;
+                const note = useSession.getState().noteFileTreeWidth;
+                const move = (ev: MouseEvent) => {
+                  const next = Math.max(160, Math.min(600, startW + (ev.clientX - startX)));
+                  note(next);
+                };
+                const up = () => {
+                  window.removeEventListener("mousemove", move);
+                  window.removeEventListener("mouseup", up);
+                };
+                window.addEventListener("mousemove", move);
+                window.addEventListener("mouseup", up);
+              }}
+              onDoubleClick={() => useSession.getState().noteFileTreeWidth(256)}
+              className="absolute right-0 top-0 bottom-0 w-1 cursor-col-resize hover:bg-noir-accent/40 z-pn-dock-handle"
+              title="Drag to resize · double-click to reset"
+            />
+          </aside>
+        )}
+        <main className="flex-1 min-w-0 flex flex-col">
+          {!zenMode && <Tabs />}
+          {!zenMode && <Breadcrumbs />}
+          <div className="flex-1 min-h-0 flex flex-col">
+            <div className="flex-1 min-h-0 relative">
+              {root ? (
+                <Editor />
+              ) : (
+                <Welcome
+                  ready={ready}
+                  onOpen={openFolder}
+                  recents={recents}
+                  onOpenRecent={(p) => setRoot(p)}
+                  onRemoveRecent={removeRecent}
+                  onShowAIPanel={() => noteDockView("ai")}
+                />
+              )}
+              <DiffView />
+              <ActiveMarkdownPreview state={mdPreview} setState={setMdPreview} />
+            </div>
+            {showProblems && (
+              <ProblemsPanel onClose={() => setShowProblems(false)} />
+            )}
+            {!zenMode && <TerminalPanel />}
+          </div>
+        </main>
+        {!zenMode && <RightDock />}
+      </div>
+      {!zenMode && <StatusBar onOpenMonitor={() => setShowMonitor(true)} />}
+      {zenMode && (
+        <button
+          onClick={() => useSession.getState().noteZenMode(false)}
+          className="fixed top-2 right-2 z-pn-toast text-[10px] uppercase tracking-wider text-noir-mute hover:text-noir-text bg-noir-panel/60 border border-noir-line/40 rounded px-2 py-1"
+          title="Exit Zen Mode (⌘K Z)"
+        >
+          Exit Zen
+        </button>
+      )}
+
+      {showPalette && (
+        <CommandPalette
+          onClose={() => setShowPalette(false)}
+          openFinder={() => {
+            setShowPalette(false);
+            setShowFinder(true);
+          }}
+          toggleChat={() => toggleDockView("assistant")}
+          openOnboarding={() => setShowOnboarding(true)}
+          openAIPanel={() => noteDockView("ai")}
+          openMonitor={() => setShowMonitor(true)}
+        />
+      )}
+      {showFinder && <FileFinder onClose={() => setShowFinder(false)} />}
+      {showFindInFiles && (
+        <FindInFiles onClose={() => setShowFindInFiles(false)} />
+      )}
+      {showMonitor && (
+        <SystemMonitor onClose={() => setShowMonitor(false)} />
+      )}
+      {showShortcutsHelp && (
+        <ShortcutsHelp onClose={() => setShowShortcutsHelp(false)} />
+      )}
+      {showSettings && <SettingsPage onClose={() => setShowSettings(false)} />}
+      {showOpenRecent && (
+        <OpenRecentPicker onClose={() => setShowOpenRecent(false)} />
+      )}
+      {showWorkspaceSymbols && (
+        <WorkspaceSymbols onClose={() => setShowWorkspaceSymbols(false)} />
+      )}
+      {showNotifications && (
+        <NotificationCenter onClose={() => setShowNotifications(false)} />
+      )}
+      {showTasks && <TasksPicker onClose={() => setShowTasks(false)} />}
+      {showBookmarks && (
+        <BookmarksPicker onClose={() => setShowBookmarks(false)} />
+      )}
+      {showLanguagePicker && (
+        <LanguagePicker onClose={() => setShowLanguagePicker(false)} />
+      )}
+      {/* The wizard renders whenever `showOnboarding` is true. We don't
+          gate on `!onboarded` here — that gate already lives in the boot
+          effect (which decides whether to auto-show the wizard on launch).
+          Adding it here would silently break the menu items "Setup /
+          Onboarding…" and "Re-run Setup", which are exactly the entry
+          points an already-onboarded user reaches for. */}
+      {showOnboarding && (
+        <Onboarding
+          onDone={() => {
+            markOnboarded();
+            setShowOnboarding(false);
+          }}
+        />
+      )}
+      <ConfirmModalHost />
+      <ToastHost />
+      <RefactorSuggestion />
+    </div>
+  );
+}
+
+function Welcome({
+  ready,
+  onOpen,
+  recents,
+  onOpenRecent,
+  onRemoveRecent,
+  onShowAIPanel,
+}: {
+  ready: boolean;
+  onOpen: () => void;
+  recents: string[];
+  onOpenRecent: (p: string) => void;
+  onRemoveRecent: (p: string) => void;
+  onShowAIPanel: () => void;
+}) {
+  const ollamaReady = useSettings((s) => s.ollamaReady);
+  const hasHfToken = useSettings((s) => s.hasHfToken);
+  // The "Models" chip on the welcome screen used to light up the moment
+  // the user had ever picked a chat model — even if they later uninstalled
+  // it. That was misleading: the chip claimed setup was done while the
+  // configured model was gone. We now consult the effective slot, which
+  // returns "" when the configured model isn't installed (or Ollama is
+  // offline), so the chip honestly reflects whether chat is wired up.
+  const effectiveChat = useSettings((s) => effectiveAssignedModel("chat", s));
+  const onboarded = useSettings((s) => s.onboarded);
+
+  const setupComplete = ollamaReady && !!effectiveChat;
+
+  return (
+    <main
+      className="h-full w-full flex items-center justify-center pn-noise relative"
+      aria-label="Welcome screen"
+    >
+      <div className="text-center max-w-lg px-8 w-full">
+        <div className="text-[64px] leading-none mb-5 select-none" aria-hidden="true">
+          <span
+            className="bg-clip-text text-transparent"
+            style={{
+              backgroundImage:
+                "linear-gradient(135deg, #FF2D7E 0%, #FFB3CE 60%, #FFD480 100%)",
+            }}
+          >
+            ▸
+          </span>
+        </div>
+        <h1 className="font-sans text-2xl font-medium tracking-tight text-noir-text mb-1.5">
+          Pointer
+        </h1>
+        <p className="text-[12.5px] text-noir-subtext mb-7 font-sans">
+          An AI-first code editor powered by open-source models running locally.
+        </p>
+
+        <div className="flex gap-2 justify-center font-sans mb-6">
+          <button
+            onClick={onOpen}
+            className="pn-button-accent flex items-center gap-1.5"
+            aria-label="Open folder (Command O)"
+          >
+            <Folder size={11} aria-hidden="true" /> Open Folder
+            <kbd className="opacity-70 ml-1.5">⌘O</kbd>
+          </button>
+          <button
+            onClick={onShowAIPanel}
+            className="pn-button flex items-center gap-1.5"
+            aria-label="Open AI setup (Command Shift Comma)"
+          >
+            <Sparkles size={11} aria-hidden="true" /> AI Setup
+            <kbd className="opacity-70 ml-1.5">⌘⇧,</kbd>
+          </button>
+        </div>
+
+        {/* Setup status card. Only useful once initial onboarding ran — before
+            that, the wizard is already on screen anyway. */}
+        {ready && onboarded && (
+          <button
+            onClick={onShowAIPanel}
+            className="w-full mb-8 rounded-lg border border-noir-line bg-noir-panel/60 hover:bg-noir-panel/80 transition-colors text-left p-3 font-sans"
+            title="Open AI Control Panel"
+          >
+            <div className="flex items-center justify-between mb-2">
+              <div className="text-[10px] uppercase tracking-wider text-noir-mute">
+                Setup status
+              </div>
+              <div
+                className={`text-[10px] ${setupComplete ? "text-noir-ok" : "text-noir-warn"}`}
+              >
+                {setupComplete ? "Ready" : "Action needed"}
+              </div>
+            </div>
+            <div className="grid grid-cols-3 gap-2 text-[11px]">
+              <SetupChip on={ollamaReady} label="Ollama" />
+              <SetupChip on={!!effectiveChat} label="Models" />
+              <SetupChip on={hasHfToken} label="HF token" optional />
+            </div>
+          </button>
+        )}
+
+        {ready && recents.length > 0 && (
+          <section className="text-left" aria-labelledby="welcome-recents-heading">
+            <h2
+              id="welcome-recents-heading"
+              className="font-sans text-[10px] uppercase tracking-wider text-noir-mute mb-2 flex items-center gap-1.5 font-normal"
+            >
+              <Clock size={10} aria-hidden="true" /> Recent
+            </h2>
+            <ul className="rounded-md border border-noir-line bg-noir-panel/60 divide-y divide-noir-line/40">
+              {recents.map((p) => {
+                const name = p.split(/[\\/]/).pop() ?? p;
+                const parent = p.slice(0, p.length - name.length).replace(/\/+$/, "");
+                return (
+                  <li
+                    key={p}
+                    className="flex items-center justify-between group hover:bg-noir-ridge/40 transition-colors"
+                  >
+                    <button
+                      onClick={() => onOpenRecent(p)}
+                      className="flex-1 flex items-center gap-2 px-3 py-2 text-left min-w-0"
+                      title={p}
+                      aria-label={`Open ${name} at ${parent}`}
+                    >
+                      <Folder
+                        size={11}
+                        aria-hidden="true"
+                        className="text-noir-subtext shrink-0"
+                      />
+                      <div className="min-w-0">
+                        <div className="font-sans text-[12px] text-noir-text truncate">
+                          {name}
+                        </div>
+                        <div className="font-mono text-[10.5px] text-noir-mute truncate">
+                          {parent}
+                        </div>
+                      </div>
+                    </button>
+                    <button
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        onRemoveRecent(p);
+                      }}
+                      className="p-2 opacity-0 group-hover:opacity-100 text-noir-mute hover:text-noir-err transition-opacity"
+                      title="Remove from recents"
+                      aria-label={`Remove ${name} from recents`}
+                    >
+                      <X size={11} aria-hidden="true" />
+                    </button>
+                  </li>
+                );
+              })}
+            </ul>
+          </section>
+        )}
+      </div>
+    </main>
+  );
+}
+
+function SetupChip({
+  on,
+  label,
+  optional,
+}: {
+  on: boolean;
+  label: string;
+  optional?: boolean;
+}) {
+  return (
+    <div
+      className={`rounded-md border px-2 py-1.5 flex items-center justify-between gap-2 ${
+        on
+          ? "border-noir-ok/30 bg-noir-ok/5"
+          : optional
+          ? "border-noir-line bg-noir-canvas/40"
+          : "border-noir-warn/30 bg-noir-warn/5"
+      }`}
+    >
+      <span className="text-noir-text">{label}</span>
+      <span
+        className={`h-1.5 w-1.5 rounded-full ${
+          on ? "bg-noir-ok" : optional ? "bg-noir-mute" : "bg-noir-warn"
+        }`}
+      />
+    </div>
+  );
+}
+
+/** Wraps MarkdownView so it only mounts when the *active* tab is
+ *  a Markdown file in preview mode. Keying off `mdPreview[active]`
+ *  lets every md file remember its own mode independently. */
+function ActiveMarkdownPreview({
+  state,
+  setState,
+}: {
+  state: Record<string, "preview" | "split" | null>;
+  setState: React.Dispatch<
+    React.SetStateAction<Record<string, "preview" | "split" | null>>
+  >;
+}) {
+  const active = useEditorStore((s) => s.activePath);
+  if (!active) return null;
+  if (!/\.(md|markdown|mdx)$/i.test(active)) return null;
+  const mode = state[active] ?? null;
+  if (!mode) return null;
+  const close = () => setState((p) => ({ ...p, [active]: null }));
+  const set = (m: "preview" | "split" | null) =>
+    setState((p) => ({ ...p, [active]: m }));
+  return (
+    <MarkdownView
+      path={active}
+      mode={mode}
+      onSetMode={set}
+      onClose={close}
+    />
+  );
+}

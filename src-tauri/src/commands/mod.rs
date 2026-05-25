@@ -1,0 +1,16 @@
+pub mod agent;
+pub mod agent_changes;
+pub mod app_state;
+pub mod assistant;
+pub mod context;
+pub mod fast_apply;
+pub mod files;
+pub mod format;
+pub mod fs;
+pub mod git;
+pub mod mcp;
+pub mod models;
+pub mod ollama;
+pub mod system;
+pub mod terminal;
+pub mod workspace;
