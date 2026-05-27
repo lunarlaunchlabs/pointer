@@ -17,34 +17,29 @@ import { useMemo } from "react";
 import { Play, Sparkles } from "lucide-react";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
+import { latestPlanText, planStepCount } from "@/lib/assistantPlans";
 import type { AssistantSession } from "@/store/assistant";
 import { useAssistant } from "@/store/assistant";
 
 export function PlanCard({ session }: { session: AssistantSession }) {
   const executePlan = useAssistant((s) => s.executePlan);
-  const planText = useMemo(() => {
-    return session.events
-      .filter((e) => e.kind === "plan")
-      .map((e) => (e.kind === "plan" ? e.text : ""))
-      .join("\n\n")
-      .trim();
-  }, [session.events]);
+  const planText = useMemo(() => latestPlanText(session.events), [session.events]);
 
   if (session.mode !== "plan") return null;
   if (!planText) return null;
 
   const busy = session.status === "running";
+  const stepCount = planStepCount(planText);
 
   return (
     <div className="mx-3 my-3 rounded-md border border-noir-accent/30 bg-noir-accent/5">
       <div className="px-3 py-2 border-b border-noir-accent/20 flex items-center gap-2">
         <Sparkles size={12} className="text-noir-accent" aria-hidden="true" />
         <span className="text-[11px] font-sans font-medium text-noir-text">
-          Plan ready
+          {busy ? "Planning…" : "Plan ready"}
         </span>
         <span className="text-[10px] font-sans text-noir-mute ml-auto">
-          {planText.split(/\n+/).filter((l) => l.trim()).length} step
-          {planText.split(/\n+/).filter((l) => l.trim()).length === 1 ? "" : "s"}
+          {stepCount} step{stepCount === 1 ? "" : "s"}
         </span>
       </div>
       <div className="px-3 py-2 max-h-64 overflow-y-auto text-[11.5px] text-noir-text font-sans prose-pn">
@@ -59,10 +54,14 @@ export function PlanCard({ session }: { session: AssistantSession }) {
             "bg-noir-accent text-noir-bg hover:bg-noir-accent/90",
             busy ? "opacity-50 cursor-not-allowed" : "",
           ].join(" ")}
-          title="Run this plan with the full Agent loop. Pointer will reuse what it already explored — no re-reads."
+          title={
+            busy
+              ? "Pointer is still finishing the plan."
+              : "Run this plan with the full Agent loop. Pointer will reuse what it already explored — no re-reads."
+          }
         >
           <Play size={10} aria-hidden="true" />
-          Execute as Agent
+          {busy ? "Finishing plan" : "Execute as Agent"}
         </button>
         <span className="text-[10px] font-sans text-noir-mute">
           Carries forward the plan's transcript + ledger.

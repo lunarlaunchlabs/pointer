@@ -54,11 +54,7 @@ export function LanguagePicker({ onClose }: { onClose: () => void }) {
       onClose();
       return;
     }
-    useEditorStore.setState((s) => ({
-      tabs: s.tabs.map((t) =>
-        t.path === active.path ? { ...t, language: id } : t,
-      ),
-    }));
+    useEditorStore.getState().setLanguage(active.path, id);
     // Notify Monaco to retokenise — model.setLanguage is the
     // supported way to swap on the fly. We do it via a tiny custom
     // event so the Editor component can run it against the active

@@ -7,8 +7,7 @@ import {
   Search,
   Trash2,
 } from "lucide-react";
-import { useChat, type ChatSession } from "@/store/chat";
-import { useAgent, type AgentSession } from "@/store/agentSessions";
+import { useAssistant, type AssistantSession } from "@/store/assistant";
 import { useSettings } from "@/store/settings";
 import type { DockView } from "@/store/session";
 
@@ -30,42 +29,30 @@ function useStaleSessionModelPredicate() {
 /** Combined chat + agent history. Picking a session also routes the dock
  *  to the appropriate view so the user lands inside the conversation. */
 export function HistoryView({ onNavigate }: { onNavigate: (v: DockView) => void }) {
-  const chatSessions = useChat((s) => s.sessions);
-  const selectChat = useChat((s) => s.selectSession);
-  const deleteChat = useChat((s) => s.deleteSession);
-
-  const agentSessions = useAgent((s) => s.sessions);
-  const selectAgent = useAgent((s) => s.selectSession);
-  const deleteAgent = useAgent((s) => s.deleteSession);
+  const sessions = useAssistant((s) => s.sessions);
+  const selectSession = useAssistant((s) => s.selectSession);
+  const deleteSession = useAssistant((s) => s.deleteSession);
 
   const [q, setQ] = useState("");
-  const [tab, setTab] = useState<"chat" | "agent">("chat");
+  const [tab, setTab] = useState<"ask" | "agent">("ask");
 
-  const filteredChat = useMemo(() => {
+  const askSessions = useMemo(() => sessions.filter((s) => s.mode === "ask"), [sessions]);
+  const agentSessions = useMemo(() => sessions.filter((s) => s.mode !== "ask"), [sessions]);
+
+  const filteredAsk = useMemo(() => {
     const needle = q.trim().toLowerCase();
-    return chatSessions
+    return askSessions
       .slice()
       .sort((a, b) => b.updatedAt - a.updatedAt)
-      .filter(
-        (s) =>
-          !needle ||
-          s.title.toLowerCase().includes(needle) ||
-          s.model.toLowerCase().includes(needle),
-      );
-  }, [chatSessions, q]);
+      .filter((s) => matchesSession(s, needle));
+  }, [askSessions, q]);
 
   const filteredAgent = useMemo(() => {
     const needle = q.trim().toLowerCase();
     return agentSessions
       .slice()
       .sort((a, b) => b.updatedAt - a.updatedAt)
-      .filter(
-        (s) =>
-          !needle ||
-          s.title.toLowerCase().includes(needle) ||
-          s.model.toLowerCase().includes(needle) ||
-          s.goal.toLowerCase().includes(needle),
-      );
+      .filter((s) => matchesSession(s, needle));
   }, [agentSessions, q]);
 
   return (
@@ -74,7 +61,7 @@ export function HistoryView({ onNavigate }: { onNavigate: (v: DockView) => void 
         <History size={12} className="text-noir-accent" />
         <span className="font-sans text-[12px] text-noir-text">History</span>
         <span className="text-[10px] text-noir-mute font-sans">
-          {chatSessions.length + agentSessions.length} sessions
+          {sessions.length} sessions
         </span>
       </header>
       <div className="px-3 py-2 border-b border-noir-line space-y-2 bg-noir-chrome/20">
@@ -98,8 +85,8 @@ export function HistoryView({ onNavigate }: { onNavigate: (v: DockView) => void 
           role="tablist"
           aria-label="Session history type"
         >
-          <TabButton current={tab} value="chat" onClick={setTab}>
-            <Bot size={10} aria-hidden="true" /> Chat ({chatSessions.length})
+          <TabButton current={tab} value="ask" onClick={setTab}>
+            <Bot size={10} aria-hidden="true" /> Ask ({askSessions.length})
           </TabButton>
           <TabButton current={tab} value="agent" onClick={setTab}>
             <ScrollText size={10} aria-hidden="true" /> Agent ({agentSessions.length})
@@ -107,23 +94,25 @@ export function HistoryView({ onNavigate }: { onNavigate: (v: DockView) => void 
         </div>
       </div>
       <div className="flex-1 min-h-0 overflow-y-auto">
-        {tab === "chat" ? (
-          <ChatList
-            list={filteredChat}
+        {tab === "ask" ? (
+          <SessionList
+            list={filteredAsk}
+            empty="No Ask sessions yet. Start one from the Assistant view."
             onOpen={(id) => {
-              selectChat(id);
+              selectSession(id);
               onNavigate("assistant");
             }}
-            onDelete={deleteChat}
+            onDelete={deleteSession}
           />
         ) : (
-          <AgentList
+          <SessionList
             list={filteredAgent}
+            empty="No Plan or Agent runs yet. Start one from the Assistant view."
             onOpen={(id) => {
-              selectAgent(id);
+              selectSession(id);
               onNavigate("assistant");
             }}
-            onDelete={deleteAgent}
+            onDelete={deleteSession}
           />
         )}
       </div>
@@ -159,12 +148,14 @@ function TabButton<T extends string>({
   );
 }
 
-function ChatList({
+function SessionList({
   list,
+  empty,
   onOpen,
   onDelete,
 }: {
-  list: ChatSession[];
+  list: AssistantSession[];
+  empty: string;
   onOpen: (id: string) => void;
   onDelete: (id: string) => void;
 }) {
@@ -172,7 +163,7 @@ function ChatList({
   if (list.length === 0) {
     return (
       <div className="px-3 py-6 text-center text-[11px] text-noir-mute">
-        No chats yet. Start one from the chat view.
+        {empty}
       </div>
     );
   }
@@ -185,7 +176,7 @@ function ChatList({
             <button
               onClick={() => onOpen(s.id)}
               className="flex-1 text-left px-3 py-2 min-w-0"
-              aria-label={`Open chat session ${s.title}${stale ? ` (model ${s.model} not installed)` : ""}`}
+              aria-label={`Open ${modeLabel(s.mode)} session ${s.title}${stale ? ` (model ${s.model} not installed)` : ""}`}
             >
               <div className="font-sans text-[11.5px] text-noir-text truncate flex items-center gap-1.5">
                 {s.title}
@@ -197,6 +188,7 @@ function ChatList({
                 }`}
                 title={stale ? `${s.model} isn't installed` : undefined}
               >
+                <span className="text-noir-mute">{modeLabel(s.mode)} · </span>
                 {s.model}
                 {stale && (
                   <span className="ml-1 text-[9px] uppercase tracking-wider">
@@ -204,7 +196,7 @@ function ChatList({
                   </span>
                 )}
                 <span className="text-noir-mute">
-                  {" "}· {s.messages.length} msg · {formatWhen(s.updatedAt)}
+                  {" "}· {s.messages.length} msg · {s.events.length} steps{s.status !== "idle" ? ` · ${s.status}` : ""} · {formatWhen(s.updatedAt)}
                 </span>
               </div>
             </button>
@@ -216,61 +208,20 @@ function ChatList({
   );
 }
 
-function AgentList({
-  list,
-  onOpen,
-  onDelete,
-}: {
-  list: AgentSession[];
-  onOpen: (id: string) => void;
-  onDelete: (id: string) => void;
-}) {
-  const isStale = useStaleSessionModelPredicate();
-  if (list.length === 0) {
-    return (
-      <div className="px-3 py-6 text-center text-[11px] text-noir-mute">
-        No agent runs yet. Start one from the agent view.
-      </div>
-    );
-  }
+function matchesSession(s: AssistantSession, needle: string): boolean {
+  if (!needle) return true;
   return (
-    <ul className="divide-y divide-noir-line/40">
-      {list.map((s) => {
-        const stale = isStale(s.model);
-        return (
-          <li key={s.id} className="group flex items-center hover:bg-noir-ridge/30">
-            <button
-              onClick={() => onOpen(s.id)}
-              className="flex-1 text-left px-3 py-2 min-w-0"
-            >
-              <div className="font-sans text-[11.5px] text-noir-text truncate flex items-center gap-1.5">
-                {s.title}
-                <ChevronRight size={10} className="text-noir-mute opacity-60" />
-              </div>
-              <div
-                className={`font-mono text-[10px] truncate ${
-                  stale ? "text-noir-warn" : "text-noir-mute"
-                }`}
-                title={stale ? `${s.model} isn't installed` : undefined}
-              >
-                <span className="text-noir-mute">{s.mode} · </span>
-                {s.model}
-                {stale && (
-                  <span className="ml-1 text-[9px] uppercase tracking-wider">
-                    · not installed
-                  </span>
-                )}
-                <span className="text-noir-mute">
-                  {" "}· {s.events.length} events · {s.status} · {formatWhen(s.updatedAt)}
-                </span>
-              </div>
-            </button>
-            <DeleteButton onClick={() => onDelete(s.id)} />
-          </li>
-        );
-      })}
-    </ul>
+    s.title.toLowerCase().includes(needle) ||
+    s.model.toLowerCase().includes(needle) ||
+    (s.workspace ?? "").toLowerCase().includes(needle) ||
+    s.messages.some((m) => m.content.toLowerCase().includes(needle))
   );
+}
+
+function modeLabel(mode: AssistantSession["mode"]): string {
+  if (mode === "ask") return "Ask";
+  if (mode === "plan") return "Plan";
+  return "Agent";
 }
 
 function DeleteButton({ onClick, label }: { onClick: () => void; label?: string }) {

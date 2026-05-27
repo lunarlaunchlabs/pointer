@@ -21,14 +21,15 @@
 //! FE listens on to extend its in-memory ledger.
 
 use serde::{Deserialize, Serialize};
-use tauri::{AppHandle, Emitter, Listener, State};
+use tauri::{AppHandle, Emitter, State};
 
 use crate::commands::agent::{
     agent_continue, agent_run, AgentContinueRequest, AgentMessage, AgentRequest, ExecutionMode,
 };
-use crate::commands::ollama::{ollama_chat, ChatMsg, ChatRequest};
+use crate::commands::ollama::ChatMsg;
 use crate::error::AppResult;
 use crate::services::history::{entry_for_answer, LedgerEntry};
+use crate::services::opencode::{run_opencode, OpenCodeMode, OpenCodeRunRequest};
 use crate::state::AppState;
 
 /// Inbound payload for `assistant_ask`. Mirrors `ChatRequest` but
@@ -48,9 +49,13 @@ pub struct AssistantAskRequest {
     #[serde(default)]
     pub system_extras: Option<String>,
     #[serde(default)]
+    #[allow(dead_code)]
     pub temperature: Option<f32>,
     #[serde(default)]
+    #[allow(dead_code)]
     pub num_ctx: Option<u32>,
+    #[serde(default)]
+    pub attached_files: Option<Vec<String>>,
 }
 
 /// Per-session ledger event payload. Sent over
@@ -88,80 +93,91 @@ pub async fn assistant_ask(
         messages,
         system,
         system_extras,
-        temperature,
-        num_ctx,
+        attached_files,
+        temperature: _,
+        num_ctx: _,
     } = request;
 
-    // Merge `system` + `system_extras` into a single system prompt so
-    // we don't have to teach `ollama_chat` about per-turn extras.
-    // Order matters: base system first, extras after, with a blank
-    // line separator. Local models reliably honour this layout.
-    let merged_system = match (system, system_extras) {
-        (Some(base), Some(extra)) if !extra.trim().is_empty() => {
-            Some(format!("{}\n\n{}", base.trim_end(), extra.trim()))
+    let _ = system;
+    let extra_context = system_extras
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+
+    let workspace = state
+        .workspace
+        .lock()
+        .as_ref()
+        .map(|p| p.display().to_string())
+        .unwrap_or_default();
+    let prompt = render_opencode_ask_prompt(extra_context, &messages);
+    let res = run_opencode(
+        app.clone(),
+        &state,
+        OpenCodeRunRequest {
+            request_id: request_id.clone(),
+            model,
+            workspace,
+            prompt,
+            mode: OpenCodeMode::Ask,
+            title: "Ask mode".into(),
+            max_steps: 1,
+            files: attached_files.unwrap_or_default(),
+        },
+    )
+    .await;
+
+    // Emit the ledger entry on success, or when an interrupted turn
+    // produced partial text. If the request never entered the model
+    // path (for example, the scheduler rejected it because the model
+    // is already busy) there is no factual answer to remember.
+    let answer = res.as_ref().map(|r| r.text.clone()).unwrap_or_default();
+    if res.is_ok() || !answer.trim().is_empty() {
+        let entry = entry_for_answer(
+            // Turn numbering is per-session and assigned by the FE
+            // store. We pass 0 here as a "to be assigned" marker; the
+            // store overwrites it with the real turn index when it
+            // appends the entry. Keeping it on the BE side would require
+            // a stateful session registry we don't need yet.
+            0,
+            now_ms(),
+            "ask",
+            &answer,
+        );
+        let _ = app.emit(
+            &format!("assistant:ledger:{}", session_id),
+            AssistantLedgerEvent {
+                session_id: session_id.clone(),
+                entry,
+            },
+        );
+    }
+
+    res.map(|_| ())
+}
+
+fn render_opencode_ask_prompt(system: Option<&str>, messages: &[ChatMsg]) -> String {
+    let mut out = String::new();
+    out.push_str("Conversation:\n");
+    for m in messages {
+        out.push_str(match m.role.as_str() {
+            "assistant" => "Assistant: ",
+            "system" => "System: ",
+            _ => "User: ",
+        });
+        out.push_str(m.content.trim());
+        out.push_str("\n\n");
+    }
+    if let Some(system) = system {
+        let system = system.trim();
+        if !system.is_empty() {
+            out.push_str("Additional context:\n");
+            out.push_str(system);
+            out.push_str("\n\n");
         }
-        (Some(base), _) => Some(base),
-        (None, Some(extra)) if !extra.trim().is_empty() => Some(extra),
-        _ => None,
-    };
-
-    // We need the model's final answer text to build the ledger
-    // entry. The cheapest way: piggy-back on the `ollama:chat:*`
-    // stream by listening locally for tokens, then call the existing
-    // `ollama_chat` so the FE keeps getting the live stream too.
-    //
-    // We avoid duplicating the streaming logic — it would be a copy
-    // of `ollama_chat` plus a divergence risk. Instead, we kick off
-    // a local listener that accumulates tokens, then call
-    // `ollama_chat` and await its completion.
-    let evt = format!("ollama:chat:{}", request_id);
-    let accum: std::sync::Arc<parking_lot::Mutex<String>> = Default::default();
-    let accum_for_handler = accum.clone();
-    let listener_handle = app.listen(evt.clone(), move |event| {
-        let payload = event.payload();
-        if let Ok(v) = serde_json::from_str::<serde_json::Value>(payload) {
-            if let Some(tok) = v.get("token").and_then(|t| t.as_str()) {
-                accum_for_handler.lock().push_str(tok);
-            }
-        }
-    });
-
-    let chat_req = ChatRequest {
-        model,
-        messages,
-        system: merged_system,
-        temperature,
-        num_ctx,
-    };
-    let res = ollama_chat(app.clone(), state, request_id.clone(), chat_req).await;
-    // Always release the listener — even on error — so we don't
-    // leak background subscribers.
-    app.unlisten(listener_handle);
-
-    // Emit the ledger entry regardless of error status: an
-    // interrupted Ask turn that produced partial text is still a
-    // factual turn ("answered: …(partial)"), and the FE store can
-    // present it correctly. An empty accumulation produces an
-    // `AnsweredOnly { summary: "(empty answer)" }` via
-    // `entry_for_answer`, which is harmless.
-    let answer = accum.lock().clone();
-    let entry = entry_for_answer(
-        // Turn numbering is per-session and assigned by the FE
-        // store. We pass 0 here as a "to be assigned" marker; the
-        // store overwrites it with the real turn index when it
-        // appends the entry. Keeping it on the BE side would require
-        // a stateful session registry we don't need yet.
-        0,
-        now_ms(),
-        "ask",
-        &answer,
-    );
-    let _ = app.emit(
-        &format!("assistant:ledger:{}", session_id),
-        AssistantLedgerEvent { session_id: session_id.clone(), entry },
-    );
-
-    res
+    }
+    out.push_str("Answer the latest user message. For file explanation questions, center the answer on the named or attached file and include a compact Key identifiers sentence with exact identifiers, dotted method names, and configuration keys visible in that file. For object methods, preserve their dotted form such as app.handle or app.use.");
+    out
 }
 
 /// Inbound payload for `agent_execute_plan`. Carries the plan text
@@ -256,6 +272,7 @@ pub async fn agent_execute_plan(
                 lint_command: None,
                 open_tabs: None,
                 active_file: None,
+                attached_files: None,
                 ledger,
             };
             agent_continue(app, state, request_id, cont).await
@@ -280,6 +297,7 @@ pub async fn agent_execute_plan(
                 depth: None,
                 open_tabs: None,
                 active_file: None,
+                attached_files: None,
             };
             agent_run(app, state, request_id, req).await
         }

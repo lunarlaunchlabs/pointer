@@ -21,6 +21,7 @@
  */
 
 import type { Monaco } from "@monaco-editor/react";
+import { setupShikiMonaco } from "@/lib/shikiMonaco";
 
 let installed = false;
 
@@ -29,9 +30,177 @@ export function setupMonaco(monaco: Monaco) {
   installed = true;
 
   registerMdx(monaco);
+  registerVue(monaco);
+  registerEjs(monaco);
+  registerMakefile(monaco);
+  registerPrisma(monaco);
   registerExtensionAliases(monaco);
   configureTypescript(monaco);
   configureJson(monaco);
+  void setupShikiMonaco(monaco);
+}
+
+function registerVue(monaco: Monaco) {
+  const id = "vue";
+  monaco.languages.register({
+    id,
+    extensions: [".vue"],
+    aliases: ["Vue", "vue"],
+  });
+  monaco.languages.setMonarchTokensProvider(id, {
+    defaultToken: "",
+    tokenizer: {
+      root: [
+        [/<!--/, { token: "comment", next: "@comment" }],
+        [/<script\b[^>]*>/, { token: "tag", next: "@script" }],
+        [/<style\b[^>]*>/, { token: "tag", next: "@style" }],
+        [/<\/?[A-Za-z][\w.-]*/, { token: "tag", next: "@tag" }],
+        [/\{\{/, { token: "delimiter.bracket", next: "@mustache" }],
+      ],
+      tag: [
+        [/\/?>/, { token: "tag", next: "@pop" }],
+        [/[:@#]?[A-Za-z_][\w:-]*(?=\s*=)/, "attribute.name"],
+        [/[:@#]?[A-Za-z_][\w:-]*/, "attribute.name"],
+        [/=/, "delimiter"],
+        [/"[^"]*"/, "string"],
+        [/'[^']*'/, "string"],
+        [/\{\{/, { token: "delimiter.bracket", next: "@mustache" }],
+      ],
+      mustache: [
+        [/\}\}/, { token: "delimiter.bracket", next: "@pop" }],
+        [/\b(v-if|v-for|v-model|true|false|null|undefined|return)\b/, "keyword"],
+        [/[A-Za-z_$][\w$]*/, "identifier"],
+        [/"[^"]*"/, "string"],
+        [/'[^']*'/, "string"],
+        [/[0-9]+(?:\.[0-9]+)?/, "number"],
+        [/[{}()[\].,?:+\-*/%&|!<>=]+/, "delimiter"],
+      ],
+      script: [
+        [/<\/script\s*>/, { token: "tag", next: "@pop" }],
+        [/\/\/.*$/, "comment"],
+        [/\/\*/, { token: "comment", next: "@blockComment" }],
+        [/\b(import|export|from|default|const|let|var|function|async|await|return|if|else|for|while|class|new|this)\b/, "keyword"],
+        [/\b(true|false|null|undefined)\b/, "constant"],
+        [/"([^"\\]|\\.)*$/, "string.invalid"],
+        [/'([^'\\]|\\.)*$/, "string.invalid"],
+        [/`/, { token: "string", next: "@templateString" }],
+        [/"([^"\\]|\\.)*"/, "string"],
+        [/'([^'\\]|\\.)*'/, "string"],
+        [/[A-Za-z_$][\w$]*/, "identifier"],
+        [/[0-9]+(?:\.[0-9]+)?/, "number"],
+        [/[{}()[\].,;:+\-*/%&|!<>=]+/, "delimiter"],
+      ],
+      style: [
+        [/<\/style\s*>/, { token: "tag", next: "@pop" }],
+        [/\/\*/, { token: "comment", next: "@blockComment" }],
+        [/[.#]?[A-Za-z_-][\w-]*(?=\s*\{)/, "tag"],
+        [/[A-Za-z-]+(?=\s*:)/, "attribute.name"],
+        [/#[0-9A-Fa-f]{3,8}\b/, "number.hex"],
+        [/"[^"]*"/, "string"],
+        [/'[^']*'/, "string"],
+        [/[{}:;(),]/, "delimiter"],
+      ],
+      templateString: [
+        [/`/, { token: "string", next: "@pop" }],
+        [/\$\{[^}]*\}/, "delimiter.bracket"],
+        [/[^`$]+/, "string"],
+      ],
+      comment: [
+        [/-->/, { token: "comment", next: "@pop" }],
+        [/[^-]+/, "comment"],
+        [/./, "comment"],
+      ],
+      blockComment: [
+        [/\*\//, { token: "comment", next: "@pop" }],
+        [/[^*]+/, "comment"],
+        [/./, "comment"],
+      ],
+    },
+  });
+  monaco.languages.setLanguageConfiguration(id, {
+    comments: { blockComment: ["<!--", "-->"] },
+    brackets: [
+      ["{", "}"],
+      ["[", "]"],
+      ["(", ")"],
+      ["<", ">"],
+    ],
+    autoClosingPairs: [
+      { open: "{", close: "}" },
+      { open: "[", close: "]" },
+      { open: "(", close: ")" },
+      { open: "<", close: ">" },
+      { open: '"', close: '"' },
+      { open: "'", close: "'" },
+      { open: "`", close: "`" },
+    ],
+  });
+}
+
+function registerEjs(monaco: Monaco) {
+  const id = "ejs";
+  monaco.languages.register({
+    id,
+    extensions: [".ejs", ".tmpl"],
+    aliases: ["EJS", "ejs", "Template"],
+  });
+  monaco.languages.setMonarchTokensProvider(id, {
+    defaultToken: "",
+    tokenizer: {
+      root: [
+        [/<!--/, { token: "comment", next: "@comment" }],
+        [/<%#/, { token: "comment", next: "@ejsComment" }],
+        [/<%[-_=]?/, { token: "delimiter", next: "@ejs" }],
+        [/\{\{[#\/]?[A-Za-z_][\w.]*\}\}/, "variable"],
+        [/\$[A-Za-z_][\w.]*/, "variable"],
+        [/<\/?[A-Za-z][\w.-]*/, { token: "tag", next: "@tag" }],
+      ],
+      tag: [
+        [/\/?>/, { token: "tag", next: "@pop" }],
+        [/[A-Za-z_][\w:-]*(?=\s*=)/, "attribute.name"],
+        [/=/, "delimiter"],
+        [/"[^"]*"/, "string"],
+        [/'[^']*'/, "string"],
+        [/<%[-_=]?/, { token: "delimiter", next: "@ejs" }],
+      ],
+      ejs: [
+        [/%>/, { token: "delimiter", next: "@pop" }],
+        [/\b(const|let|var|function|if|else|for|while|return|await|async|new|true|false|null|undefined)\b/, "keyword"],
+        [/[A-Za-z_$][\w$]*/, "identifier"],
+        [/"[^"]*"/, "string"],
+        [/'[^']*'/, "string"],
+        [/[0-9]+(?:\.[0-9]+)?/, "number"],
+        [/[{}()[\].,?:+\-*/%&|!<>=]+/, "delimiter"],
+      ],
+      ejsComment: [
+        [/%>/, { token: "comment", next: "@pop" }],
+        [/[^%]+/, "comment"],
+        [/./, "comment"],
+      ],
+      comment: [
+        [/-->/, { token: "comment", next: "@pop" }],
+        [/[^-]+/, "comment"],
+        [/./, "comment"],
+      ],
+    },
+  });
+  monaco.languages.setLanguageConfiguration(id, {
+    comments: { blockComment: ["<!--", "-->"] },
+    brackets: [
+      ["{", "}"],
+      ["[", "]"],
+      ["(", ")"],
+      ["<", ">"],
+    ],
+    autoClosingPairs: [
+      { open: "{", close: "}" },
+      { open: "[", close: "]" },
+      { open: "(", close: ")" },
+      { open: "<", close: ">" },
+      { open: '"', close: '"' },
+      { open: "'", close: "'" },
+    ],
+  });
 }
 
 /**
@@ -115,6 +284,94 @@ function registerMdx(monaco: Monaco) {
       { open: "{", close: "}" },
       { open: "<", close: ">" },
       { open: "`", close: "`" },
+    ],
+  });
+}
+
+function registerMakefile(monaco: Monaco) {
+  const id = "makefile";
+  monaco.languages.register({
+    id,
+    extensions: [".mk"],
+    filenames: ["Makefile", "makefile", "GNUmakefile"],
+    aliases: ["Makefile", "makefile"],
+  });
+  monaco.languages.setMonarchTokensProvider(id, {
+    defaultToken: "",
+    tokenizer: {
+      root: [
+        [/^\s*#.*$/, "comment"],
+        [/^\s*include\b.*$/, "keyword"],
+        [/^\s*[-]?include\b.*$/, "keyword"],
+        [/^[A-Za-z0-9_.\/%$(){} -]+(?=\s*:)/, "type.identifier"],
+        [/[:;]/, "delimiter"],
+        [/^\t.*$/, "string"],
+        [/[$][({][A-Za-z0-9_.-]+[)}]/, "variable"],
+        [/[$][@<^+?*%]/, "variable.predefined"],
+        [/([A-Za-z0-9_.-]+)\s*(\?=|\+=|:=|=)/, ["variable", "operator"]],
+        [/"[^"]*"/, "string"],
+        [/'[^']*'/, "string"],
+      ],
+    },
+  });
+  monaco.languages.setLanguageConfiguration(id, {
+    comments: { lineComment: "#" },
+    brackets: [
+      ["(", ")"],
+      ["{", "}"],
+    ],
+    autoClosingPairs: [
+      { open: "(", close: ")" },
+      { open: "{", close: "}" },
+      { open: '"', close: '"' },
+      { open: "'", close: "'" },
+    ],
+  });
+}
+
+function registerPrisma(monaco: Monaco) {
+  const id = "prisma";
+  monaco.languages.register({
+    id,
+    extensions: [".prisma"],
+    aliases: ["Prisma", "prisma"],
+  });
+  monaco.languages.setMonarchTokensProvider(id, {
+    defaultToken: "",
+    tokenizer: {
+      root: [
+        [/\/\/.*$/, "comment"],
+        [/\/\*/, { token: "comment", next: "@comment" }],
+        [/\b(generator|datasource|model|enum|type|view)\b/, "keyword"],
+        [/\b(provider|url|shadowDatabaseUrl|relationMode|previewFeatures)\b/, "attribute.name"],
+        [/\b(String|Boolean|Int|BigInt|Float|Decimal|DateTime|Json|Bytes)\b/, "type"],
+        [/@{1,2}[A-Za-z_][\w.]*/, "annotation"],
+        [/\b(true|false|null)\b/, "constant"],
+        [/"[^"]*"/, "string"],
+        [/'[^']*'/, "string"],
+        [/[{}()[\],]/, "delimiter"],
+        [/[A-Za-z_]\w*(?=\s*[{(])/, "type.identifier"],
+        [/[A-Za-z_]\w*/, "identifier"],
+      ],
+      comment: [
+        [/[^\/*]+/, "comment"],
+        [/\*\//, { token: "comment", next: "@pop" }],
+        [/[\/*]/, "comment"],
+      ],
+    },
+  });
+  monaco.languages.setLanguageConfiguration(id, {
+    comments: { lineComment: "//", blockComment: ["/*", "*/"] },
+    brackets: [
+      ["{", "}"],
+      ["(", ")"],
+      ["[", "]"],
+    ],
+    autoClosingPairs: [
+      { open: "{", close: "}" },
+      { open: "(", close: ")" },
+      { open: "[", close: "]" },
+      { open: '"', close: '"' },
     ],
   });
 }

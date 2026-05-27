@@ -11,8 +11,6 @@ pub enum AppError {
     Json(#[from] serde_json::Error),
     #[error("notify: {0}")]
     Notify(#[from] notify::Error),
-    #[error("keyring: {0}")]
-    Keyring(#[from] keyring::Error),
     #[error("sqlite: {0}")]
     Sqlite(#[from] rusqlite::Error),
     #[error("path outside workspace: {0}")]

@@ -1,6 +1,9 @@
 import { useEffect, useState } from "react";
 import { ChevronDown, ChevronRight } from "lucide-react";
 import { useEditorStore } from "@/store/editor";
+import { ipc, type LspDocumentSymbol } from "@/lib/ipc";
+import { vueOutlineSymbols } from "@/lib/vueIntelligence";
+import { pathFromMonacoUri } from "@/lib/monacoUri";
 import type * as MonacoNs from "monaco-editor";
 
 /**
@@ -47,7 +50,7 @@ export function Outline() {
         const monaco: typeof MonacoNs = await import("monaco-editor");
         const model = monaco.editor
           .getModels()
-          .find((m) => m.uri.path === active.path);
+          .find((m) => pathFromMonacoUri(m.uri.toString()) === active.path);
         if (!model) {
           if (!cancelled) {
             setItems([]);
@@ -72,6 +75,31 @@ export function Outline() {
           .getRootElement?.()
           ? null
           : null;
+        const lspSymbols = await ipc
+          .lspDocumentSymbols({
+            path: active.path,
+            language: active.language,
+            content: active.content,
+          })
+          .catch(() => []);
+        if (active.language === "vue") {
+          const fallback = scanByRegex(model.getValue(), active.language);
+          if (fallback.length > 0) {
+            if (!cancelled) {
+              setItems(fallback);
+              setError(null);
+            }
+            return;
+          }
+        }
+        if (lspSymbols.length > 0) {
+          if (!cancelled) {
+            setItems(lspSymbols.map(fromLspSymbol));
+            setError(null);
+          }
+          return;
+        }
+
         // Fall back to a regex-based scan if Monaco's symbol APIs
         // aren't reachable — gives at least functions/classes for
         // most C-style languages. The provider-based path lives
@@ -139,6 +167,60 @@ export function Outline() {
       </div>
     </div>
   );
+}
+
+function fromLspSymbol(symbol: LspDocumentSymbol): OutlineItem {
+  return {
+    name: symbol.name,
+    kindLabel: symbolKindLabel(symbol.kind),
+    line: symbol.line,
+    column: symbol.column,
+    detail: symbol.detail ?? undefined,
+    children: symbol.children.map(fromLspSymbol),
+  };
+}
+
+function symbolKindLabel(kind: number): string {
+  switch (kind) {
+    case 2:
+      return "Module";
+    case 3:
+      return "Namespace";
+    case 4:
+      return "Package";
+    case 5:
+      return "Class";
+    case 6:
+      return "Method";
+    case 7:
+      return "Property";
+    case 8:
+      return "Field";
+    case 9:
+      return "Constructor";
+    case 10:
+      return "Enum";
+    case 11:
+      return "Interface";
+    case 12:
+      return "Function";
+    case 13:
+      return "Variable";
+    case 14:
+      return "Constant";
+    case 18:
+      return "Array";
+    case 22:
+      return "Struct";
+    case 23:
+      return "Event";
+    case 24:
+      return "Operator";
+    case 25:
+      return "Type";
+    default:
+      return "Symbol";
+  }
 }
 
 function OutlineRow({
@@ -256,6 +338,26 @@ export function scanByRegex(source: string, language: string): OutlineItem[] {
       if (m) push(m[2], `H${m[1].length}`, i);
     }
     return out;
+  }
+
+  if (language === "vue") {
+    return vueOutlineSymbols(source).map((symbol) => ({
+      name: symbol.name,
+      kindLabel:
+        symbol.kind === "component"
+          ? "Component"
+          : symbol.kind === "computed"
+          ? "Computed"
+          : symbol.kind === "data"
+          ? "Data"
+          : symbol.kind === "method"
+          ? "Method"
+          : symbol.kind === "prop"
+          ? "Prop"
+          : "Setup",
+      line: symbol.line,
+      column: symbol.column,
+    }));
   }
 
   // Generic C-style: function, class, interface, type, enum, const fn.

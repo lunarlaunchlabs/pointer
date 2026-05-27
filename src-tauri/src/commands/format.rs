@@ -26,7 +26,7 @@
 use crate::error::AppResult;
 use serde::{Deserialize, Serialize};
 use std::io::Write;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -56,14 +56,12 @@ pub async fn format_text(path: String, content: String) -> AppResult<FormatResul
         // Prettier handles a huge chunk of the JS/Web/Data ecosystem.
         "js" | "jsx" | "ts" | "tsx" | "mjs" | "cjs" | "css" | "scss" | "less" | "json"
         | "jsonc" | "html" | "htm" | "md" | "mdx" | "yaml" | "yml" | "vue" | "svelte" => {
-            vec![
-                FormatterCmd::new(
-                    "prettier",
-                    &["--stdin-filepath", &path],
-                ),
-            ]
+            vec![FormatterCmd::new("prettier", &["--stdin-filepath", &path])]
         }
-        "rs" => vec![FormatterCmd::new("rustfmt", &["--emit", "stdout", "--edition", "2021"])],
+        "rs" => vec![FormatterCmd::new(
+            "rustfmt",
+            &["--emit", "stdout", "--edition", "2021"],
+        )],
         "go" => vec![FormatterCmd::new("gofmt", &[])],
         "py" => vec![
             FormatterCmd::new("black", &["--quiet", "-"]),
@@ -78,7 +76,7 @@ pub async fn format_text(path: String, content: String) -> AppResult<FormatResul
 
     let mut last_err: Option<String> = None;
     for cmd in &candidates {
-        match run_formatter(cmd, &content) {
+        match run_formatter(cmd, &content, Path::new(&path)) {
             Ok(Some(out)) => {
                 return Ok(FormatResult {
                     content: out,
@@ -126,7 +124,11 @@ impl FormatterCmd {
 ///   • Ok(Some(out))  — formatter ran successfully
 ///   • Ok(None)       — binary not on PATH (try next candidate)
 ///   • Err(message)   — binary ran but exited non-zero
-fn run_formatter(cmd: &FormatterCmd, content: &str) -> Result<Option<String>, String> {
+fn run_formatter(
+    cmd: &FormatterCmd,
+    content: &str,
+    source_path: &Path,
+) -> Result<Option<String>, String> {
     let mut child = match Command::new(cmd.bin)
         .args(&cmd.args)
         .stdin(Stdio::piped())
@@ -137,10 +139,7 @@ fn run_formatter(cmd: &FormatterCmd, content: &str) -> Result<Option<String>, St
         // pyenv, etc.). Tauri inherits the launch environment
         // which on macOS doesn't include /opt/homebrew/bin from a
         // double-clicked .app.
-        .env(
-            "PATH",
-            augmented_path(),
-        )
+        .env("PATH", augmented_path(source_path))
         .spawn()
     {
         Ok(c) => c,
@@ -175,12 +174,42 @@ fn run_formatter(cmd: &FormatterCmd, content: &str) -> Result<Option<String>, St
 /// Build a PATH that includes the common locations user-installed
 /// formatters live in. Avoids the "Homebrew formatter not found
 /// because Tauri launched from Finder" footgun on macOS.
-fn augmented_path() -> String {
-    let mut paths: Vec<String> = std::env::var("PATH")
-        .unwrap_or_default()
-        .split(':')
-        .map(|s| s.to_string())
-        .collect();
+fn augmented_path(source_path: &Path) -> String {
+    let mut paths = project_tool_paths(source_path);
+    if let Some(existing) = std::env::var_os("PATH") {
+        paths.extend(std::env::split_paths(&existing).map(|p| p.display().to_string()));
+    }
+    append_standard_tool_paths(&mut paths);
+    std::env::join_paths(paths.iter().map(PathBuf::from))
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_else(|_| paths.join(":"))
+}
+
+fn project_tool_paths(source_path: &Path) -> Vec<String> {
+    let mut paths: Vec<String> = Vec::new();
+    let mut dir = if source_path.is_dir() {
+        source_path.to_path_buf()
+    } else {
+        source_path
+            .parent()
+            .unwrap_or_else(|| Path::new(""))
+            .to_path_buf()
+    };
+    for _ in 0..12 {
+        for sub in ["node_modules/.bin", ".venv/bin", "venv/bin", "vendor/bin"] {
+            let p = dir.join(sub);
+            if p.is_dir() {
+                paths.push(p.display().to_string());
+            }
+        }
+        if !dir.pop() {
+            break;
+        }
+    }
+    paths
+}
+
+fn append_standard_tool_paths(paths: &mut Vec<String>) {
     let extras = [
         "/opt/homebrew/bin",
         "/opt/homebrew/sbin",
@@ -204,7 +233,6 @@ fn augmented_path() -> String {
             }
         }
     }
-    paths.join(":")
 }
 
 impl FormatResult {
@@ -215,5 +243,33 @@ impl FormatResult {
             formatter: String::new(),
             error: None,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn augmented_path_prefers_repo_local_node_tools() {
+        let dir = tempfile::tempdir().unwrap();
+        let nested = dir.path().join("packages/app/src");
+        std::fs::create_dir_all(&nested).unwrap();
+        let bin = dir.path().join("packages/app/node_modules/.bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        let path = augmented_path(&nested.join("App.tsx"));
+        let first = path.split(':').next().unwrap_or_default();
+        assert_eq!(first, bin.display().to_string());
+    }
+
+    #[test]
+    fn augmented_path_finds_parent_virtualenv() {
+        let dir = tempfile::tempdir().unwrap();
+        let nested = dir.path().join("pkg/sub");
+        std::fs::create_dir_all(&nested).unwrap();
+        let bin = dir.path().join(".venv/bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        let path = augmented_path(&nested.join("module.py"));
+        assert!(path.split(':').any(|p| p == bin.display().to_string()));
     }
 }

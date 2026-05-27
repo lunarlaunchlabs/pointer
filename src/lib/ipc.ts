@@ -1,6 +1,7 @@
 import { invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import { nanoid } from "nanoid";
+import type { CatalogEntry } from "@/lib/modelCatalog";
 
 export type FsEntry = {
   name: string;
@@ -104,7 +105,6 @@ export type UninstallReport = {
 
 export type ResetOptions = {
   clear_settings?: boolean;
-  clear_hf_token?: boolean;
   clear_index?: boolean;
   stop_ollama?: boolean;
 };
@@ -184,23 +184,6 @@ export type GitBlameLine = {
   boundary: boolean;
 };
 
-export type HfTokenStatus = {
-  present: boolean;
-  /** Active source for reads: "keychain" when the keychain has it; "file"
-   *  otherwise. Null when nothing is saved. */
-  location: "keychain" | "file" | null;
-  /** Short preview like "hf_…3X9Q" so the user can verify they saved the
-   *  expected one without exposing the secret. */
-  preview: string | null;
-  /** Absolute path to the on-disk file fallback. Reported even when the
-   *  active source is the keychain so the user can verify on disk. */
-  file_path: string | null;
-  /** True if the secondary keychain entry holds the token. */
-  in_keychain: boolean;
-  /** True if the on-disk file holds the token. */
-  in_file: boolean;
-};
-
 export type SystemSnapshot = {
   cpu_percent: number;
   cpu_count: number;
@@ -238,6 +221,25 @@ export type LoadedModel = {
   expires_at: string | null;
 };
 
+export type InferenceJob = {
+  request_id: string;
+  model: string;
+  kind: string;
+  title: string;
+  started_at_ms: number;
+  updated_at_ms: number;
+  token_count: number;
+  cancellable: boolean;
+  interruptible: boolean;
+  cancelling: boolean;
+};
+
+export type InferenceSnapshot = {
+  active: InferenceJob[];
+  active_count: number;
+  updated_at_ms: number;
+};
+
 /** Kind reported by the Rust classifier — keep in sync with FileKind. */
 export type FileKind = "image" | "pdf" | "spreadsheet" | "plain" | "unsupported";
 
@@ -256,6 +258,112 @@ export type ProcessFileResult = {
   raw_bytes: number;
   used_model: boolean;
   model_name: string | null;
+};
+
+export type ProjectCheckInfo = {
+  kind: string;
+  command: string;
+};
+
+export type ProjectDiagnostic = {
+  uri: string;
+  name: string;
+  startLine: number;
+  startCol: number;
+  endLine: number;
+  endCol: number;
+  severity: "error" | "warning" | "info" | "hint";
+  message: string;
+  source: string;
+  code?: string | null;
+};
+
+export type ProjectCheckResult = {
+  detected: ProjectCheckInfo | null;
+  diagnostics: ProjectDiagnostic[];
+  rawOutput: string;
+  exitCode: number | null;
+  timedOut: boolean;
+};
+
+export type LanguageServerStatus = {
+  language: string;
+  label: string;
+  status: "ready" | "available" | "monaco" | "syntax" | "missing" | string;
+  detail: string;
+  command: string | null;
+  source: string;
+  capabilities: string[];
+};
+
+export type LspRange = {
+  startLine: number;
+  startColumn: number;
+  endLine: number;
+  endColumn: number;
+};
+
+export type LspHover = {
+  contents: string;
+  range: LspRange | null;
+};
+
+export type LspLocation = {
+  path: string;
+  line: number;
+  column: number;
+  endLine: number;
+  endColumn: number;
+};
+
+export type LspCompletionItem = {
+  label: string;
+  detail: string | null;
+  documentation: string | null;
+  kind: number | null;
+  insertText: string | null;
+  insertTextFormat: number | null;
+  filterText: string | null;
+  sortText: string | null;
+  preselect: boolean | null;
+  range: LspRange | null;
+  additionalTextEdits: { range: LspRange; newText: string }[];
+  data: unknown | null;
+};
+
+export type LspDocumentSymbol = {
+  name: string;
+  kind: number;
+  detail: string | null;
+  line: number;
+  column: number;
+  endLine: number;
+  endColumn: number;
+  children: LspDocumentSymbol[];
+};
+
+export type LspDiagnosticEvent = {
+  uri: string;
+  path: string;
+  diagnostics: {
+    range: LspRange;
+    severity: number | null;
+    code: string | null;
+    source: string | null;
+    message: string;
+  }[];
+};
+
+export type LspDocumentRequest = {
+  path: string;
+  language: string;
+  content: string;
+};
+
+export type LspTextDocumentRequest = LspDocumentRequest & {
+  line: number;
+  column: number;
+  limit?: number;
 };
 
 // ---------- MCP (Model Context Protocol) -----------------------------------
@@ -379,6 +487,26 @@ export const ipc = {
     ),
   revealInFiler: (path: string) =>
     invoke<void>("reveal_in_filer", { path }),
+  projectCheckDetect: () =>
+    invoke<ProjectCheckInfo | null>("project_check_detect"),
+  projectCheckRun: () => invoke<ProjectCheckResult>("project_check_run"),
+  lspStatus: (workspace?: string) =>
+    invoke<LanguageServerStatus[]>("lsp_status", { workspace }),
+  lspDidOpen: (doc: LspDocumentRequest) =>
+    invoke<void>("lsp_did_open", { doc }),
+  lspDidChange: (doc: LspDocumentRequest) =>
+    invoke<void>("lsp_did_change", { doc }),
+  lspHover: (req: LspTextDocumentRequest) =>
+    invoke<LspHover | null>("lsp_hover", { req }),
+  lspDefinition: (req: LspTextDocumentRequest) =>
+    invoke<LspLocation[]>("lsp_definition", { req }),
+  lspCompletion: (req: LspTextDocumentRequest) =>
+    invoke<LspCompletionItem[]>("lsp_completion", { req }),
+  lspCompletionResolve: (
+    req: LspDocumentRequest & { item: LspCompletionItem },
+  ) => invoke<LspCompletionItem>("lsp_completion_resolve", { req }),
+  lspDocumentSymbols: (doc: LspDocumentRequest) =>
+    invoke<LspDocumentSymbol[]>("lsp_document_symbols", { doc }),
 
   // Git — read-only status. Always returns a value; errors are encoded
   // inline so callers don't need to wrap every poll in try/catch.
@@ -437,6 +565,9 @@ export const ipc = {
   ollamaUnloadModel: (model: string) =>
     invoke<void>("ollama_unload_model", { model }),
   ollamaPs: () => invoke<LoadedModel[]>("ollama_ps"),
+  inferenceStatus: () => invoke<InferenceSnapshot>("inference_status"),
+  inferenceCancel: (requestId: string) =>
+    invoke<boolean>("inference_cancel", { requestId }),
   ollamaDeleteModel: (model: string) =>
     invoke<void>("ollama_delete_model", { model }),
   ollamaUninstall: (purgeModels: boolean) =>
@@ -452,6 +583,8 @@ export const ipc = {
       system?: string;
       temperature?: number;
       num_ctx?: number;
+      purpose?: string;
+      title?: string;
     },
   ) => invoke<void>("ollama_chat", { requestId, request }),
   ollamaGenerate: (
@@ -464,6 +597,8 @@ export const ipc = {
       temperature?: number;
       num_predict?: number;
       raw?: boolean;
+      purpose?: string;
+      title?: string;
     },
   ) => invoke<void>("ollama_generate", { requestId, request }),
   ollamaFim: (
@@ -481,29 +616,11 @@ export const ipc = {
   ollamaCancel: (requestId: string) =>
     invoke<boolean>("ollama_cancel", { requestId }),
 
-  // Models / HF
+  // Models / Ollama library
   recommendModels: () => invoke<ModelRecommendation[]>("recommend_models"),
   systemMemoryGb: () => invoke<number>("system_memory_gb"),
-  setHfToken: (token: string) =>
-    invoke<HfTokenStatus>("set_hf_token", { token }),
-  getHfToken: () => invoke<string | null>("get_hf_token"),
-  hfTokenStatus: () => invoke<HfTokenStatus>("hf_token_status"),
-  clearHfToken: () => invoke<void>("clear_hf_token"),
-  hfSearchModels: (query: string, limit = 20) =>
-    invoke<
-      {
-        id: string;
-        downloads: number | null;
-        likes: number | null;
-        gated: boolean;
-        tags: string[];
-        pipeline_tag: string | null;
-      }[]
-    >("hf_search_models", { query, limit }),
-  hfImportGguf: (
-    requestId: string,
-    request: { repo: string; file: string; local_name?: string },
-  ) => invoke<string>("hf_import_gguf", { requestId, request }),
+  ollamaLibraryCatalog: () =>
+    invoke<CatalogEntry[]>("ollama_library_catalog"),
 
   // Context
   indexWorkspace: (request: { root: string; embed_model?: string }) =>
@@ -534,6 +651,7 @@ export const ipc = {
       // is looking at without needing to ask.
       open_tabs?: string[];
       active_file?: string;
+      attached_files?: string[];
     },
   ) => invoke<void>("agent_run", { requestId, request }),
   /**
@@ -556,6 +674,7 @@ export const ipc = {
       lint_command?: string;
       open_tabs?: string[];
       active_file?: string;
+      attached_files?: string[];
       /**
        * Prior action ledger persisted by the assistant store. When
        * sent, the backend resumes the same factual record so the
@@ -659,6 +778,7 @@ export const ipc = {
       system_extras?: string;
       temperature?: number;
       num_ctx?: number;
+      attached_files?: string[];
     },
   ) => invoke<void>("assistant_ask", { requestId, request }),
   agentExecutePlan: (
@@ -749,5 +869,13 @@ export async function listenEvent<T>(
   event: string,
   cb: (payload: T) => void,
 ): Promise<UnlistenFn> {
-  return await listen<T>(event, (e) => cb(e.payload));
+  try {
+    return await listen<T>(event, (e) => cb(e.payload));
+  } catch {
+    // The Vite dev surface can be opened outside the Tauri shell during
+    // browser smoke tests. In that environment event subscriptions are not
+    // available, so callers get a harmless unsubscribe function instead of a
+    // console-breaking runtime error.
+    return () => undefined;
+  }
 }

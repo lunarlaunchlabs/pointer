@@ -21,6 +21,7 @@
 //! same.
 
 use crate::error::{AppError, AppResult};
+use crate::services::inference::{acquire_inference, InferenceClaim, InferencePolicy};
 use crate::state::AppState;
 use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
@@ -54,6 +55,18 @@ pub async fn ollama_fast_apply(
     request_id: String,
     request: FastApplyRequest,
 ) -> AppResult<FastApplyResult> {
+    let permit = acquire_inference(
+        &app,
+        &state,
+        InferenceClaim::new(
+            request_id.clone(),
+            request.model.clone(),
+            "fast_apply",
+            format!("Fast apply {}", request.path),
+        ),
+        InferencePolicy::RejectBusy,
+    )
+    .await?;
     let mut cancel = state.cancels.lock().issue(&request_id);
     let evt = format!("fast_apply:{}", request_id);
     let started = std::time::Instant::now();
@@ -108,6 +121,9 @@ pub async fn ollama_fast_apply(
                             if let Ok(v) = serde_json::from_slice::<Value>(line) {
                                 if let Some(c) = v.get("message").and_then(|m| m.get("content")).and_then(|c| c.as_str()) {
                                     proposed.push_str(c);
+                                    if !c.is_empty() {
+                                        permit.note_tokens(1);
+                                    }
                                     let _ = app.emit(&evt, json!({"token": c}));
                                 }
                             }
@@ -181,8 +197,16 @@ fn shared_suffix_len(a: &str, b: &str) -> usize {
 
 fn trigram_overlap(a: &str, b: &str) -> f32 {
     use std::collections::HashSet;
-    let ta: HashSet<&str> = a.as_bytes().windows(3).filter_map(|w| std::str::from_utf8(w).ok()).collect();
-    let tb: HashSet<&str> = b.as_bytes().windows(3).filter_map(|w| std::str::from_utf8(w).ok()).collect();
+    let ta: HashSet<&str> = a
+        .as_bytes()
+        .windows(3)
+        .filter_map(|w| std::str::from_utf8(w).ok())
+        .collect();
+    let tb: HashSet<&str> = b
+        .as_bytes()
+        .windows(3)
+        .filter_map(|w| std::str::from_utf8(w).ok())
+        .collect();
     if ta.is_empty() || tb.is_empty() {
         return 0.0;
     }

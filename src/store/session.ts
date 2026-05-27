@@ -14,7 +14,7 @@ const MAX_RECENTS = 8;
  *  legacy `"chat"` and `"agent"` views. The `init()` migration below maps
  *  old persisted values to `"assistant"` so an existing user's dock
  *  selection survives the rename. */
-export type DockView = "assistant" | "history" | "ai" | "scm" | null;
+export type DockView = "assistant" | "history" | "ai" | "activity" | "scm" | null;
 
 /** Per-file editor state we restore across sessions: where the
  *  cursor was, where the viewport was scrolled to, and any
@@ -84,6 +84,7 @@ type SessionState = SessionSnapshot & {
   noteViewState: (path: string, vs: EditorViewState) => void;
   noteHotExit: (path: string, content: string | null) => void;
   notePinnedTabs: (paths: string[]) => void;
+  rewritePathPrefix: (oldPath: string, newPath: string) => void;
 };
 
 export const useSession = create<SessionState>((set, get) => ({
@@ -228,7 +229,40 @@ export const useSession = create<SessionState>((set, get) => ({
     set({ pinnedTabs: paths });
     persistAsync(PINNED_TABS_KEY, paths);
   },
+  rewritePathPrefix: (oldPath, newPath) => {
+    const rewrite = (path: string): string => rewritePathPrefix(path, oldPath, newPath);
+    const s = get();
+    const openTabs = (s.openTabs ?? []).map(rewrite);
+    const activePath = s.activePath ? rewrite(s.activePath) : s.activePath;
+    const pinnedTabs = s.pinnedTabs.map(rewrite);
+    const viewState = rewriteRecordKeys(s.viewState, rewrite);
+    const hotExitBuffers = rewriteRecordKeys(s.hotExitBuffers, rewrite);
+    set({ openTabs, activePath, pinnedTabs, viewState, hotExitBuffers });
+    flush(get());
+    persistAsync(PINNED_TABS_KEY, pinnedTabs);
+    persistAsync(VIEW_STATE_KEY, viewState);
+    persistAsync(HOT_EXIT_KEY, hotExitBuffers);
+  },
 }));
+
+function rewritePathPrefix(path: string, oldPath: string, newPath: string): string {
+  if (path === oldPath) return newPath;
+  return path.startsWith(`${oldPath}/`) ? `${newPath}${path.slice(oldPath.length)}` : path;
+}
+
+function rewriteRecordKeys<T>(
+  record: Record<string, T>,
+  rewrite: (path: string) => string,
+): Record<string, T> {
+  let changed = false;
+  const next: Record<string, T> = {};
+  for (const [path, value] of Object.entries(record)) {
+    const rewritten = rewrite(path);
+    if (rewritten !== path) changed = true;
+    next[rewritten] = value;
+  }
+  return changed ? next : record;
+}
 
 function flush(s: SessionState) {
   persistAsync<SessionSnapshot>(SESSION_KEY, {

@@ -21,7 +21,10 @@ pub struct PromptBudget {
 
 impl PromptBudget {
     pub fn new(max_tokens: usize) -> Self {
-        Self { max_tokens, pieces: vec![] }
+        Self {
+            max_tokens,
+            pieces: vec![],
+        }
     }
     pub fn push(&mut self, priority: i32, tag: &'static str, text: impl Into<String>) {
         self.pieces.push(Piece {
@@ -45,7 +48,12 @@ impl PromptBudget {
             }
         }
         // Re-sort by original insertion order for assembly.
-        included.sort_by_key(|p| self.pieces.iter().position(|q| std::ptr::eq(q, *p)).unwrap_or(0));
+        included.sort_by_key(|p| {
+            self.pieces
+                .iter()
+                .position(|q| std::ptr::eq(q, *p))
+                .unwrap_or(0)
+        });
         let mut out = String::with_capacity(used);
         let mut tags = vec![];
         for p in included {

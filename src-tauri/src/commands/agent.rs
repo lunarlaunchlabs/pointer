@@ -49,9 +49,9 @@
 #![allow(clippy::too_many_arguments)]
 
 use crate::error::AppResult;
-use crate::services::history::{
-    entry_for_answer, entry_for_tool, ActionLedger, LedgerEntry,
-};
+use crate::services::history::{entry_for_answer, entry_for_tool, ActionLedger, LedgerEntry};
+use crate::services::inference::{acquire_inference, InferenceClaim, InferencePolicy};
+use crate::services::opencode::{run_opencode, OpenCodeMode, OpenCodeRunRequest};
 use crate::state::AppState;
 use futures_util::StreamExt;
 use parking_lot::Mutex;
@@ -111,21 +111,15 @@ const STREAM_IDLE_TIMEOUT_S: u64 = 90;
 /// top-level UI `Ask` mode (chat-only, no tools) is NOT an
 /// `ExecutionMode` — it goes through `assistant_ask` instead and
 /// never enters the agent loop.
-#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, Deserialize, Serialize, PartialEq, Eq)]
 pub enum ExecutionMode {
     #[serde(rename = "plan")]
     Plan,
     #[serde(rename = "ask", alias = "agent_approve")]
+    #[default]
     AgentApprove,
     #[serde(rename = "auto", alias = "agent_auto")]
     AgentAuto,
-}
-
-impl Default for ExecutionMode {
-    fn default() -> Self {
-        // Default mirrors the old default ("ask"-style approval).
-        ExecutionMode::AgentApprove
-    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -158,6 +152,8 @@ pub struct AgentRequest {
     pub open_tabs: Option<Vec<String>>,
     #[serde(default)]
     pub active_file: Option<String>,
+    #[serde(default)]
+    pub attached_files: Option<Vec<String>>,
 }
 
 /// Follow-up turn on an existing session. Same surface as `AgentRequest`
@@ -188,6 +184,8 @@ pub struct AgentContinueRequest {
     pub open_tabs: Option<Vec<String>>,
     #[serde(default)]
     pub active_file: Option<String>,
+    #[serde(default)]
+    pub attached_files: Option<Vec<String>>,
     /// Prior action ledger persisted by the FE. When present we
     /// resume the same factual record so the model sees one
     /// `<previous_work>` block covering every turn of the session,
@@ -284,7 +282,10 @@ pub async fn agent_run(
     // with the prior transcript instead.
     let max_steps = request.max_steps.unwrap_or(DEFAULT_MAX_STEPS).max(1);
     let max_runtime = Duration::from_secs(
-        request.max_runtime_secs.unwrap_or(DEFAULT_MAX_RUNTIME_S).max(15),
+        request
+            .max_runtime_secs
+            .unwrap_or(DEFAULT_MAX_RUNTIME_S)
+            .max(15),
     );
     let mode = request.mode.unwrap_or_default();
     let depth = request.depth.unwrap_or(0);
@@ -312,6 +313,45 @@ pub async fn agent_run(
             "workspace": workspace,
         }),
     );
+
+    let open_tabs = request.open_tabs.clone().unwrap_or_default();
+    let active_file = request.active_file.clone();
+    let attached_files = request.attached_files.clone().unwrap_or_default();
+    let opencode_mode = if mode == ExecutionMode::Plan {
+        OpenCodeMode::Plan
+    } else {
+        OpenCodeMode::Agent
+    };
+    let prompt = render_opencode_agent_prompt(
+        &workspace,
+        mode,
+        request.context.as_deref(),
+        &request.goal,
+        &open_tabs,
+        active_file.as_deref(),
+    );
+    if use_opencode_agent_runtime() {
+        return run_opencode(
+            app.clone(),
+            &state,
+            OpenCodeRunRequest {
+                request_id: request_id.clone(),
+                model: request.model.clone(),
+                workspace: workspace.clone(),
+                prompt,
+                mode: opencode_mode,
+                title: match opencode_mode {
+                    OpenCodeMode::Plan => "Plan mode".into(),
+                    OpenCodeMode::Agent => "Agent mode".into(),
+                    OpenCodeMode::Ask => "Ask mode".into(),
+                },
+                max_steps,
+                files: attached_files,
+            },
+        )
+        .await
+        .map(|_| ());
+    }
 
     // Compose the system prompt:
     //   - the static AGENT_SYSTEM contract,
@@ -374,7 +414,10 @@ pub async fn agent_continue(
 ) -> AppResult<()> {
     let max_steps = request.max_steps.unwrap_or(DEFAULT_MAX_STEPS).max(1);
     let max_runtime = Duration::from_secs(
-        request.max_runtime_secs.unwrap_or(DEFAULT_MAX_RUNTIME_S).max(15),
+        request
+            .max_runtime_secs
+            .unwrap_or(DEFAULT_MAX_RUNTIME_S)
+            .max(15),
     );
     let mode = request.mode.unwrap_or_default();
     let lint_command = request.lint_command.clone();
@@ -404,6 +447,46 @@ pub async fn agent_continue(
             "workspace": workspace,
         }),
     );
+
+    let open_tabs = request.open_tabs.clone().unwrap_or_default();
+    let active_file = request.active_file.clone();
+    let attached_files = request.attached_files.clone().unwrap_or_default();
+    let opencode_mode = if mode == ExecutionMode::Plan {
+        OpenCodeMode::Plan
+    } else {
+        OpenCodeMode::Agent
+    };
+    let prompt = render_opencode_continue_prompt(
+        &workspace,
+        mode,
+        &request.transcript,
+        request.context.as_deref(),
+        &request.user_message,
+        &open_tabs,
+        active_file.as_deref(),
+    );
+    if use_opencode_agent_runtime() {
+        return run_opencode(
+            app.clone(),
+            &state,
+            OpenCodeRunRequest {
+                request_id: request_id.clone(),
+                model: request.model.clone(),
+                workspace: workspace.clone(),
+                prompt,
+                mode: opencode_mode,
+                title: match opencode_mode {
+                    OpenCodeMode::Plan => "Plan mode".into(),
+                    OpenCodeMode::Agent => "Agent mode".into(),
+                    OpenCodeMode::Ask => "Ask mode".into(),
+                },
+                max_steps,
+                files: attached_files,
+            },
+        )
+        .await
+        .map(|_| ());
+    }
 
     let open_tabs = request.open_tabs.clone().unwrap_or_default();
     let active_file = request.active_file.clone();
@@ -465,6 +548,86 @@ pub async fn agent_continue(
     .await
 }
 
+fn render_opencode_agent_prompt(
+    workspace: &str,
+    mode: ExecutionMode,
+    context: Option<&str>,
+    goal: &str,
+    open_tabs: &[String],
+    active_file: Option<&str>,
+) -> String {
+    let mut out = String::new();
+    out.push_str(&format!("Workspace: {workspace}\n"));
+    out.push_str(&format!("Mode: {}\n\n", execution_mode_label(mode)));
+    if let Some(active) = active_file {
+        if !active.trim().is_empty() {
+            out.push_str("Active editor file:\n");
+            out.push_str(active.trim());
+            out.push_str("\n\n");
+        }
+    }
+    if !open_tabs.is_empty() {
+        out.push_str("Open tabs:\n");
+        for tab in open_tabs.iter().take(20) {
+            out.push_str("- ");
+            out.push_str(tab);
+            out.push('\n');
+        }
+        out.push('\n');
+    }
+    if let Some(context) = context {
+        let context = context.trim();
+        if !context.is_empty() {
+            out.push_str("Attached context:\n");
+            out.push_str(context);
+            out.push_str("\n\n");
+        }
+    }
+    out.push_str("User goal:\n");
+    out.push_str(goal.trim());
+    if mode == ExecutionMode::Plan {
+        out.push_str("\n\nFinal response: provide a concrete executable plan with exact files and verification. If investigation shows no code change is warranted, say that directly and include the exact files/tests that prove it.");
+    }
+    out
+}
+
+fn render_opencode_continue_prompt(
+    workspace: &str,
+    mode: ExecutionMode,
+    transcript: &[AgentMessage],
+    context: Option<&str>,
+    user_message: &str,
+    open_tabs: &[String],
+    active_file: Option<&str>,
+) -> String {
+    let mut out = render_opencode_agent_prompt(
+        workspace,
+        mode,
+        context,
+        user_message,
+        open_tabs,
+        active_file,
+    );
+    if !transcript.is_empty() {
+        out.push_str("\n\nPrevious Pointer transcript summary/context:\n");
+        for msg in transcript.iter().rev().take(12).rev() {
+            out.push_str(match msg.role.as_str() {
+                "assistant" => "Assistant: ",
+                "tool" => "Tool: ",
+                "system" => "System: ",
+                _ => "User: ",
+            });
+            out.push_str(msg.content.trim());
+            out.push_str("\n\n");
+        }
+    }
+    out
+}
+
+fn use_opencode_agent_runtime() -> bool {
+    true
+}
+
 /// Cheap preflight planner: a single tool-free model call that returns
 /// `{steps, summary}`. The UI uses this to pre-fill the Max-steps
 /// input with a model-suggested budget for the current goal. We clamp
@@ -472,11 +635,24 @@ pub async fn agent_continue(
 /// `max_steps`.
 #[tauri::command]
 pub async fn agent_estimate(
+    app: AppHandle,
     state: State<'_, AppState>,
     request_id: String,
     request: AgentEstimateRequest,
 ) -> AppResult<AgentEstimateResult> {
-    let _ = request_id; // reserved for future cancellation hooks
+    let _permit = acquire_inference(
+        &app,
+        &state,
+        InferenceClaim::new(
+            request_id.clone(),
+            request.model.clone(),
+            "planner",
+            "Agent estimate",
+        ),
+        InferencePolicy::RejectBusy,
+    )
+    .await?;
+    let mut cancel = state.cancels.lock().issue(&request_id);
     let mode = request.mode.unwrap_or_default();
     let workspace = request
         .workspace
@@ -507,12 +683,19 @@ pub async fn agent_estimate(
     });
 
     let client = reqwest::Client::new();
-    let resp = client
+    let send = client
         .post("http://127.0.0.1:11434/api/chat")
         .json(&body)
-        .send()
-        .await
-        .map_err(|e| crate::error::AppError::Msg(format!("estimate: {e}")))?;
+        .send();
+    let resp = tokio::select! {
+        _ = cancel.recv() => {
+            state.cancels.lock().clear(&request_id);
+            return Err(crate::error::AppError::Msg("estimate: cancelled".into()));
+        }
+        resp = send => resp
+            .map_err(|e| crate::error::AppError::Msg(format!("estimate: {e}")))?,
+    };
+    state.cancels.lock().clear(&request_id);
     if !resp.status().is_success() {
         let status = resp.status();
         let text = resp.text().await.unwrap_or_default();
@@ -541,7 +724,7 @@ pub async fn agent_estimate(
         .get("steps")
         .and_then(|v| v.as_u64())
         .ok_or_else(|| crate::error::AppError::Msg("estimate: missing `steps`".into()))?;
-    let steps = (steps_raw.max(1).min(100)) as u32;
+    let steps = steps_raw.clamp(1, 100) as u32;
     let summary = parsed
         .get("summary")
         .and_then(|v| v.as_str())
@@ -612,19 +795,44 @@ async fn run_agent_loop(
     mut transcript: Vec<Value>,
     mut ledger: ActionLedger,
 ) -> AppResult<()> {
+    let inference_kind = if mode == ExecutionMode::Plan {
+        "plan"
+    } else {
+        "agent"
+    };
+    let _inference_permit = acquire_inference(
+        &app,
+        &state,
+        InferenceClaim::new(
+            request_id.clone(),
+            model.clone(),
+            inference_kind,
+            match mode {
+                ExecutionMode::Plan => "Planning",
+                ExecutionMode::AgentApprove => "Agent run awaiting approvals",
+                ExecutionMode::AgentAuto => "Agent run",
+            },
+        ),
+        InferencePolicy::RejectBusy,
+    )
+    .await?;
     let mut cancel = state.cancels.lock().issue(&request_id);
     let evt = format!("agent:event:{}", request_id);
     let client = reqwest::Client::new();
     let started = Instant::now();
     let mut fingerprints: HashMap<u64, u32> = HashMap::new();
-    // Set the first time the model emits a prose-only turn (no
-    // tool, no final, no clarify). We forgive ONE such turn and
-    // ask the model to either take an action or finalize. Without
-    // this, larger reasoning models that pause to narrate between
-    // steps get killed mid-task. After the second prose-only turn
-    // we treat the buffer as an implicit final so a model that
-    // genuinely has nothing left to do still terminates cleanly.
-    let mut prose_redirect_used = false;
+    // Count prose-only and malformed-tool turns. We forgive a couple
+    // because local models often narrate or clip XML before settling
+    // into the protocol, but repeated failures still terminate rather
+    // than spinning forever.
+    let mut prose_redirect_count: u8 = 0;
+    let mut malformed_tool_redirect_count: u8 = 0;
+    // Tracks whether this plan run has inspected package.json before
+    // naming npm script argument forwarding. Without this, models
+    // often invent commands like `npm test -- file` that the
+    // manifest may not support.
+    let mut plan_quality_redirect_count: u8 = 0;
+    let mut manifest_read_for_plan = false;
     // Sliding window of recent fingerprints for cycle detection.
     // We look for repeats at windows of 1, 2, and 3 — three identical
     // calls in a row, A,B,A,B pings, and A,B,C,A,B,C cycles.
@@ -798,6 +1006,7 @@ async fn run_agent_loop(
                                                 }));
                                             }
                                             buf.push_str(c);
+                                            _inference_permit.note_tokens(1);
                                             let _ = app.emit(&evt, json!({"kind": "token", "step": step, "text": c}));
                                         }
                                     }
@@ -828,16 +1037,123 @@ async fn run_agent_loop(
         // parsing. Some checkpoints hallucinate a fake `<tool_result>`
         // (with invented file contents) and then emit a `<final>`
         // based on that fake. We discard those blocks so only the
-        // real tool call survives. The original `buf` is preserved
-        // in the transcript above for fidelity.
+        // real tool call survives. The sanitized turn replaces the
+        // raw assistant text in the model transcript so future turns
+        // never see invented tool output as conversation history.
         let parse_buf = sanitize_model_output(&buf);
+        if parse_buf != buf {
+            replace_last_assistant_turn(&mut transcript, parse_buf.clone());
+        }
 
         // Surface a <plan> block, if any, for the UI to render as a checklist.
-        if let Some(plan) = extract_block(&parse_buf, "plan") {
+        // In Plan mode, first reject the common bad shape where the model
+        // has already read files but the user-facing plan still says
+        // "inspect/read/identify" instead of giving exact implementation
+        // steps. The next good plan event supersedes this one in the UI.
+        let plan_block = extract_block(&parse_buf, "plan");
+        let needs_plan_rewrite = mode == ExecutionMode::Plan
+            && plan_block
+                .as_deref()
+                .map(plan_looks_like_discovery_checklist)
+                .unwrap_or(false);
+        let needs_command_rewrite = mode == ExecutionMode::Plan
+            && plan_block
+                .as_deref()
+                .map(|plan| {
+                    plan_uses_npm_test_forwarding(plan)
+                        || plan_uses_npm_run_script_without_dash_dash(plan)
+                        || plan_uses_bare_js_test_runner(plan)
+                })
+                .unwrap_or(false);
+        let needs_generic_test_rewrite = mode == ExecutionMode::Plan
+            && plan_block
+                .as_deref()
+                .map(plan_uses_generic_npm_test_despite_named_test)
+                .unwrap_or(false);
+        let needs_broad_test_rewrite = mode == ExecutionMode::Plan
+            && plan_block
+                .as_deref()
+                .map(plan_uses_broad_npm_test)
+                .unwrap_or(false);
+        let needs_ui_render_context_rewrite = mode == ExecutionMode::Plan
+            && plan_block
+                .as_deref()
+                .map(plan_mentions_ui_state_without_render_site)
+                .unwrap_or(false);
+        let needs_test_edit_rewrite = mode == ExecutionMode::Plan
+            && plan_block
+                .as_deref()
+                .map(plan_edits_existing_test)
+                .unwrap_or(false);
+        if plan_quality_redirect_count < 8
+            && (needs_plan_rewrite
+                || needs_command_rewrite
+                || needs_generic_test_rewrite
+                || needs_broad_test_rewrite
+                || needs_ui_render_context_rewrite
+                || needs_test_edit_rewrite)
+        {
+            plan_quality_redirect_count += 1;
+            let mut violations = Vec::new();
+            if needs_plan_rewrite {
+                violations
+                    .push("it still contains discovery steps instead of implementation steps");
+            }
+            if needs_command_rewrite {
+                violations.push("it uses an npm script argument form that will not reliably pass the target test file to the runner");
+            }
+            if needs_generic_test_rewrite {
+                violations.push("it names a specific test file but verifies with broad `npm test`");
+            }
+            if needs_broad_test_rewrite {
+                violations.push("it falls back to broad `npm test` instead of naming the narrowest relevant one-shot verification");
+            }
+            if needs_ui_render_context_rewrite {
+                violations.push("it plans a UI state fix without naming the component/style that renders the affected UI");
+            }
+            if needs_test_edit_rewrite {
+                violations.push("it proposes editing a test file even though the existing test should be used as the specification");
+            }
+            let command_hint = plan_block
+                .as_deref()
+                .and_then(|plan| narrow_verification_command_hint(&workspace, plan))
+                .map(|cmd| format!("Use this exact verification command in the plan: `{cmd}`. "))
+                .unwrap_or_default();
+            let redirect = format!(
+                "Your <plan> is not ready to execute. Fix these violations: {}. \
+                 The corrected plan must name exact source file(s), the exact source change, the existing test/spec context, and the narrowest one-shot verification command. \
+                 For UI work, preserve all gathered evidence categories in the final plan: source file/change, render site, test/spec file, and command. Do not trade one category away when adding another. \
+                 Do not include discovery steps. Do not edit tests when an existing test already covers the behavior. {}{}",
+                violations.join("; "),
+                command_hint,
+                if manifest_read_for_plan {
+                    "Use the underlying test runner from package.json, preserving required flags and replacing broad test globs with the target test file. If no relevant test/spec file is in context yet, emit exactly one read-only tool call now to find it (for example <glob>src/**/__tests__/*drag*.test.js</glob> or <grep glob=\"src/**/__tests__/*.js\">symbolName</grep>). If a UI state/render site is not in context yet, emit exactly one read-only tool call now to find it (for example <grep>showDropOverlay|drop-overlay</grep>). Otherwise emit only <plan>...</plan> followed by <final>...</final>."
+                } else {
+                    "If package.json is not in context, emit exactly one read-only tool call now: <read_file path=\"package.json\" />. Otherwise emit only <plan>...</plan> followed by <final>...</final>."
+                }
+            );
+            let _ = app.emit(
+                &evt,
+                json!({
+                    "kind": "thought",
+                    "step": step,
+                    "text": "(refining plan: first plan was not executable enough)"
+                }),
+            );
+            transcript.push(json!({
+                "role": "user",
+                "content": redirect,
+            }));
+            continue;
+        }
+        if let Some(plan) = plan_block.as_deref() {
             let _ = app.emit(&evt, json!({"kind": "plan", "step": step, "text": plan}));
         }
         if let Some(thought) = extract_block(&parse_buf, "think") {
-            let _ = app.emit(&evt, json!({"kind": "thought", "step": step, "text": thought}));
+            let _ = app.emit(
+                &evt,
+                json!({"kind": "thought", "step": step, "text": thought}),
+            );
         }
 
         // Mid-run budget renegotiation. The model emits
@@ -848,7 +1164,7 @@ async fn run_agent_loop(
         // `agent_budget_decision`. A `Cancel` decision (or an
         // outright `agent_cancel`) breaks out as cancelled.
         if let Some((proposed_raw, reason)) = parse_budget_bump(&parse_buf) {
-            let proposed = proposed_raw.max(1).min(100);
+            let proposed = proposed_raw.clamp(1, 100);
             let _ = app.emit(
                 &evt,
                 json!({
@@ -859,7 +1175,9 @@ async fn run_agent_loop(
                 }),
             );
             let (tx, rx) = oneshot::channel::<BudgetDecision>();
-            BUDGET_BUMPS.lock().insert(request_id.clone(), BudgetBump { tx });
+            BUDGET_BUMPS
+                .lock()
+                .insert(request_id.clone(), BudgetBump { tx });
             // Same 30-minute timeout pattern as APPROVALS so a forgotten
             // tab doesn't pin the loop forever.
             let decision = match tokio::time::timeout(Duration::from_secs(60 * 30), rx).await {
@@ -881,7 +1199,7 @@ async fn run_agent_loop(
                     continue;
                 }
                 BudgetDecision::Override(m) => {
-                    let m = m.max(1).min(100);
+                    let m = m.clamp(1, 100);
                     max_steps = m;
                     transcript.push(json!({
                         "role": "user",
@@ -908,10 +1226,19 @@ async fn run_agent_loop(
         // the model will produce a fresh final/clarify on the next
         // turn once it sees actual data.
         let tool_call_opt = parse_tool_call(&parse_buf);
+        let mut ignored_extra_executable_tags = false;
+        if tool_call_opt.is_some() {
+            let (assistant_turn, ignored) = transcript_turn_for_executed_tool(&parse_buf);
+            ignored_extra_executable_tags = ignored;
+            replace_last_assistant_turn(&mut transcript, assistant_turn);
+        }
         if tool_call_opt.is_none() {
             // <clarify> short-circuits with a request for user input.
             if let Some(question) = extract_block(&parse_buf, "clarify") {
-                let _ = app.emit(&evt, json!({"kind": "clarify", "step": step, "text": question}));
+                let _ = app.emit(
+                    &evt,
+                    json!({"kind": "clarify", "step": step, "text": question}),
+                );
                 termination = "clarify";
                 break;
             }
@@ -923,9 +1250,33 @@ async fn run_agent_loop(
                     &execution_mode_label(mode),
                     &final_text,
                 ));
-                let _ = app.emit(&evt, json!({"kind": "final", "step": step, "text": final_text}));
+                let _ = app.emit(
+                    &evt,
+                    json!({"kind": "final", "step": step, "text": final_text}),
+                );
                 termination = "final";
                 break;
+            }
+            // In Plan mode the `<plan>` block is the actual artifact
+            // the UI needs to enable Execute. Some local checkpoints
+            // reliably produce a good plan but omit the redundant
+            // `<final>` wrapper; accept the plan itself as the terminal
+            // answer once it passed the quality gates above.
+            if mode == ExecutionMode::Plan {
+                if let Some(plan_text) = plan_block.as_deref() {
+                    ledger.push(entry_for_answer(
+                        step,
+                        now_ms(),
+                        &execution_mode_label(mode),
+                        plan_text,
+                    ));
+                    let _ = app.emit(
+                        &evt,
+                        json!({"kind": "final", "step": step, "text": plan_text}),
+                    );
+                    termination = "final";
+                    break;
+                }
             }
         }
 
@@ -942,24 +1293,62 @@ async fn run_agent_loop(
         // to do can fall through to the implicit-final path on
         // the second prose-only turn.
         let Some(call) = tool_call_opt else {
-            if !prose_redirect_used {
-                prose_redirect_used = true;
+            if let Some(tag) = first_malformed_tool_tag(&parse_buf) {
+                if malformed_tool_redirect_count < 2 {
+                    malformed_tool_redirect_count += 1;
+                    let redirect = format!(
+                        "Your previous turn looked like a malformed <{tag}> tool call, so nothing was executed. \
+                         Emit exactly one complete XML tool block now, with all required attributes and the closing tag when the tool has a body. \
+                         For apply_diff/edit_file, include complete <<<<<<< SEARCH / ======= / >>>>>>> REPLACE hunks copied from the current file. \
+                         Do not explain in prose."
+                    );
+                    let _ = app.emit(
+                        &evt,
+                        json!({
+                            "kind": "thought",
+                            "step": step,
+                            "text": format!("(redirected: malformed <{tag}> tool call — asking for one complete XML block)"),
+                        }),
+                    );
+                    transcript.push(json!({
+                        "role": "user",
+                        "content": redirect,
+                    }));
+                    continue;
+                }
+            }
+
+            if prose_redirect_count < 2 {
+                prose_redirect_count += 1;
+                let redirect = if mode == ExecutionMode::Plan {
+                    "Your previous turn was prose only — no tool call, no <plan>, no <final>, no <clarify>. \
+                     In PLAN MODE, either gather context with exactly one read-only tool call \
+                     (discover, read_file, list_dir, glob, grep, search_codebase, list_code_definition_names), \
+                     or if you are ready, emit a <plan> block with exact files/steps/verification followed by a <final> block. \
+                     The <plan> block is what enables Execute. \
+                     Do NOT explain further in prose; the harness only acts on tags."
+                } else {
+                    "Your previous turn was prose only — no tool call, no <final>, no <clarify>. \
+                     If the goal isn't complete yet, emit the NEXT tool call now (one of: edit_file, rename_symbol, discover, run_check, read_file, list_dir, glob, grep, search_codebase, list_code_definition_names, write_file, apply_diff, delete_path, rename_path, run_shell, mcp_call, task). \
+                     If the goal IS complete, emit exactly `<final>one-paragraph summary</final>` — nothing else. \
+                     If you're blocked and need user input, emit `<clarify>your question</clarify>`. \
+                     Do NOT explain further in prose; the harness only acts on tags."
+                };
                 let _ = app.emit(
                     &evt,
                     json!({
                         "kind": "thought",
                         "step": step,
-                        "text": "(redirected: turn had no tool call or <final> — asking for next action)"
+                        "text": if mode == ExecutionMode::Plan {
+                            "(redirected: turn had no tool call, <plan>, or <final> — asking for executable plan protocol)"
+                        } else {
+                            "(redirected: turn had no tool call or <final> — asking for next action)"
+                        }
                     }),
                 );
                 transcript.push(json!({
                     "role": "user",
-                    "content":
-                        "Your previous turn was prose only — no tool call, no <final>, no <clarify>. \
-                         If the goal isn't complete yet, emit the NEXT tool call now (one of: read_file, list_dir, glob, grep, search_codebase, list_code_definition_names, write_file, apply_diff, delete_path, rename_path, run_shell, task). \
-                         If the goal IS complete, emit exactly `<final>one-paragraph summary</final>` — nothing else. \
-                         If you're blocked and need user input, emit `<clarify>your question</clarify>`. \
-                         Do NOT explain further in prose; the harness only acts on tags.".to_string(),
+                    "content": redirect.to_string(),
                 }));
                 continue;
             }
@@ -971,8 +1360,11 @@ async fn run_agent_loop(
                 &execution_mode_label(mode),
                 &trimmed_final,
             ));
-            let _ = app.emit(&evt, json!({"kind": "final", "step": step, "text": trimmed_final}));
-            termination = "no_tool";
+            let _ = app.emit(
+                &evt,
+                json!({"kind": "final", "step": step, "text": trimmed_final}),
+            );
+            termination = "final";
             break;
         };
 
@@ -1024,6 +1416,18 @@ async fn run_agent_loop(
             Ok(r) => (r.status, r.message, r.extra),
             Err(e) => ("error".to_string(), format!("ERROR: {e}"), None),
         };
+        if status == "ok"
+            && call.tool == "read_file"
+            && call
+                .attrs
+                .get("path")
+                .and_then(|p| Path::new(p).file_name())
+                .and_then(|n| n.to_str())
+                .map(|n| n.eq_ignore_ascii_case("package.json"))
+                .unwrap_or(false)
+        {
+            manifest_read_for_plan = true;
+        }
         // Cross-turn dedup hint (ADVISORY ONLY). For read-only
         // tools, if the ledger already records this exact read or
         // search from an earlier turn, append a one-liner so the
@@ -1064,7 +1468,7 @@ async fn run_agent_loop(
                 "extra": extra.unwrap_or(json!({})),
             }),
         );
-        let tool_result_body = match dedup_hint {
+        let mut tool_result_body = match dedup_hint {
             Some(hint) => format!(
                 "<tool_result tool=\"{}\" status=\"{}\">\n{}\n</tool_result>\n<dedup_hint>\n{}\n</dedup_hint>",
                 call.tool, status, truncate(&text, TOOL_RESULT_TRUNCATE), hint,
@@ -1074,13 +1478,31 @@ async fn run_agent_loop(
                 call.tool, status, truncate(&text, TOOL_RESULT_TRUNCATE),
             ),
         };
+        if ignored_extra_executable_tags {
+            tool_result_body.push_str(
+                "\n<protocol_note>\nOnly the first tool call from your previous turn was executed. \
+                 Any later tool calls, invented tool results, or final text in the same turn were ignored. \
+                 Wait for real tool results and emit exactly one next action.\n</protocol_note>",
+            );
+        }
         transcript.push(json!({"role": "user", "content": tool_result_body}));
 
         // If a mutation just happened, also feed an optional verifier report.
         if MUTATING_TOOLS.contains(&call.tool.as_str()) && status == "ok" {
-            if let Some(report) =
-                run_verifier(&app, &request_id, step, &workspace, &call, lint_command.as_deref()).await
-            {
+            let verifier_report = run_verifier(
+                &app,
+                &request_id,
+                step,
+                &workspace,
+                &call,
+                lint_command.as_deref(),
+            )
+            .await;
+            let has_source_hygiene_issue = verifier_report
+                .as_deref()
+                .map(|report| report.contains("source hygiene issue"))
+                .unwrap_or(false);
+            if let Some(report) = verifier_report {
                 transcript.push(json!({
                     "role": "user",
                     "content": format!("<verifier>\n{}\n</verifier>", truncate(&report, 4000)),
@@ -1095,7 +1517,11 @@ async fn run_agent_loop(
             // sends, so the offline eval and production stay in sync.
             transcript.push(json!({
                 "role": "user",
-                "content": "The file change has been APPLIED on disk. If the goal is met, your NEXT turn must be exactly a <final>…</final> block — nothing else, no other tags, no extra tool calls. If more work remains, emit the next tool call instead.".to_string(),
+                "content": if has_source_hygiene_issue {
+                    "The file change has been APPLIED on disk, but the verifier found a source hygiene issue. The goal is NOT met yet. Your NEXT turn must be exactly one mutating tool call that removes the stale marker or contradictory old code — do not emit <final> yet.".to_string()
+                } else {
+                    "The file change has been APPLIED on disk. If the user explicitly requested tests/build/checks, the goal is NOT met until that verification command has run successfully; run that one-shot command next instead of finalizing. If the goal is met, your NEXT turn must be exactly a <final>…</final> block — nothing else, no other tags, no extra tool calls. If more work remains, emit the next tool call instead.".to_string()
+                },
             }));
         }
         // After a failed apply_diff, guide the model based on WHY
@@ -1110,13 +1536,9 @@ async fn run_agent_loop(
         // budget (this is exactly the failure mode in the
         // index.html screenshot reported by the user).
         if call.tool == "apply_diff" && status == "error" {
-            let path_attr = call
-                .attrs
-                .get("path")
-                .cloned()
-                .unwrap_or_default();
-            let file_missing = text.contains("does not exist")
-                || text.contains("No such file or directory");
+            let path_attr = call.attrs.get("path").cloned().unwrap_or_default();
+            let file_missing =
+                text.contains("does not exist") || text.contains("No such file or directory");
             if file_missing {
                 transcript.push(json!({
                     "role": "user",
@@ -1172,6 +1594,19 @@ async fn run_agent_loop(
                 "content": format!("The path `{}` does not exist. {}", path_attr, suggestion_text),
             }));
         }
+
+        if mode == ExecutionMode::Plan
+            && PLAN_FORBIDDEN_TOOLS.contains(&call.tool.as_str())
+            && status != "ok"
+        {
+            transcript.push(json!({
+                "role": "user",
+                "content": format!(
+                    "This is PLAN MODE — <{}> is forbidden and was not executed. Do NOT call run_shell, run_check, task, or mutating tools in Plan mode. If you already have the source file, test/spec file, and package.json context, emit a <plan> block with the exact source change and narrow verification command, followed by <final>.",
+                    call.tool
+                ),
+            }));
+        }
     }
 
     state.cancels.lock().clear(&request_id);
@@ -1198,7 +1633,10 @@ fn emit_transcript_snapshot(app: &AppHandle, evt: &str, transcript: &[Value]) {
             Some(json!({"role": role, "content": content}))
         })
         .collect();
-    let _ = app.emit(evt, json!({"kind": "transcript_snapshot", "messages": messages}));
+    let _ = app.emit(
+        evt,
+        json!({"kind": "transcript_snapshot", "messages": messages}),
+    );
 }
 
 /// Capture the per-session action ledger and forward it to the FE
@@ -1210,6 +1648,83 @@ fn emit_ledger_snapshot(app: &AppHandle, evt: &str, ledger: &ActionLedger) {
     if let Ok(entries) = serde_json::to_value(&ledger.entries) {
         let _ = app.emit(evt, json!({"kind": "ledger_snapshot", "entries": entries}));
     }
+}
+
+fn replace_last_assistant_turn(transcript: &mut [Value], content: String) {
+    if let Some(last) = transcript
+        .iter_mut()
+        .rev()
+        .find(|m| m.get("role").and_then(|r| r.as_str()) == Some("assistant"))
+    {
+        last["content"] = Value::String(content);
+    }
+}
+
+/// Keep only the assistant content that led to the tool call we will
+/// actually execute. Some local models emit `<read_file/>` and then
+/// immediately continue with `<apply_diff>` or `<final>` in the same
+/// turn, imagining a result they have not received. The loop executes
+/// exactly one tool call, so the transcript must record exactly that
+/// one call; otherwise the next turn can treat unexecuted tags as
+/// factual history.
+fn transcript_turn_for_executed_tool(s: &str) -> (String, bool) {
+    let Some((_start, end)) = first_tool_span(s) else {
+        return (s.to_string(), false);
+    };
+    let ignored_extra = has_executable_tag(&s[end..]);
+    (s[..end].to_string(), ignored_extra)
+}
+
+fn first_tool_span(s: &str) -> Option<(usize, usize)> {
+    let mut best: Option<(usize, &str)> = None;
+    for &tag in TOOL_TAGS {
+        let needle = format!("<{tag}");
+        if let Some(pos) = s.find(&needle) {
+            if best.map(|(p, _)| pos < p).unwrap_or(true) {
+                best = Some((pos, tag));
+            }
+        }
+    }
+    let (start, tag) = best?;
+    let rest = &s[start..];
+    let header_end_rel = rest.find('>')?;
+    let header = &rest[..header_end_rel];
+    let body_start = start + header_end_rel + 1;
+    if header.trim_end().ends_with('/') {
+        return Some((start, body_start));
+    }
+    let close = format!("</{tag}>");
+    let close_start = s[body_start..].find(&close).map(|i| body_start + i)?;
+    Some((start, close_start + close.len()))
+}
+
+fn has_executable_tag(s: &str) -> bool {
+    TOOL_TAGS
+        .iter()
+        .copied()
+        .chain(["final", "clarify", "tool_result", "verifier", "budget_bump"])
+        .any(|tag| s.contains(&format!("<{tag}")))
+}
+
+fn first_malformed_tool_tag(s: &str) -> Option<&'static str> {
+    // If a known tool tag appears but no complete tool span can be
+    // parsed, the model usually clipped a closing tag or emitted a
+    // half-formed XML block. Redirecting once or twice recovers far
+    // better than treating the turn as prose.
+    if first_tool_span(s).is_some() {
+        return None;
+    }
+
+    let mut best: Option<(usize, &'static str)> = None;
+    for &tag in TOOL_TAGS {
+        let needle = format!("<{tag}");
+        if let Some(pos) = s.find(&needle) {
+            if best.map(|(p, _)| pos < p).unwrap_or(true) {
+                best = Some((pos, tag));
+            }
+        }
+    }
+    best.map(|(_, tag)| tag)
 }
 
 /// Best-effort millisecond timestamp. `SystemTime::now()` can
@@ -1258,19 +1773,28 @@ fn parse_budget_bump(s: &str) -> Option<(u32, String)> {
 
 #[tauri::command]
 pub async fn agent_cancel(state: State<'_, AppState>, request_id: String) -> AppResult<bool> {
+    Ok(cancel_agent_request(&state, &request_id))
+}
+
+pub(crate) fn cancel_agent_request(state: &AppState, request_id: &str) -> bool {
     // Also unblock any pending approval so the loop can wind down cleanly.
-    let _ = take_approval(&request_id).map(|a| a.tx.send(ApprovalDecision { approved: false, note: Some("cancelled".into()) }));
+    let _ = take_approval(request_id).map(|a| {
+        a.tx.send(ApprovalDecision {
+            approved: false,
+            note: Some("cancelled".into()),
+        })
+    });
     // Likewise for a pending budget-bump pause — without this the
     // loop sits on the 30-min timeout even after the user hits Stop.
-    let _ = take_budget_bump(&request_id).map(|b| b.tx.send(BudgetDecision::Cancel));
+    let _ = take_budget_bump(request_id).map(|b| b.tx.send(BudgetDecision::Cancel));
     // Tell any in-flight <run_shell> for this request to die,
     // otherwise the user clicks "stop" but the agent loop sits
     // there waiting for `npm install` to finish for 15 minutes.
-    cancel_shell_for(&request_id);
+    cancel_shell_for(request_id);
     // Release any paused prompt waiters so the reader thread can
     // wind down instead of sitting on `recv_timeout(120s)`.
-    cancel_shell_prompts_for(&request_id);
-    Ok(state.cancels.lock().cancel(&request_id))
+    cancel_shell_prompts_for(request_id);
+    state.cancels.lock().cancel(request_id)
 }
 
 /// Resolve a paused `<budget_bump>` request. `accept` keeps the model's
@@ -1320,7 +1844,10 @@ pub async fn agent_shell_respond(prompt_id: String, response: String) -> AppResu
 #[tauri::command]
 pub async fn agent_approve(request_id: String, note: Option<String>) -> AppResult<bool> {
     if let Some(a) = take_approval(&request_id) {
-        let _ = a.tx.send(ApprovalDecision { approved: true, note });
+        let _ = a.tx.send(ApprovalDecision {
+            approved: true,
+            note,
+        });
         Ok(true)
     } else {
         Ok(false)
@@ -1330,7 +1857,10 @@ pub async fn agent_approve(request_id: String, note: Option<String>) -> AppResul
 #[tauri::command]
 pub async fn agent_reject(request_id: String, note: Option<String>) -> AppResult<bool> {
     if let Some(a) = take_approval(&request_id) {
-        let _ = a.tx.send(ApprovalDecision { approved: false, note });
+        let _ = a.tx.send(ApprovalDecision {
+            approved: false,
+            note,
+        });
         Ok(true)
     } else {
         Ok(false)
@@ -1351,13 +1881,49 @@ const MUTATING_TOOLS: &[&str] = &[
     // Plan mode refuses, Ask mode prompts, Auto mode runs.
     "mcp_call",
     // Skills that touch the filesystem. `discover` and `run_check`
-    // are read-only and stay off this list. `run_check` runs the
-    // project's typecheck command, which is read-only in spirit but
-    // does call `run_shell` underneath — Plan-mode plumbing still
-    // works because the shell gate fires when the skill recurses
-    // into the primitive.
+    // are read-only and stay off this list. `run_check` executes a
+    // shell command, so Plan mode blocks it through PLAN_FORBIDDEN_TOOLS
+    // below without making Ask mode prompt for approval.
     "edit_file",
     "rename_symbol",
+];
+
+const PLAN_FORBIDDEN_TOOLS: &[&str] = &[
+    "write_file",
+    "apply_diff",
+    "delete_path",
+    "rename_path",
+    "run_shell",
+    "mcp_call",
+    "edit_file",
+    "rename_symbol",
+    // These can execute arbitrary work through another agent or a
+    // shell-backed checker. Plan mode is for reading and producing a
+    // plan; verification commands belong in the plan, not in the run.
+    "task",
+    "run_check",
+];
+
+const TOOL_TAGS: &[&str] = &[
+    // ── skills (composed workflows) ────────────────────────
+    "edit_file",
+    "rename_symbol",
+    "discover",
+    "run_check",
+    // ── primitives ──────────────────────────────────────────
+    "read_file",
+    "list_dir",
+    "glob",
+    "grep",
+    "search_codebase",
+    "list_code_definition_names",
+    "write_file",
+    "apply_diff",
+    "delete_path",
+    "rename_path",
+    "run_shell",
+    "mcp_call",
+    "task",
 ];
 
 /// Result of a single tool dispatch. Visible to sibling crate
@@ -1388,12 +1954,12 @@ async fn execute_tool(
     let evt = format!("agent:event:{}", request_id);
 
     // Mode gate.
-    if MUTATING_TOOLS.contains(&call.tool.as_str()) && mode == ExecutionMode::Plan {
+    if PLAN_FORBIDDEN_TOOLS.contains(&call.tool.as_str()) && mode == ExecutionMode::Plan {
         return Ok(ToolOutput {
             status: "error".into(),
             message: format!(
-                "Tool '{}' is mutating, but the agent is in plan-only mode. \
-                 Describe what you would change instead of writing it.",
+                "Tool '{}' is not allowed in plan-only mode. \
+                 Use read-only code-inspection tools, then describe the edit and verification command in <plan> instead of executing it.",
                 call.tool,
             ),
             extra: None,
@@ -1403,7 +1969,9 @@ async fn execute_tool(
     // AgentApprove-mode gate: require approval round-trip on each mutation.
     if MUTATING_TOOLS.contains(&call.tool.as_str()) && mode == ExecutionMode::AgentApprove {
         let (tx, rx) = oneshot::channel::<ApprovalDecision>();
-        APPROVALS.lock().insert(request_id.to_string(), Approval { tx });
+        APPROVALS
+            .lock()
+            .insert(request_id.to_string(), Approval { tx });
         let _ = app.emit(
             &evt,
             json!({
@@ -1417,8 +1985,14 @@ async fn execute_tool(
         // Wait, but periodically nudge so the UI can show an aging hint.
         let decision = match tokio::time::timeout(Duration::from_secs(60 * 30), rx).await {
             Ok(Ok(d)) => d,
-            Ok(Err(_)) => ApprovalDecision { approved: false, note: Some("channel closed".into()) },
-            Err(_) => ApprovalDecision { approved: false, note: Some("approval timed out (30m)".into()) },
+            Ok(Err(_)) => ApprovalDecision {
+                approved: false,
+                note: Some("channel closed".into()),
+            },
+            Err(_) => ApprovalDecision {
+                approved: false,
+                note: Some("approval timed out (30m)".into()),
+            },
         };
         if !decision.approved {
             return Ok(ToolOutput {
@@ -1445,15 +2019,21 @@ async fn execute_tool(
         "delete_path" => run_delete_path(app, step, workspace, call).map(Ok)?,
         "rename_path" => run_rename_path(app, step, workspace, call).map(Ok)?,
         "run_shell" => run_shell(app, request_id, workspace, call).await.map(Ok)?,
-        "task" => run_subtask(app, call, workspace, depth, lint_command).await.map(Ok)?,
+        "task" => run_subtask(app, call, workspace, depth, lint_command)
+            .await
+            .map(Ok)?,
         "mcp_call" => run_mcp_call(app, call).await.map(Ok)?,
         // ── Skills: bigger, deterministic compositions on top of
         //    the primitives above. See services/skills.rs for the
         //    design rationale and per-skill spec.
-        "edit_file" => crate::services::skills::run_edit_file(app, step, workspace, call, lint_command)
-            .await
-            .map(Ok)?,
-        "rename_symbol" => crate::services::skills::run_rename_symbol(app, step, workspace, call).map(Ok)?,
+        "edit_file" => {
+            crate::services::skills::run_edit_file(app, step, workspace, call, lint_command)
+                .await
+                .map(Ok)?
+        }
+        "rename_symbol" => {
+            crate::services::skills::run_rename_symbol(app, step, workspace, call).map(Ok)?
+        }
         "discover" => crate::services::skills::run_discover(workspace, call).map(Ok)?,
         "run_check" => crate::services::skills::run_run_check(app, request_id, workspace, call)
             .await
@@ -1537,7 +2117,10 @@ fn render_mcp_result(v: &Value) -> String {
             "image" => {
                 // We don't pipe image bytes back into the text-only model.
                 // Note their presence so the agent can decide what to do.
-                let mime = p.get("mimeType").and_then(|s| s.as_str()).unwrap_or("image/*");
+                let mime = p
+                    .get("mimeType")
+                    .and_then(|s| s.as_str())
+                    .unwrap_or("image/*");
                 out.push_str(&format!("[image: {mime}]"));
             }
             "resource" => {
@@ -1604,7 +2187,11 @@ fn render_mcp_section(tools: &[(String, crate::services::mcp::McpTool)]) -> Stri
                     let mut field_lines = vec![];
                     for (k, v) in props.iter().take(8) {
                         let ty = v.get("type").and_then(|s| s.as_str()).unwrap_or("any");
-                        let req = if required.contains(k.as_str()) { " (required)" } else { "" };
+                        let req = if required.contains(k.as_str()) {
+                            " (required)"
+                        } else {
+                            ""
+                        };
                         field_lines.push(format!("      - {k}: {ty}{req}"));
                     }
                     if !field_lines.is_empty() {
@@ -1803,7 +2390,10 @@ fn run_list_dir(workspace: &str, call: &ToolCall) -> Result<ToolOutput, String> 
 ///     `impl ... for X`, `impl X`.
 ///   * Go: `func X(`, `func (r R) Method(`, `type X`.
 ///   * Markdown: `# ` headers (top-level only) as an outline.
-pub(crate) fn run_list_code_definitions(workspace: &str, call: &ToolCall) -> Result<ToolOutput, String> {
+pub(crate) fn run_list_code_definitions(
+    workspace: &str,
+    call: &ToolCall,
+) -> Result<ToolOutput, String> {
     let raw_path = call
         .attrs
         .get("path")
@@ -1867,10 +2457,7 @@ pub(crate) fn run_list_code_definitions(workspace: &str, call: &ToolCall) -> Res
 /// Extract definitions from a source file. Returns
 /// `Vec<(kind, name, line)>` or None for unsupported types (binary,
 /// huge files, etc.).
-fn extract_definitions(
-    path: &Path,
-    ext: &str,
-) -> Option<Vec<(&'static str, String, usize)>> {
+fn extract_definitions(path: &Path, ext: &str) -> Option<Vec<(&'static str, String, usize)>> {
     let bytes = std::fs::read(path).ok()?;
     if bytes.iter().take(2000).any(|&b| b == 0) {
         return None;
@@ -1914,9 +2501,7 @@ fn extract_definitions(
             "py" => {
                 if let Some(name) = first_capture(r"^def\s+(\w+)\s*\(", trimmed) {
                     out.push(("fn", name, line_no));
-                } else if let Some(name) =
-                    first_capture(r"^class\s+(\w+)\s*[:\(]", trimmed)
-                {
+                } else if let Some(name) = first_capture(r"^class\s+(\w+)\s*[:\(]", trimmed) {
                     out.push(("class", name, line_no));
                 }
             }
@@ -1990,7 +2575,11 @@ pub(crate) fn run_glob(workspace: &str, call: &ToolCall) -> Result<ToolOutput, S
     }
     Ok(ToolOutput {
         status: "ok".into(),
-        message: if hits.is_empty() { "no matches".into() } else { hits.join("\n") },
+        message: if hits.is_empty() {
+            "no matches".into()
+        } else {
+            hits.join("\n")
+        },
         extra: Some(json!({"pattern": pattern, "count": hits.len()})),
     })
 }
@@ -2005,11 +2594,11 @@ pub(crate) fn run_grep(workspace: &str, call: &ToolCall) -> Result<ToolOutput, S
     // Models trained on real-world repos overwhelmingly emit regex
     // (e.g. `helper\d+\(`) for greps, so accepting both keeps the
     // surface honest. A failing compile still works fine as literal.
-    let re = regex::RegexBuilder::new(q)
-        .multi_line(true)
-        .build()
-        .ok();
-    let glob_filter = call.attrs.get("glob").and_then(|p| globset::Glob::new(p).ok());
+    let re = regex::RegexBuilder::new(q).multi_line(true).build().ok();
+    let glob_filter = call
+        .attrs
+        .get("glob")
+        .and_then(|p| globset::Glob::new(p).ok());
     let glob_matcher = glob_filter.map(|g| g.compile_matcher());
     let walker = ignore::WalkBuilder::new(workspace)
         .git_ignore(true)
@@ -2061,14 +2650,25 @@ pub(crate) fn run_grep(workspace: &str, call: &ToolCall) -> Result<ToolOutput, S
     }
     Ok(ToolOutput {
         status: "ok".into(),
-        message: if hits.is_empty() { "no matches".into() } else { hits.join("\n") },
+        message: if hits.is_empty() {
+            "no matches".into()
+        } else {
+            hits.join("\n")
+        },
         extra: Some(json!({"query": q, "count": hits.len()})),
     })
 }
 
-fn run_search_codebase(app: &AppHandle, request_id: &str, call: &ToolCall) -> Result<ToolOutput, String> {
+fn run_search_codebase(
+    app: &AppHandle,
+    request_id: &str,
+    call: &ToolCall,
+) -> Result<ToolOutput, String> {
     let evt = format!("agent:event:{}", request_id);
-    let _ = app.emit(&evt, json!({"kind":"tool_proxy", "tool": "search_codebase", "args": call.body}));
+    let _ = app.emit(
+        &evt,
+        json!({"kind":"tool_proxy", "tool": "search_codebase", "args": call.body}),
+    );
     // The actual semantic search runs in the indexer command from the
     // frontend; we surface a hint here. If the frontend wants to wire a
     // synchronous answer in the future, expose it via state.
@@ -2092,7 +2692,8 @@ fn run_write_file(
         .clone();
     let abs = resolve(workspace, &path);
     if let Some(parent) = abs.parent() {
-        std::fs::create_dir_all(parent).map_err(|e| format!("mkdir {}: {}", parent.display(), e))?;
+        std::fs::create_dir_all(parent)
+            .map_err(|e| format!("mkdir {}: {}", parent.display(), e))?;
     }
     // Snapshot the BEFORE state so the review card can show a diff
     // and the user can undo. We do this BEFORE the write so a partial
@@ -2104,8 +2705,7 @@ fn run_write_file(
     } else {
         Vec::new()
     };
-    std::fs::write(&abs, &call.body)
-        .map_err(|e| format!("write_file {}: {}", path, e))?;
+    std::fs::write(&abs, &call.body).map_err(|e| format!("write_file {}: {}", path, e))?;
     let change = if existed {
         // No-op overwrite (same bytes) returns None — we skip
         // recording so the review panel doesn't fill with noise.
@@ -2119,13 +2719,8 @@ fn run_write_file(
         .map_err(|e| format!("write_file snapshot {}: {}", path, e))?
     } else {
         Some(
-            crate::commands::agent_changes::record_create(
-                app,
-                step,
-                &path,
-                call.body.as_bytes(),
-            )
-            .map_err(|e| format!("write_file snapshot {}: {}", path, e))?,
+            crate::commands::agent_changes::record_create(app, step, &path, call.body.as_bytes())
+                .map_err(|e| format!("write_file snapshot {}: {}", path, e))?,
         )
     };
     let mut extra = json!({"path": path, "bytes": call.body.len()});
@@ -2225,8 +2820,7 @@ pub(crate) fn run_apply_diff(
                 .unwrap_or_default(),
         ));
     }
-    std::fs::write(&abs, &current)
-        .map_err(|e| format!("apply_diff write {}: {}", path, e))?;
+    std::fs::write(&abs, &current).map_err(|e| format!("apply_diff write {}: {}", path, e))?;
     // Record AFTER the write so we don't snapshot a state that's
     // about to be reverted by a downstream IO failure. record_modify
     // returns None when bytes are unchanged (defensive — apply_diff
@@ -2239,7 +2833,8 @@ pub(crate) fn run_apply_diff(
         current.as_bytes(),
     )
     .map_err(|e| format!("apply_diff snapshot {}: {}", path, e))?;
-    let mut extra = json!({"path": path, "applied": applied, "total": hunks.len(), "failed": failed});
+    let mut extra =
+        json!({"path": path, "applied": applied, "total": hunks.len(), "failed": failed});
     if let Some(c) = change {
         extra["change"] = serde_json::to_value(c).unwrap_or(json!(null));
     }
@@ -2324,7 +2919,8 @@ fn run_rename_path(
     let abs_from = resolve(workspace, &from);
     let abs_to = resolve(workspace, &to);
     if let Some(parent) = abs_to.parent() {
-        std::fs::create_dir_all(parent).map_err(|e| format!("mkdir {}: {}", parent.display(), e))?;
+        std::fs::create_dir_all(parent)
+            .map_err(|e| format!("mkdir {}: {}", parent.display(), e))?;
     }
     std::fs::rename(&abs_from, &abs_to)
         .map_err(|e| format!("rename_path {} -> {}: {}", from, to, e))?;
@@ -2387,14 +2983,12 @@ pub(crate) async fn run_shell(
     // honor the request. The poller below tears the process down
     // when the signal hits.
     let wait_for = call.attrs.get("wait_for").and_then(|s| parse_wait_for(s));
-    if let Some(spec) = &wait_for {
-        if let WaitForSpec::Invalid(reason) = spec {
-            return Err(format!(
-                "run_shell: invalid wait_for value: {reason}. Valid forms: \
-                 `wait_for=\"port:3000\"`, `wait_for=\"output:Listening on\"`, \
-                 `wait_for=\"file:dist/bundle.js\"`."
-            ));
-        }
+    if let Some(WaitForSpec::Invalid(reason)) = &wait_for {
+        return Err(format!(
+            "run_shell: invalid wait_for value: {reason}. Valid forms: \
+             `wait_for=\"port:3000\"`, `wait_for=\"output:Listening on\"`, \
+             `wait_for=\"file:dist/bundle.js\"`."
+        ));
     }
     if wait_for.is_none() {
         // Pre-flight: refuse known blocking commands BEFORE spawning.
@@ -2423,7 +3017,11 @@ pub(crate) async fn run_shell(
         .unwrap_or(default_timeout_ms)
         .min(15 * 60 * 1000);
 
-    let (sh, flag) = if cfg!(windows) { ("cmd", "/C") } else { ("/bin/sh", "-c") };
+    let (sh, flag) = if cfg!(windows) {
+        ("cmd", "/C")
+    } else {
+        ("/bin/sh", "-c")
+    };
     let workspace = workspace.to_string();
     let cmd_owned = cmd.to_string();
     let app_clone = app.clone();
@@ -2431,7 +3029,19 @@ pub(crate) async fn run_shell(
     let evt_name = format!("agent:event:{}", request_id);
     let wait_for_owned = wait_for.clone();
 
-    let join = tokio::task::spawn_blocking(move || -> Result<(i32, String, String, bool, Option<&'static str>, Option<String>), String> {
+    type ShellBlockingResult = Result<
+        (
+            i32,
+            String,
+            String,
+            bool,
+            Option<&'static str>,
+            Option<String>,
+        ),
+        String,
+    >;
+
+    let join = tokio::task::spawn_blocking(move || -> ShellBlockingResult {
         // stdin is now `piped` (not `null`) so we can forward the
         // user's response when the child sits on an interactive
         // prompt like "Ok to proceed? (y) ". The reader thread
@@ -3001,16 +3611,12 @@ fn detect_prompt(tail: &str) -> Option<String> {
         .filter(|s| !s.is_empty())?;
     // But also keep the trailing whitespace context (for the
     // "ends with `? ` or `: `" no-newline patterns).
-    let last_with_ws = tail
-        .rsplit_once('\n')
-        .map(|(_, s)| s)
-        .unwrap_or(tail);
+    let last_with_ws = tail.rsplit_once('\n').map(|(_, s)| s).unwrap_or(tail);
     let lower = last.to_lowercase();
 
     // Strong y/n patterns.
     const YN: &[&str] = &[
-        "[y/n]", "[y/n]?", "(y/n)", "(yes/no)",
-        "[yes/no]", " (y) ", " (y)?", "(y) ", "(y)?",
+        "[y/n]", "[y/n]?", "(y/n)", "(yes/no)", "[yes/no]", " (y) ", " (y)?", "(y) ", "(y)?",
     ];
     for needle in YN {
         if lower.contains(needle) {
@@ -3024,9 +3630,7 @@ fn detect_prompt(tail: &str) -> Option<String> {
     // trailing colon on the same line.
     const PASS_KEYWORDS: &[&str] = &["password", "passphrase", "passcode", "pin"];
     for kw in PASS_KEYWORDS {
-        if lower.contains(kw)
-            && (last.ends_with(':') || last_with_ws.ends_with(": "))
-        {
+        if lower.contains(kw) && (last.ends_with(':') || last_with_ws.ends_with(": ")) {
             return Some(last.to_string());
         }
     }
@@ -3051,8 +3655,7 @@ fn detect_prompt(tail: &str) -> Option<String> {
     // followed by space, no newline) — common for CLI prompts that
     // sit on the line waiting. Required: at least one alphabetic
     // character before, so we don't fire on `?` in JSON output.
-    if last_with_ws.ends_with("? ") {
-        let prefix = &last_with_ws[..last_with_ws.len() - 2];
+    if let Some(prefix) = last_with_ws.strip_suffix("? ") {
         if prefix.chars().filter(|c| c.is_alphabetic()).count() >= 3 {
             return Some(prefix.trim_start().to_string() + "?");
         }
@@ -3109,29 +3712,58 @@ fn blocking_command_refusal(cmd: &str) -> Option<String> {
     let patterns: &[(&str, &str, &str)] = &[
         // Test runners in DEFAULT-watch mode where the model
         // clearly meant the one-shot equivalent.
-        ("vitest --watch", "Vitest watch mode",
-         "use `vitest --run` for a one-shot test run"),
-        ("jest --watch",   "Jest watch mode",
-         "use `jest --run` or bare `jest` for a one-shot test run"),
-        ("tsc --watch",    "TypeScript watch mode",
-         "use `tsc --noEmit` for one-shot type checking"),
-        ("tsc -w ",        "TypeScript watch mode",
-         "use `tsc --noEmit` for one-shot type checking"),
+        (
+            "vitest --watch",
+            "Vitest watch mode",
+            "use `vitest --run` for a one-shot test run",
+        ),
+        (
+            "jest --watch",
+            "Jest watch mode",
+            "use `jest --run` or bare `jest` for a one-shot test run",
+        ),
+        (
+            "tsc --watch",
+            "TypeScript watch mode",
+            "use `tsc --noEmit` for one-shot type checking",
+        ),
+        (
+            "tsc -w ",
+            "TypeScript watch mode",
+            "use `tsc --noEmit` for one-shot type checking",
+        ),
         // Log followers — output never ends and there's no readiness signal.
-        ("tail -f ",       "log follower",
-         "use `tail -n 100 <file>` for the last lines, or `cat <file>` if it's small"),
-        ("journalctl -f",  "log follower",
-         "use `journalctl -n 100` for the last 100 lines"),
-        ("logs -f",        "log follower (kubectl/docker)",
-         "drop `-f` and use `logs --tail=100` for a snapshot"),
-        ("less ",          "interactive pager",
-         "use `cat`, `head -n N`, or `tail -n N` to dump the content directly"),
-        ("less\n",         "interactive pager",
-         "use `cat` instead"),
-        ("more ",          "interactive pager",
-         "use `cat` or `head -n N` instead"),
-        ("watch ",         "watch(1) repeating command",
-         "run the inner command once; the harness shows fresh output every turn"),
+        (
+            "tail -f ",
+            "log follower",
+            "use `tail -n 100 <file>` for the last lines, or `cat <file>` if it's small",
+        ),
+        (
+            "journalctl -f",
+            "log follower",
+            "use `journalctl -n 100` for the last 100 lines",
+        ),
+        (
+            "logs -f",
+            "log follower (kubectl/docker)",
+            "drop `-f` and use `logs --tail=100` for a snapshot",
+        ),
+        (
+            "less ",
+            "interactive pager",
+            "use `cat`, `head -n N`, or `tail -n N` to dump the content directly",
+        ),
+        ("less\n", "interactive pager", "use `cat` instead"),
+        (
+            "more ",
+            "interactive pager",
+            "use `cat` or `head -n N` instead",
+        ),
+        (
+            "watch ",
+            "watch(1) repeating command",
+            "run the inner command once; the harness shows fresh output every turn",
+        ),
     ];
     for (needle, family, suggestion) in patterns {
         if stripped.contains(needle) {
@@ -3157,7 +3789,8 @@ fn strip_leading_command_noise(cmd: &str) -> String {
         let before = s.clone();
         // `cd PATH && rest` → `rest`
         if let Some(rest) = s.strip_prefix("cd ").and_then(|tail| {
-            tail.split_once("&&").map(|(_, rest)| rest.trim().to_string())
+            tail.split_once("&&")
+                .map(|(_, rest)| rest.trim().to_string())
         }) {
             s = rest;
             continue;
@@ -3253,9 +3886,7 @@ fn parse_wait_for(raw: &str) -> Option<WaitForSpec> {
     if let Some(rest) = s.strip_prefix("file:") {
         let path = rest.trim();
         if path.is_empty() {
-            return Some(WaitForSpec::Invalid(
-                "file: needs a non-empty path".into(),
-            ));
+            return Some(WaitForSpec::Invalid("file: needs a non-empty path".into()));
         }
         return Some(WaitForSpec::File(path.to_string()));
     }
@@ -3301,44 +3932,44 @@ fn detect_server_ready(tail: &str) -> Option<&'static str> {
         "listening on ",
         "listening at ",
         "listening: ",
-        "now listening on",         // .NET / Kestrel
-        "started server on",        // Go (net/http) / common
+        "now listening on",  // .NET / Kestrel
+        "started server on", // Go (net/http) / common
         "started server at",
-        "server running at",        // express, restify, plain node
+        "server running at", // express, restify, plain node
         "server listening",
         "server is listening",
         "server started on",
         "server started at",
         "server ready on",
-        "running on http",          // Flask, FastAPI, Express
+        "running on http", // Flask, FastAPI, Express
         "running at http",
         "serving at http",
-        "serving http on",          // Python http.server
+        "serving http on", // Python http.server
         "serving on http",
-        "ready in ",                // Vite ("ready in 430 ms")
-        "ready on http",            // Next.js dev
-        "ready - started server",   // Next.js older
-        "local:",                   // Vite/Next/CRA dev banner
+        "ready in ",              // Vite ("ready in 430 ms")
+        "ready on http",          // Next.js dev
+        "ready - started server", // Next.js older
+        "local:",                 // Vite/Next/CRA dev banner
         "bound to port",
         "bound to address",
         "started on port",
-        "started application in",   // Spring Boot
-        "tomcat started on port",   // Spring Boot
+        "started application in", // Spring Boot
+        "tomcat started on port", // Spring Boot
         "tomcat started",
         "application startup complete", // FastAPI / Uvicorn
         "startup complete",
-        "uvicorn running on",       // Uvicorn / FastAPI
+        "uvicorn running on",             // Uvicorn / FastAPI
         "starting development server at", // Django
         "starting development server",
-        "rocket has launched",      // Rust Rocket
-        "actix-server running",     // Rust actix-web
-        "axum::serve listening",    // Rust axum
+        "rocket has launched",   // Rust Rocket
+        "actix-server running",  // Rust actix-web
+        "axum::serve listening", // Rust axum
         "running on tcp",
-        "running phoenix",          // Elixir Phoenix
+        "running phoenix", // Elixir Phoenix
         "phoenix.endpoint",
         "phoenix server running",
-        "puma starting",            // Ruby Puma
-        "use ctrl-c to stop",       // Rails / Puma
+        "puma starting",      // Ruby Puma
+        "use ctrl-c to stop", // Rails / Puma
         "use ctrl-c to shutdown",
         "press ctrl-c to stop",
         "press ctrl+c to stop",
@@ -3346,7 +3977,7 @@ fn detect_server_ready(tail: &str) -> Option<&'static str> {
         "php development server",   // PHP -S
         "php * development server", // alt
         "(press ctrl+c to quit)",
-        "compiled successfully",    // CRA / webpack dev
+        "compiled successfully", // CRA / webpack dev
         "compiled successfully!",
         "compiled client and server successfully",
     ];
@@ -3365,9 +3996,9 @@ fn detect_server_ready(tail: &str) -> Option<&'static str> {
         "watching for changes",
         "watching files for changes",
         "file watcher: ready",
-        "watch usage",                // vitest
-        "press a to run all tests",   // jest --watch
-        "press q to quit",            // various
+        "watch usage",              // vitest
+        "press a to run all tests", // jest --watch
+        "press q to quit",          // various
         "press q to exit",
         "press h to show help",
         "no tests found related to files changed",
@@ -3387,10 +4018,13 @@ fn detect_server_ready(tail: &str) -> Option<&'static str> {
     // Require the URL be followed by typical end-of-banner content
     // to reduce false positives — `http://localhost:` alone shows up
     // in error messages and tutorials.
-    if (lower.contains("http://localhost:") || lower.contains("http://127.0.0.1:")
+    if (lower.contains("http://localhost:")
+        || lower.contains("http://127.0.0.1:")
         || lower.contains("http://0.0.0.0:"))
-        && (lower.contains("ready") || lower.contains("running")
-            || lower.contains("started") || lower.contains("listening")
+        && (lower.contains("ready")
+            || lower.contains("running")
+            || lower.contains("started")
+            || lower.contains("listening")
             || lower.contains("serving"))
     {
         return Some("server");
@@ -3438,12 +4072,16 @@ fn cancel_shell_prompts_for(request_id: &str) {
 }
 
 /// Track running shell PIDs so `agent_cancel` can SIGTERM them.
-static SHELL_PIDS: once_cell::sync::Lazy<
-    Mutex<HashMap<String, (u32, Arc<std::sync::atomic::AtomicBool>)>>,
-> = once_cell::sync::Lazy::new(|| Mutex::new(HashMap::new()));
+type ShellCancelFlag = Arc<std::sync::atomic::AtomicBool>;
+type ShellPidMap = HashMap<String, (u32, ShellCancelFlag)>;
 
-fn register_shell_pid(request_id: &str, pid: u32, flag: Arc<std::sync::atomic::AtomicBool>) {
-    SHELL_PIDS.lock().insert(request_id.to_string(), (pid, flag));
+static SHELL_PIDS: once_cell::sync::Lazy<Mutex<ShellPidMap>> =
+    once_cell::sync::Lazy::new(|| Mutex::new(HashMap::new()));
+
+fn register_shell_pid(request_id: &str, pid: u32, flag: ShellCancelFlag) {
+    SHELL_PIDS
+        .lock()
+        .insert(request_id.to_string(), (pid, flag));
 }
 
 fn unregister_shell_pid(request_id: &str) {
@@ -3516,6 +4154,62 @@ async fn run_subtask(
 
 // -------------------- Verifier ---------------------------------------------
 
+fn has_stale_marker_word(s: &str) -> bool {
+    s.split(|c: char| !c.is_ascii_alphanumeric() && c != '_')
+        .any(|word| matches!(word.to_ascii_uppercase().as_str(), "BUG" | "TODO" | "FIXME"))
+}
+
+fn normalize_marker_line(s: &str) -> String {
+    s.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+fn source_hygiene_warning(path: &str, text: &str, call: &ToolCall) -> Option<String> {
+    if !matches!(
+        call.tool.as_str(),
+        "apply_diff" | "edit_file" | "write_file"
+    ) {
+        return None;
+    }
+
+    let copied_marker_lines: Vec<String> = call
+        .body
+        .lines()
+        .map(normalize_marker_line)
+        .filter(|line| !line.is_empty() && has_stale_marker_word(line))
+        .collect();
+    if copied_marker_lines.is_empty() {
+        return None;
+    }
+
+    let mut retained = Vec::new();
+    for (idx, line) in text.lines().enumerate() {
+        let normalized = normalize_marker_line(line);
+        if has_stale_marker_word(&normalized)
+            && copied_marker_lines
+                .iter()
+                .any(|source| source == &normalized)
+        {
+            retained.push((idx + 1, line.trim().to_string()));
+        }
+        if retained.len() >= 5 {
+            break;
+        }
+    }
+
+    if retained.is_empty() {
+        return None;
+    }
+
+    let preview = retained
+        .iter()
+        .map(|(line, text)| format!("{path}:{line}: {text}"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    Some(format!(
+        "source hygiene issue: `{path}` still contains stale BUG/TODO/FIXME marker(s) copied from the edited code:\n{preview}\nRemove or replace these stale markers before finalizing; tests passing is not enough while the edited source still describes the old bug."
+    ))
+}
+
 async fn run_verifier(
     app: &AppHandle,
     request_id: &str,
@@ -3549,6 +4243,9 @@ async fn run_verifier(
                 "post-state {path}: {total} lines, {} bytes\nhead:\n{head}\n…\ntail:\n{tail}\n",
                 text.len()
             ));
+            if let Some(warning) = source_hygiene_warning(path, &text, call) {
+                report.push_str(&format!("\n{warning}\n"));
+            }
         }
     }
 
@@ -3557,24 +4254,29 @@ async fn run_verifier(
     if let Some(cmd) = lint_command {
         let cmd = cmd.trim();
         if !cmd.is_empty() {
-            let (sh, flag) = if cfg!(windows) { ("cmd", "/C") } else { ("/bin/sh", "-c") };
+            let (sh, flag) = if cfg!(windows) {
+                ("cmd", "/C")
+            } else {
+                ("/bin/sh", "-c")
+            };
             let ws = workspace.to_string();
             let cmd_s = cmd.to_string();
-            let result: Result<(i32, String, String), String> = tokio::task::spawn_blocking(move || {
-                let out = std::process::Command::new(sh)
-                    .arg(flag)
-                    .arg(&cmd_s)
-                    .current_dir(if ws.is_empty() { ".".into() } else { ws })
-                    .output()
-                    .map_err(|e| e.to_string())?;
-                Ok((
-                    out.status.code().unwrap_or(-1),
-                    String::from_utf8_lossy(&out.stdout).to_string(),
-                    String::from_utf8_lossy(&out.stderr).to_string(),
-                ))
-            })
-            .await
-            .unwrap_or_else(|e| Err(e.to_string()));
+            let result: Result<(i32, String, String), String> =
+                tokio::task::spawn_blocking(move || {
+                    let out = std::process::Command::new(sh)
+                        .arg(flag)
+                        .arg(&cmd_s)
+                        .current_dir(if ws.is_empty() { ".".into() } else { ws })
+                        .output()
+                        .map_err(|e| e.to_string())?;
+                    Ok((
+                        out.status.code().unwrap_or(-1),
+                        String::from_utf8_lossy(&out.stdout).to_string(),
+                        String::from_utf8_lossy(&out.stderr).to_string(),
+                    ))
+                })
+                .await
+                .unwrap_or_else(|e| Err(e.to_string()));
             match result {
                 Ok((code, so, se)) => {
                     report.push_str(&format!(
@@ -3655,6 +4357,11 @@ fn render_environment_details(
     out.push_str("<environment_details>\n");
     out.push_str(&format!("# Workspace\n{}\n\n", workspace));
     out.push_str(&format!("# Mode\n{:?}\n\n", mode));
+    if mode == ExecutionMode::Plan {
+        out.push_str(
+            "# Plan mode allowed actions\nAllowed: read_file, list_dir, glob, grep, search_codebase, list_code_definition_names, discover, <plan>, <final>, <clarify>.\nForbidden: run_shell, run_check, task, write_file, apply_diff, edit_file, rename_symbol, delete_path, rename_path, mcp_call.\nMention verification commands in the plan; do not execute them.\n\n",
+        );
+    }
     out.push_str(&format!("# OS\n{}\n\n", std::env::consts::OS));
     out.push_str(&format!(
         // Surface the cap so the model can decide whether to call
@@ -3792,10 +4499,7 @@ fn smart_prune_transcript(transcript: &mut Vec<Value>, ledger: &ActionLedger) {
         let mut to_drop: Vec<usize> = vec![];
         let mut seen_paths: std::collections::HashSet<String> = std::collections::HashSet::new();
         for idx in (2..prunable_end).rev() {
-            let Some(content) = transcript[idx]
-                .get("content")
-                .and_then(|c| c.as_str())
-            else {
+            let Some(content) = transcript[idx].get("content").and_then(|c| c.as_str()) else {
                 continue;
             };
             let kind = classify_transcript_entry(content);
@@ -4078,7 +4782,10 @@ fn cross_turn_dedup_hint(call: &ToolCall, ledger: &ActionLedger) -> Option<Strin
         "grep" | "search_codebase" => {
             // Match on the raw query — small models often type the
             // identical query when they "forget" they ran it.
-            let q_attr = call.attrs.get("query").or_else(|| call.attrs.get("pattern"));
+            let q_attr = call
+                .attrs
+                .get("query")
+                .or_else(|| call.attrs.get("pattern"));
             let q_body = if call.body.trim().is_empty() {
                 None
             } else {
@@ -4137,7 +4844,10 @@ fn inject_fresh_reads(transcript: &mut [Value], ledger: &ActionLedger, workspace
     // it's the tool_result entry — in which case we DON'T inject
     // (there's no user prose to mine for path mentions).
     let last_idx = match transcript.iter().rposition(|m| {
-        m.get("role").and_then(|r| r.as_str()).map(|s| s == "user").unwrap_or(false)
+        m.get("role")
+            .and_then(|r| r.as_str())
+            .map(|s| s == "user")
+            .unwrap_or(false)
     }) {
         Some(i) => i,
         None => return,
@@ -4233,9 +4943,13 @@ fn extract_path_mentions(s: &str) -> Vec<String> {
     let mut cursor = 0;
     let bytes = s.as_bytes();
     while cursor < bytes.len() {
-        let Some(open) = s[cursor..].find('`') else { break };
+        let Some(open) = s[cursor..].find('`') else {
+            break;
+        };
         let after = cursor + open + 1;
-        let Some(close) = s[after..].find('`') else { break };
+        let Some(close) = s[after..].find('`') else {
+            break;
+        };
         let span = &s[after..after + close];
         if looks_like_path(span) {
             let normalized = span.trim_start_matches('@').to_string();
@@ -4246,7 +4960,9 @@ fn extract_path_mentions(s: &str) -> Vec<String> {
         cursor = after + close + 1;
     }
     // 2) Bare and @-mentions
-    for chunk in s.split(|c: char| c.is_whitespace() || c == ',' || c == ';' || c == '(' || c == ')' || c == '[' || c == ']') {
+    for chunk in s.split(|c: char| {
+        c.is_whitespace() || c == ',' || c == ';' || c == '(' || c == ')' || c == '[' || c == ']'
+    }) {
         let trimmed = chunk
             .trim_matches(|c: char| c == '.' || c == ',' || c == '"' || c == '\'')
             .trim_start_matches('@')
@@ -4271,11 +4987,43 @@ fn looks_like_path(s: &str) -> bool {
     // word like "1.0.2" into the brief.
     let has_slash = s.contains('/');
     let has_known_ext = [
-        ".ts", ".tsx", ".js", ".jsx", ".rs", ".py", ".go", ".java", ".kt",
-        ".rb", ".php", ".cs", ".cpp", ".cc", ".c", ".h", ".hpp", ".swift",
-        ".m", ".mm", ".sh", ".bash", ".zsh", ".lua", ".toml", ".yaml",
-        ".yml", ".json", ".md", ".markdown", ".html", ".css", ".scss",
-        ".sql", ".proto", ".vue", ".svelte",
+        ".ts",
+        ".tsx",
+        ".js",
+        ".jsx",
+        ".rs",
+        ".py",
+        ".go",
+        ".java",
+        ".kt",
+        ".rb",
+        ".php",
+        ".cs",
+        ".cpp",
+        ".cc",
+        ".c",
+        ".h",
+        ".hpp",
+        ".swift",
+        ".m",
+        ".mm",
+        ".sh",
+        ".bash",
+        ".zsh",
+        ".lua",
+        ".toml",
+        ".yaml",
+        ".yml",
+        ".json",
+        ".md",
+        ".markdown",
+        ".html",
+        ".css",
+        ".scss",
+        ".sql",
+        ".proto",
+        ".vue",
+        ".svelte",
     ]
     .iter()
     .any(|ext| s.ends_with(ext));
@@ -4382,35 +5130,216 @@ fn extract_block(s: &str, tag: &str) -> Option<String> {
     Some(s[after_open..end].trim().to_string())
 }
 
+fn plan_looks_like_discovery_checklist(plan: &str) -> bool {
+    let lines: Vec<String> = plan
+        .lines()
+        .map(|line| line.trim().to_ascii_lowercase())
+        .filter(|line| !line.is_empty())
+        .collect();
+    if lines.is_empty() {
+        return false;
+    }
+    let discovery_terms = [
+        "examine",
+        "look at",
+        "read",
+        "analyze",
+        "inspect",
+        "identify",
+        "determine",
+        "find",
+        "figure out",
+        "understand",
+        "gather",
+        "plan the verification",
+        "plan verification",
+    ];
+    let implementation_terms = [
+        "edit",
+        "update",
+        "change",
+        "replace",
+        "add",
+        "remove",
+        "reuse",
+        "call",
+        "pass",
+        "wire",
+        "fix",
+        "verify with",
+        "run `",
+        "test with",
+    ];
+    let discovery_lines = lines
+        .iter()
+        .filter(|line| discovery_terms.iter().any(|term| line.contains(term)))
+        .count();
+    let first_line_is_discovery = lines
+        .first()
+        .map(|line| discovery_terms.iter().any(|term| line.contains(term)))
+        .unwrap_or(false);
+    let implementation_lines = lines
+        .iter()
+        .filter(|line| implementation_terms.iter().any(|term| line.contains(term)))
+        .count();
+    let lower = plan.to_ascii_lowercase();
+    let verification_terms = [
+        "npm ",
+        "pnpm ",
+        "yarn ",
+        "bun ",
+        "cargo ",
+        "pytest",
+        "mocha",
+        "vitest",
+        "jest",
+        "go test",
+        "mvn ",
+        "gradle",
+        "verify with",
+    ];
+    let has_concrete_verification = verification_terms.iter().any(|term| lower.contains(term));
+    first_line_is_discovery
+        || (discovery_lines >= 2
+            && (implementation_lines <= discovery_lines || !has_concrete_verification))
+}
+
+fn plan_uses_npm_test_forwarding(plan: &str) -> bool {
+    let lower = plan.to_ascii_lowercase();
+    lower.contains("npm test -- ") || lower.contains("npm run test -- ")
+}
+
+fn plan_uses_npm_run_script_without_dash_dash(plan: &str) -> bool {
+    let lower = plan.to_ascii_lowercase();
+    lower
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .windows(4)
+        .any(|w| w[0] == "npm" && w[1] == "run" && w[2].starts_with("test:") && w[3] != "--")
+}
+
+fn plan_uses_bare_js_test_runner(plan: &str) -> bool {
+    let lower = plan.to_ascii_lowercase();
+    let uses_bare_runner = ["vitest ", "jest ", "mocha "]
+        .iter()
+        .any(|needle| lower.contains(needle));
+    let has_launcher = lower.contains("npx vitest")
+        || lower.contains("npx jest")
+        || lower.contains("npx mocha")
+        || lower.contains("npm exec")
+        || lower.contains("npm run");
+    uses_bare_runner && !has_launcher
+}
+
+fn plan_uses_generic_npm_test_despite_named_test(plan: &str) -> bool {
+    let lower = plan.to_ascii_lowercase();
+    let mentions_test_file = lower
+        .split_whitespace()
+        .map(|token| {
+            token.trim_matches(|c: char| {
+                !(c.is_ascii_alphanumeric() || matches!(c, '/' | '.' | '_' | '-'))
+            })
+        })
+        .any(|token| {
+            (token.starts_with("test/") || token.contains(".test."))
+                && (token.ends_with(".js")
+                    || token.ends_with(".jsx")
+                    || token.ends_with(".ts")
+                    || token.ends_with(".tsx")
+                    || token.ends_with(".mjs")
+                    || token.ends_with(".cjs"))
+        });
+    let uses_generic_npm_test = (lower.contains("npm test") || lower.contains("npm run test"))
+        && !plan_uses_npm_test_forwarding(plan);
+    mentions_test_file && uses_generic_npm_test
+}
+
+fn plan_uses_broad_npm_test(plan: &str) -> bool {
+    let lower = plan.to_ascii_lowercase();
+    let uses_npm_test = lower.contains("npm test") || lower.contains("npm run test");
+    let uses_specific_npm_script =
+        lower.contains("npm run test:") || lower.contains("npm run test -- ");
+    uses_npm_test && !uses_specific_npm_script
+}
+
+fn plan_mentions_ui_state_without_render_site(plan: &str) -> bool {
+    let lower = plan.to_ascii_lowercase();
+    let mentions_ui_state = lower.contains("ui")
+        || lower.contains("overlay")
+        || lower.contains("showdropoverlay")
+        || lower.contains("visible")
+        || lower.contains("render");
+    let names_render_site = lower.contains(".vue")
+        || lower.contains(".tsx")
+        || lower.contains(".jsx")
+        || lower.contains(".css")
+        || lower.contains("drop-overlay");
+    mentions_ui_state && !names_render_site
+}
+
+fn plan_edits_existing_test(plan: &str) -> bool {
+    let lower = plan.to_ascii_lowercase();
+    lower.lines().any(|line| {
+        (line.contains("update")
+            || line.contains("edit")
+            || line.contains("change")
+            || line.contains("modify")
+            || line.contains("add"))
+            && line.contains("test/")
+            && (line.contains(".js")
+                || line.contains(".jsx")
+                || line.contains(".ts")
+                || line.contains(".tsx")
+                || line.contains(".mjs")
+                || line.contains(".cjs"))
+    })
+}
+
+fn extract_specific_test_file(text: &str) -> Option<String> {
+    text.split_whitespace()
+        .map(|token| {
+            token
+                .trim_matches(|c: char| {
+                    !(c.is_ascii_alphanumeric() || matches!(c, '/' | '.' | '_' | '-'))
+                })
+                .to_string()
+        })
+        .find(|token| {
+            let lower = token.to_ascii_lowercase();
+            let has_test_shape =
+                lower.starts_with("test/") || lower.contains(".test.") || lower.contains(".spec.");
+            has_test_shape
+                && [".js", ".jsx", ".ts", ".tsx", ".mjs", ".cjs"]
+                    .iter()
+                    .any(|ext| lower.ends_with(ext))
+        })
+}
+
+fn narrow_verification_command_hint(workspace: &str, plan: &str) -> Option<String> {
+    let file = extract_specific_test_file(plan)?;
+    let package_json = std::fs::read_to_string(resolve(workspace, "package.json")).ok()?;
+    let lower = package_json.to_ascii_lowercase();
+    if lower.contains("vitest") {
+        Some(format!("npx vitest run {file}"))
+    } else if lower.contains("mocha") {
+        Some(format!("npx mocha {file}"))
+    } else if lower.contains("jest") {
+        Some(format!("npx jest {file}"))
+    } else if lower.contains("node --test") {
+        Some(format!("node --test {file}"))
+    } else {
+        None
+    }
+}
+
 fn parse_tool_call(s: &str) -> Option<ToolCall> {
     // Tools in priority order; we pick the first that appears.
     // Skills come BEFORE their underlying primitives so a model that
     // emits `<edit_file path="x">…</edit_file>` is routed to the
     // skill (with rollback + verification) rather than dispatched as
     // a raw `<apply_diff>` if both somehow appear in the same turn.
-    let tools = [
-        // ── skills (composed workflows) ────────────────────────
-        "edit_file",
-        "rename_symbol",
-        "discover",
-        "run_check",
-        // ── primitives ──────────────────────────────────────────
-        "read_file",
-        "list_dir",
-        "glob",
-        "grep",
-        "search_codebase",
-        "list_code_definition_names",
-        "write_file",
-        "apply_diff",
-        "delete_path",
-        "rename_path",
-        "run_shell",
-        "mcp_call",
-        "task",
-    ];
     let mut best: Option<(usize, &str)> = None;
-    for t in tools {
+    for &t in TOOL_TAGS {
         let needle = format!("<{t}");
         if let Some(pos) = s.find(&needle) {
             if best.map(|(p, _)| pos < p).unwrap_or(true) {
@@ -4462,7 +5391,12 @@ fn parse_attrs(s: &str) -> HashMap<String, String> {
             i += 1;
         }
         let key_start = i;
-        while i < bytes.len() && bytes[i] != b'=' && !bytes[i].is_ascii_whitespace() && bytes[i] != b'/' && bytes[i] != b'>' {
+        while i < bytes.len()
+            && bytes[i] != b'='
+            && !bytes[i].is_ascii_whitespace()
+            && bytes[i] != b'/'
+            && bytes[i] != b'>'
+        {
             i += 1;
         }
         if key_start == i {
@@ -4500,7 +5434,11 @@ fn parse_attrs(s: &str) -> HashMap<String, String> {
                 out.insert(key.to_string(), val.to_string());
             }
             None => {
-                while i < bytes.len() && !bytes[i].is_ascii_whitespace() && bytes[i] != b'>' && bytes[i] != b'/' {
+                while i < bytes.len()
+                    && !bytes[i].is_ascii_whitespace()
+                    && bytes[i] != b'>'
+                    && bytes[i] != b'/'
+                {
                     i += 1;
                 }
                 let val = &s[val_start..i];
@@ -4579,9 +5517,7 @@ fn fingerprint(tool: &str, attrs: &HashMap<String, String>, body: &str) -> u64 {
 
 pub(crate) fn resolve(workspace: &str, path: &str) -> PathBuf {
     let p = Path::new(path);
-    if p.is_absolute() {
-        p.to_path_buf()
-    } else if workspace.is_empty() {
+    if p.is_absolute() || workspace.is_empty() {
         p.to_path_buf()
     } else {
         PathBuf::from(workspace).join(p)
@@ -4620,11 +5556,7 @@ pub(crate) fn find_similar_paths(workspace: &str, missing: &str) -> Vec<String> 
         if !entry.file_type().map(|t| t.is_file()).unwrap_or(false) {
             continue;
         }
-        let name = entry
-            .file_name()
-            .to_str()
-            .unwrap_or("")
-            .to_lowercase();
+        let name = entry.file_name().to_str().unwrap_or("").to_lowercase();
         if name == basename {
             let rel = entry
                 .path()
@@ -4835,7 +5767,11 @@ mod tests {
         for (offset, i) in (0..TRANSCRIPT_RECENT_TAIL).enumerate() {
             let entry = &t[t.len() - TRANSCRIPT_RECENT_TAIL + offset];
             assert!(
-                entry.get("content").and_then(|c| c.as_str()).unwrap().contains(&format!("turn {i}")),
+                entry
+                    .get("content")
+                    .and_then(|c| c.as_str())
+                    .unwrap()
+                    .contains(&format!("turn {i}")),
                 "recent tail was mutated at offset {offset}"
             );
         }
@@ -4901,9 +5837,15 @@ mod tests {
         let ledger = ledger_with_write("foo.ts");
         inject_fresh_reads(&mut t, &ledger, dir.path().to_str().unwrap());
         let brief = t[1].get("content").unwrap().as_str().unwrap();
-        assert!(brief.starts_with("<fresh_reads>"), "expected fresh_reads block, got: {brief}");
+        assert!(
+            brief.starts_with("<fresh_reads>"),
+            "expected fresh_reads block, got: {brief}"
+        );
         assert!(brief.contains("export const fresh = 1;"));
-        assert!(brief.contains("now also rename"), "original prose must be preserved");
+        assert!(
+            brief.contains("now also rename"),
+            "original prose must be preserved"
+        );
     }
 
     #[test]
@@ -4966,7 +5908,11 @@ mod tests {
         inject_fresh_reads(&mut t, &ledger, dir.path().to_str().unwrap());
         let brief = t[1].get("content").unwrap().as_str().unwrap();
         // Cap is 3 — we expect exactly 3 <file> entries.
-        assert_eq!(brief.matches("<file path=").count(), 3, "fresh_reads cap not enforced");
+        assert_eq!(
+            brief.matches("<file path=").count(),
+            3,
+            "fresh_reads cap not enforced"
+        );
     }
 
     #[test]
@@ -5013,13 +5959,80 @@ mod tests {
     fn mk_read_call(path: &str) -> ToolCall {
         let mut attrs = HashMap::new();
         attrs.insert("path".into(), path.into());
-        ToolCall { tool: "read_file".into(), attrs, body: String::new(), fingerprint: 0 }
+        ToolCall {
+            tool: "read_file".into(),
+            attrs,
+            body: String::new(),
+            fingerprint: 0,
+        }
     }
 
     fn mk_grep_call(query: &str) -> ToolCall {
         let mut attrs = HashMap::new();
         attrs.insert("query".into(), query.into());
-        ToolCall { tool: "grep".into(), attrs, body: String::new(), fingerprint: 0 }
+        ToolCall {
+            tool: "grep".into(),
+            attrs,
+            body: String::new(),
+            fingerprint: 0,
+        }
+    }
+
+    fn mk_apply_diff_call(path: &str, body: &str) -> ToolCall {
+        let mut attrs = HashMap::new();
+        attrs.insert("path".into(), path.into());
+        ToolCall {
+            tool: "apply_diff".into(),
+            attrs,
+            body: body.into(),
+            fingerprint: 0,
+        }
+    }
+
+    #[test]
+    fn source_hygiene_warns_when_patch_leaves_copied_bug_marker() {
+        let body = r#"<<<<<<< SEARCH
+      // BUG: overlay remains visible after drop events.
+      showDropOverlay.value = true
+=======
+      // BUG: overlay remains visible after drop events.
+      showDropOverlay.value = false
+>>>>>>> REPLACE"#;
+        let text = "if (type === 'drop') {\n      // BUG: overlay remains visible after drop events.\n      showDropOverlay.value = false\n}";
+        let call = mk_apply_diff_call("src/composables/useDragDrop.js", body);
+        let warning = source_hygiene_warning("src/composables/useDragDrop.js", text, &call)
+            .expect("expected stale marker warning");
+
+        assert!(warning.contains("source hygiene issue"));
+        assert!(warning.contains("src/composables/useDragDrop.js:2"));
+        assert!(warning.contains("overlay remains visible"));
+    }
+
+    #[test]
+    fn source_hygiene_is_clear_after_marker_is_removed() {
+        let body = r#"<<<<<<< SEARCH
+      // BUG: overlay remains visible after drop events.
+      showDropOverlay.value = true
+=======
+      showDropOverlay.value = false
+>>>>>>> REPLACE"#;
+        let text = "if (type === 'drop') {\n      showDropOverlay.value = false\n}";
+        let call = mk_apply_diff_call("src/composables/useDragDrop.js", body);
+
+        assert!(source_hygiene_warning("src/composables/useDragDrop.js", text, &call).is_none());
+    }
+
+    #[test]
+    fn source_hygiene_ignores_unrelated_existing_markers() {
+        let body = r#"<<<<<<< SEARCH
+      showDropOverlay.value = true
+=======
+      showDropOverlay.value = false
+>>>>>>> REPLACE"#;
+        let text = "// TODO: unrelated future cleanup\nshowDropOverlay.value = false\n";
+        let call = mk_apply_diff_call("src/composables/useDragDrop.js", body);
+
+        assert!(source_hygiene_warning("src/composables/useDragDrop.js", text, &call).is_none());
     }
 
     #[test]
@@ -5029,7 +6042,9 @@ mod tests {
             turn: 1,
             timestamp_ms: 0,
             mode: "agent".into(),
-            kind: crate::services::history::LedgerKind::Read { paths: vec!["src/foo.ts".into()] },
+            kind: crate::services::history::LedgerKind::Read {
+                paths: vec!["src/foo.ts".into()],
+            },
         });
         let hint = cross_turn_dedup_hint(&mk_read_call("src/foo.ts"), &ledger);
         let msg = hint.expect("expected dedup hint for repeated read");
@@ -5044,7 +6059,9 @@ mod tests {
             turn: 1,
             timestamp_ms: 0,
             mode: "agent".into(),
-            kind: crate::services::history::LedgerKind::Read { paths: vec!["src/foo.ts".into()] },
+            kind: crate::services::history::LedgerKind::Read {
+                paths: vec!["src/foo.ts".into()],
+            },
         });
         // Different path → no hint.
         assert!(cross_turn_dedup_hint(&mk_read_call("src/bar.ts"), &ledger).is_none());
@@ -5073,22 +6090,38 @@ mod tests {
             timestamp_ms: 0,
             mode: "agent".into(),
             kind: crate::services::history::LedgerKind::Wrote {
-                path: "src/foo.ts".into(), bytes: 10, hunks: 1,
+                path: "src/foo.ts".into(),
+                bytes: 10,
+                hunks: 1,
             },
         });
         // Even though src/foo.ts was already written, a NEW write
         // call must never get a dedup hint — iteration is legitimate.
         let mut attrs = HashMap::new();
         attrs.insert("path".into(), "src/foo.ts".into());
-        let call = ToolCall { tool: "write_file".into(), attrs, body: "new bytes".into(), fingerprint: 0 };
-        assert!(cross_turn_dedup_hint(&call, &ledger).is_none(),
-            "iteration on prior write must not be blocked or hinted");
+        let call = ToolCall {
+            tool: "write_file".into(),
+            attrs,
+            body: "new bytes".into(),
+            fingerprint: 0,
+        };
+        assert!(
+            cross_turn_dedup_hint(&call, &ledger).is_none(),
+            "iteration on prior write must not be blocked or hinted"
+        );
 
         let mut attrs = HashMap::new();
         attrs.insert("path".into(), "src/foo.ts".into());
-        let call = ToolCall { tool: "apply_diff".into(), attrs, body: "@@\n+x\n".into(), fingerprint: 0 };
-        assert!(cross_turn_dedup_hint(&call, &ledger).is_none(),
-            "edit on prior write must not be blocked or hinted");
+        let call = ToolCall {
+            tool: "apply_diff".into(),
+            attrs,
+            body: "@@\n+x\n".into(),
+            fingerprint: 0,
+        };
+        assert!(
+            cross_turn_dedup_hint(&call, &ledger).is_none(),
+            "edit on prior write must not be blocked or hinted"
+        );
     }
 
     #[test]
@@ -5118,9 +6151,13 @@ mod tests {
 
         let mut ledger = ActionLedger::new();
         ledger.push(crate::services::history::LedgerEntry {
-            turn: 1, timestamp_ms: 1, mode: "agent".into(),
+            turn: 1,
+            timestamp_ms: 1,
+            mode: "agent".into(),
             kind: crate::services::history::LedgerKind::Wrote {
-                path: "foo.ts".into(), bytes: 28, hunks: 1,
+                path: "foo.ts".into(),
+                bytes: 28,
+                hunks: 1,
             },
         });
 
@@ -5133,10 +6170,19 @@ mod tests {
         smart_prune_transcript(&mut t, &ledger);
 
         let brief = t[1].get("content").unwrap().as_str().unwrap();
-        assert!(brief.contains("<previous_work"), "missing previous_work header");
+        assert!(
+            brief.contains("<previous_work"),
+            "missing previous_work header"
+        );
         assert!(brief.contains("wrote foo.ts"));
-        assert!(brief.contains("<fresh_reads>"), "fresh_reads must inline current bytes");
-        assert!(brief.contains("export function old()"), "current file content missing");
+        assert!(
+            brief.contains("<fresh_reads>"),
+            "fresh_reads must inline current bytes"
+        );
+        assert!(
+            brief.contains("export function old()"),
+            "current file content missing"
+        );
         assert!(brief.contains("rename old()"), "user request must survive");
 
         // Now simulate the model deciding to write the file again.
@@ -5144,9 +6190,16 @@ mod tests {
         // iteration is the whole point.
         let mut attrs = HashMap::new();
         attrs.insert("path".into(), "foo.ts".into());
-        let edit = ToolCall { tool: "edit_file".into(), attrs, body: "patch".into(), fingerprint: 0 };
-        assert!(cross_turn_dedup_hint(&edit, &ledger).is_none(),
-            "edit on prior write must not be blocked");
+        let edit = ToolCall {
+            tool: "edit_file".into(),
+            attrs,
+            body: "patch".into(),
+            fingerprint: 0,
+        };
+        assert!(
+            cross_turn_dedup_hint(&edit, &ledger).is_none(),
+            "edit on prior write must not be blocked"
+        );
     }
 
     #[test]
@@ -5161,9 +6214,13 @@ mod tests {
 
         let mut ledger = ActionLedger::new();
         ledger.push(crate::services::history::LedgerEntry {
-            turn: 1, timestamp_ms: 1, mode: "agent".into(),
+            turn: 1,
+            timestamp_ms: 1,
+            mode: "agent".into(),
             kind: crate::services::history::LedgerKind::Wrote {
-                path: "foo.ts".into(), bytes: 32, hunks: 1,
+                path: "foo.ts".into(),
+                bytes: 32,
+                hunks: 1,
             },
         });
 
@@ -5176,15 +6233,22 @@ mod tests {
 
         let brief = t[1].get("content").unwrap().as_str().unwrap();
         assert!(brief.contains("wrote foo.ts"));
-        assert!(brief.contains("export function current()"),
-            "fresh_reads must show post-write state so the model knows what to undo");
+        assert!(
+            brief.contains("export function current()"),
+            "fresh_reads must show post-write state so the model knows what to undo"
+        );
         assert!(brief.contains("undo the previous change"));
 
         // A NEW write to revert the change is not redo-from-memory;
         // it's a legitimate next action. Dedup hint must not fire.
         let mut attrs = HashMap::new();
         attrs.insert("path".into(), "foo.ts".into());
-        let write = ToolCall { tool: "write_file".into(), attrs, body: "export function old() {}\n".into(), fingerprint: 0 };
+        let write = ToolCall {
+            tool: "write_file".into(),
+            attrs,
+            body: "export function old() {}\n".into(),
+            fingerprint: 0,
+        };
         assert!(cross_turn_dedup_hint(&write, &ledger).is_none());
     }
 
@@ -5207,9 +6271,18 @@ mod tests {
         assert_eq!(agent_auto, ExecutionMode::AgentAuto);
         // Serializing emits the legacy strings so ledger entries
         // and event payloads stay stable.
-        assert_eq!(serde_json::to_string(&ExecutionMode::Plan).unwrap(), "\"plan\"");
-        assert_eq!(serde_json::to_string(&ExecutionMode::AgentApprove).unwrap(), "\"ask\"");
-        assert_eq!(serde_json::to_string(&ExecutionMode::AgentAuto).unwrap(), "\"auto\"");
+        assert_eq!(
+            serde_json::to_string(&ExecutionMode::Plan).unwrap(),
+            "\"plan\""
+        );
+        assert_eq!(
+            serde_json::to_string(&ExecutionMode::AgentApprove).unwrap(),
+            "\"ask\""
+        );
+        assert_eq!(
+            serde_json::to_string(&ExecutionMode::AgentAuto).unwrap(),
+            "\"auto\""
+        );
     }
 
     #[test]
@@ -5256,7 +6329,9 @@ mod tests {
         let defs = extract_definitions(&p, "ts").unwrap();
         assert!(defs.iter().any(|(k, n, _)| *k == "fn" && n == "login"));
         assert!(defs.iter().any(|(k, n, _)| *k == "class" && n == "User"));
-        assert!(defs.iter().any(|(k, n, _)| *k == "interface" && n == "Session"));
+        assert!(defs
+            .iter()
+            .any(|(k, n, _)| *k == "interface" && n == "Session"));
     }
 
     /// Prompt detection — strong patterns must fire, ambiguous
@@ -5299,12 +6374,12 @@ mod tests {
             "[INFO] Connecting to: registry.npmjs.org",
             "Downloading: 23%",
             "{\n  \"key\": \"value\",\n  \"flag\": true\n}",
-            "What is going on here, anyway? \nMore log output\n",  // trailing newline = no live prompt
+            "What is going on here, anyway? \nMore log output\n", // trailing newline = no live prompt
             "loaded plugin: typescript",
             "Found 0 errors. Watching for file changes.",
             "compiled successfully",
             "",
-            "?",  // standalone — not enough surrounding alpha
+            "?", // standalone — not enough surrounding alpha
         ];
         for case in cases {
             assert!(
@@ -5387,11 +6462,26 @@ mod tests {
 
     #[test]
     fn parse_wait_for_rejects_invalid() {
-        assert!(matches!(parse_wait_for("port:abc"), Some(WaitForSpec::Invalid(_))));
-        assert!(matches!(parse_wait_for("port:0"), Some(WaitForSpec::Invalid(_))));
-        assert!(matches!(parse_wait_for("output:"), Some(WaitForSpec::Invalid(_))));
-        assert!(matches!(parse_wait_for("file:"), Some(WaitForSpec::Invalid(_))));
-        assert!(matches!(parse_wait_for("nonsense"), Some(WaitForSpec::Invalid(_))));
+        assert!(matches!(
+            parse_wait_for("port:abc"),
+            Some(WaitForSpec::Invalid(_))
+        ));
+        assert!(matches!(
+            parse_wait_for("port:0"),
+            Some(WaitForSpec::Invalid(_))
+        ));
+        assert!(matches!(
+            parse_wait_for("output:"),
+            Some(WaitForSpec::Invalid(_))
+        ));
+        assert!(matches!(
+            parse_wait_for("file:"),
+            Some(WaitForSpec::Invalid(_))
+        ));
+        assert!(matches!(
+            parse_wait_for("nonsense"),
+            Some(WaitForSpec::Invalid(_))
+        ));
         // Empty is None (no wait_for specified at all).
         assert!(parse_wait_for("").is_none());
         assert!(parse_wait_for("  ").is_none());
@@ -5563,10 +6653,19 @@ mod tests {
         // The model needs more than "no" — it needs the alternative
         // so it can recover in the same turn.
         let msg = blocking_command_refusal("tail -f /var/log/syslog").unwrap();
-        assert!(msg.contains("tail -f /var/log/syslog"), "missing original command: {msg}");
-        assert!(msg.contains("tail -n"), "missing snapshot alternative: {msg}");
+        assert!(
+            msg.contains("tail -f /var/log/syslog"),
+            "missing original command: {msg}"
+        );
+        assert!(
+            msg.contains("tail -n"),
+            "missing snapshot alternative: {msg}"
+        );
         let msg = blocking_command_refusal("tsc --watch").unwrap();
-        assert!(msg.contains("tsc --noEmit"), "missing one-shot suggestion: {msg}");
+        assert!(
+            msg.contains("tsc --noEmit"),
+            "missing one-shot suggestion: {msg}"
+        );
     }
 
     #[test]
@@ -5595,11 +6694,31 @@ mod tests {
         // defaults the larger checkpoints will silently stop
         // completing multi-step tasks again. The numbers don't
         // need to be exact — just floors.
-        assert!(DEFAULT_MAX_STEPS >= 30, "max_steps too low for 32B-class tasks: {DEFAULT_MAX_STEPS}");
-        assert!(DEFAULT_MAX_RUNTIME_S >= 1200, "runtime cap too short for slow inference: {DEFAULT_MAX_RUNTIME_S}");
-        assert!(DEFAULT_NUM_PREDICT >= 2048, "per-turn token cap too low for large models: {DEFAULT_NUM_PREDICT}");
-        assert!(TRANSCRIPT_SOFT_BUDGET_CHARS >= 40_000, "context budget too small for 32K-context models");
-        assert!(TRANSCRIPT_RECENT_TAIL >= 6, "recent-tail floor too aggressive: smart pruner needs working memory");
+        let max_steps = std::hint::black_box(DEFAULT_MAX_STEPS);
+        let max_runtime_s = std::hint::black_box(DEFAULT_MAX_RUNTIME_S);
+        let num_predict = std::hint::black_box(DEFAULT_NUM_PREDICT);
+        let soft_budget = std::hint::black_box(TRANSCRIPT_SOFT_BUDGET_CHARS);
+        let recent_tail = std::hint::black_box(TRANSCRIPT_RECENT_TAIL);
+        assert!(
+            max_steps >= 30,
+            "max_steps too low for 32B-class tasks: {max_steps}"
+        );
+        assert!(
+            max_runtime_s >= 1200,
+            "runtime cap too short for slow inference: {max_runtime_s}"
+        );
+        assert!(
+            num_predict >= 2048,
+            "per-turn token cap too low for large models: {num_predict}"
+        );
+        assert!(
+            soft_budget >= 40_000,
+            "context budget too small for 32K-context models"
+        );
+        assert!(
+            recent_tail >= 6,
+            "recent-tail floor too aggressive: smart pruner needs working memory"
+        );
     }
 
     #[test]
@@ -5607,7 +6726,10 @@ mod tests {
         let (tx, rx) = std::sync::mpsc::channel();
         register_shell_prompt("req-x/0", tx);
         assert!(deliver_shell_prompt_response("req-x/0", "y".into()));
-        assert_eq!(rx.recv_timeout(Duration::from_millis(50)).ok(), Some("y".into()));
+        assert_eq!(
+            rx.recv_timeout(Duration::from_millis(50)).ok(),
+            Some("y".into())
+        );
         // After delivery, the slot is gone.
         assert!(!deliver_shell_prompt_response("req-x/0", "n".into()));
     }
@@ -5622,8 +6744,14 @@ mod tests {
         register_shell_prompt("req-z/0", tx_c);
         cancel_shell_prompts_for("req-y");
         // y's prompts both released with empty string.
-        assert_eq!(rx_a.recv_timeout(Duration::from_millis(50)).ok(), Some(String::new()));
-        assert_eq!(rx_b.recv_timeout(Duration::from_millis(50)).ok(), Some(String::new()));
+        assert_eq!(
+            rx_a.recv_timeout(Duration::from_millis(50)).ok(),
+            Some(String::new())
+        );
+        assert_eq!(
+            rx_b.recv_timeout(Duration::from_millis(50)).ok(),
+            Some(String::new())
+        );
         // z's prompt untouched.
         assert!(rx_c.recv_timeout(Duration::from_millis(50)).is_err());
         // Clean up.
@@ -5670,7 +6798,8 @@ mod tests {
         let body = &call.body;
         let timeout = Duration::from_millis(15_000);
         let mut child = std::process::Command::new("/bin/sh")
-            .arg("-c").arg(body)
+            .arg("-c")
+            .arg(body)
             .current_dir(&ws)
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::piped())
@@ -5685,18 +6814,29 @@ mod tests {
             while r.read_line(&mut line).unwrap_or(0) > 0 {
                 buf.push_str(&line);
                 line.clear();
-                if buf.len() > 300_000 { break; }
+                if buf.len() > 300_000 {
+                    break;
+                }
             }
             buf
         });
         let deadline = Instant::now() + timeout;
         loop {
-            if child.try_wait().unwrap().is_some() { break; }
-            assert!(Instant::now() < deadline, "child deadlocked (regression: pipe drainer missing)");
+            if child.try_wait().unwrap().is_some() {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "child deadlocked (regression: pipe drainer missing)"
+            );
             std::thread::sleep(Duration::from_millis(40));
         }
         let captured = h1.join().unwrap();
-        assert!(captured.len() >= 100_000, "expected >=100 KB drained, got {}", captured.len());
+        assert!(
+            captured.len() >= 100_000,
+            "expected >=100 KB drained, got {}",
+            captured.len()
+        );
         let _ = rt;
     }
 
@@ -5709,16 +6849,21 @@ mod tests {
         // `read` blocks until stdin yields a line. With stdin set
         // to /dev/null it gets immediate EOF and falls through.
         let mut child = std::process::Command::new("/bin/sh")
-            .arg("-c").arg("read line; echo done")
+            .arg("-c")
+            .arg("read line; echo done")
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::piped())
             .spawn()
             .expect("spawn");
         let started = Instant::now();
         loop {
-            if child.try_wait().unwrap().is_some() { break; }
-            assert!(started.elapsed() < Duration::from_secs(3),
-                "stdin not closed: child blocked on read");
+            if child.try_wait().unwrap().is_some() {
+                break;
+            }
+            assert!(
+                started.elapsed() < Duration::from_secs(3),
+                "stdin not closed: child blocked on read"
+            );
             std::thread::sleep(Duration::from_millis(50));
         }
     }
@@ -5851,6 +6996,36 @@ mod tests {
         assert_eq!(out, input);
     }
 
+    #[test]
+    fn transcript_turn_keeps_only_executed_tool_call() {
+        let input = "<think>need current bytes</think>\n<read_file path=\"src/a.js\" />\n<apply_diff path=\"src/a.js\">x</apply_diff>\n<final>done</final>";
+        let (turn, ignored) = transcript_turn_for_executed_tool(input);
+        assert!(ignored);
+        assert!(turn.contains("<think>need current bytes</think>"));
+        assert!(turn.contains("<read_file path=\"src/a.js\" />"));
+        assert!(!turn.contains("<apply_diff"));
+        assert!(!turn.contains("<final>"));
+    }
+
+    #[test]
+    fn transcript_turn_keeps_body_tool_through_close_tag() {
+        let input = "<apply_diff path=\"src/a.js\">\n<<<<<<< SEARCH\nold\n=======\nnew\n>>>>>>> REPLACE\n</apply_diff>\n<run_check />";
+        let (turn, ignored) = transcript_turn_for_executed_tool(input);
+        assert!(ignored);
+        assert!(turn.ends_with("</apply_diff>"));
+        assert!(!turn.contains("<run_check"));
+    }
+
+    #[test]
+    fn malformed_tool_tag_detects_clipped_body_tool() {
+        let input = "<apply_diff path=\"src/a.js\">\n<<<<<<< SEARCH\nold\n=======\nnew";
+        assert_eq!(first_malformed_tool_tag(input), Some("apply_diff"));
+        assert_eq!(
+            first_malformed_tool_tag("<apply_diff path=\"src/a.js\">x</apply_diff>"),
+            None
+        );
+    }
+
     // Self-closing tags are the canonical form taught by the system
     // prompt (`<read_file path="x" />`, `<list_dir path="." />`,
     // `<rename_path from="a" to="b" />`, etc.) and the form local
@@ -5861,9 +7036,13 @@ mod tests {
     // qwen2.5-coder:32b.
     #[test]
     fn parse_tool_call_handles_self_closing_read_file() {
-        let call = parse_tool_call("<read_file path=\"test/test.ts\" />").expect("self-closing should parse");
+        let call = parse_tool_call("<read_file path=\"test/test.ts\" />")
+            .expect("self-closing should parse");
         assert_eq!(call.tool, "read_file");
-        assert_eq!(call.attrs.get("path").map(String::as_str), Some("test/test.ts"));
+        assert_eq!(
+            call.attrs.get("path").map(String::as_str),
+            Some("test/test.ts")
+        );
         assert!(call.body.is_empty());
     }
 
@@ -5880,7 +7059,8 @@ mod tests {
         // rename_path has two required attrs — exercised here both
         // to confirm parse_attrs cooperates with the self-closing
         // branch and to cover one of the other attribute-only tools.
-        let call = parse_tool_call("<rename_path from=\"old/p\" to=\"new/p\" />").expect("must parse");
+        let call =
+            parse_tool_call("<rename_path from=\"old/p\" to=\"new/p\" />").expect("must parse");
         assert_eq!(call.tool, "rename_path");
         assert_eq!(call.attrs.get("from").map(String::as_str), Some("old/p"));
         assert_eq!(call.attrs.get("to").map(String::as_str), Some("new/p"));
@@ -5992,8 +7172,11 @@ mod tests {
         // forgotten in the parser, this test catches it.
         for tag in crate::services::skills::SKILL_TAGS {
             let s = format!("<{tag} />");
-            let call = parse_tool_call(&s)
-                .unwrap_or_else(|| panic!("skill tag <{tag}/> did not parse — is it in parse_tool_call's priority list?"));
+            let call = parse_tool_call(&s).unwrap_or_else(|| {
+                panic!(
+                    "skill tag <{tag}/> did not parse — is it in parse_tool_call's priority list?"
+                )
+            });
             assert_eq!(&call.tool, tag);
         }
     }
@@ -6027,6 +7210,41 @@ mod tests {
     }
 
     #[test]
+    fn plan_forbidden_tools_blocks_shell_backed_workflows() {
+        assert!(PLAN_FORBIDDEN_TOOLS.contains(&"run_shell"));
+        assert!(PLAN_FORBIDDEN_TOOLS.contains(&"run_check"));
+        assert!(PLAN_FORBIDDEN_TOOLS.contains(&"task"));
+        assert!(!PLAN_FORBIDDEN_TOOLS.contains(&"read_file"));
+        assert!(!PLAN_FORBIDDEN_TOOLS.contains(&"discover"));
+    }
+
+    #[test]
+    fn plan_quality_rejects_generic_npm_test_even_when_runner_is_named() {
+        let plan = "Use src/utils/__tests__/i18n-helper.test.js as the spec. Verify with `npm test` (which runs `vitest`).";
+        assert!(plan_uses_generic_npm_test_despite_named_test(plan));
+        assert!(plan_uses_broad_npm_test(plan));
+
+        let targeted = "Verify with `npx vitest run src/utils/__tests__/i18n-helper.test.js`.";
+        assert!(!plan_uses_generic_npm_test_despite_named_test(targeted));
+        assert!(!plan_uses_broad_npm_test(targeted));
+    }
+
+    #[test]
+    fn narrow_verification_command_hint_uses_package_runner() {
+        let dir = tempdir().unwrap();
+        fs::write(
+            dir.path().join("package.json"),
+            r#"{"scripts":{"test":"mocha --require test/support/env.js --reporter spec"}}"#,
+        )
+        .unwrap();
+        let plan = "Use test/res.links.js as the spec. Verify with `npm test`.";
+        let hint = narrow_verification_command_hint(dir.path().to_str().unwrap(), plan)
+            .expect("expected mocha hint");
+
+        assert_eq!(hint, "npx mocha test/res.links.js");
+    }
+
+    #[test]
     fn stream_idle_timeout_is_in_sensible_range() {
         // The watchdog terminates the run if no model chunk arrives
         // within this window. Lower bound: long enough to cover
@@ -6035,9 +7253,10 @@ mod tests {
         // user staring at "thinking..." for minutes (the failure
         // mode that prompted adding the watchdog). 60–300 s is the
         // safe band.
+        let timeout_s = std::hint::black_box(STREAM_IDLE_TIMEOUT_S);
         assert!(
-            STREAM_IDLE_TIMEOUT_S >= 60 && STREAM_IDLE_TIMEOUT_S <= 300,
-            "STREAM_IDLE_TIMEOUT_S = {STREAM_IDLE_TIMEOUT_S} is outside the 60–300 s safe range",
+            (60..=300).contains(&timeout_s),
+            "STREAM_IDLE_TIMEOUT_S = {timeout_s} is outside the 60-300 s safe range",
         );
     }
 
@@ -6151,7 +7370,7 @@ mod tests {
         fs::write(rules_dir.join("00-big.md"), &big).unwrap();
         let out = load_project_rules(dir.path().to_str().unwrap()).expect("rules present");
         assert!(out.len() <= 50 * 1024); // certainly bounded by content size
-        // Sanity: the cap should kick in well below the original size.
+                                         // Sanity: the cap should kick in well below the original size.
         assert!(out.len() < 40 * 1024, "got {} bytes", out.len());
     }
 

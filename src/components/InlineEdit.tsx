@@ -21,6 +21,7 @@ export function InlineEdit({
   onProposeDiff: (original: string, proposed: string, description?: string) => void;
 }) {
   const inputRef = useRef<HTMLTextAreaElement | null>(null);
+  const streamBufferRef = useRef("");
   const [prompt, setPrompt] = useState("");
   const [streaming, setStreaming] = useState(false);
   const [partial, setPartial] = useState("");
@@ -52,8 +53,10 @@ export function InlineEdit({
   }, [onClose]);
 
   const submit = async () => {
-    if (!prompt.trim() || !active) return;
+    const instruction = prompt.trim();
+    if (!instruction || !active || streaming) return;
     setStreaming(true);
+    streamBufferRef.current = "";
     setPartial("");
     setError(null);
     const rid = newRequestId("cmdk");
@@ -95,40 +98,57 @@ type usage). Do not include backticks or commentary.`;
       })),
       budgetChars: 3_000,
     });
-    const userMessage = `${ctx.userMessage}\n\nInstruction: ${prompt}`;
+    const userMessage = `${ctx.userMessage}\n\nInstruction: ${instruction}`;
 
-    const off = await listenEvent<
-      | { token: string }
-      | { done: true }
-      | { error: string; done: true }
-    >(`ollama:chat:${rid}`, (p) => {
-      if ("token" in p) setPartial((cur) => cur + p.token);
-      if ("error" in p) setError(p.error);
-      if ("done" in p && p.done) {
-        off();
-        setStreaming(false);
-        const final = (document.querySelector("[data-cmdk-buffer]") as HTMLElement | null)?.innerText ?? "";
-        const text = final || partial;
-        const hunks = parseSearchReplace(text);
-        if (hunks.length > 0 && active) {
-          const { text: out, applied } = applyHunks(active.content, hunks);
-          if (applied > 0) {
-            onProposeDiff(active.content, out, prompt);
-          } else {
-            setError("Could not match the selection to apply the edit.");
-          }
-        } else {
-          setError("Model didn't return a search/replace block.");
+    let off: (() => void) | null = null;
+    try {
+      off = await listenEvent<
+        | { token: string }
+        | { done: true }
+        | { error: string; done: true }
+      >(`ollama:chat:${rid}`, (p) => {
+        if ("token" in p) {
+          streamBufferRef.current += p.token;
+          setPartial(streamBufferRef.current);
         }
-      }
-    });
+        if ("error" in p) {
+          setError(p.error);
+          if ("done" in p && p.done) {
+            off?.();
+            setStreaming(false);
+          }
+          return;
+        }
+        if ("done" in p && p.done) {
+          off?.();
+          setStreaming(false);
+          const hunks = parseSearchReplace(streamBufferRef.current);
+          if (hunks.length > 0 && active) {
+            const { text: out, applied } = applyHunks(active.content, hunks);
+            if (applied > 0) {
+              onProposeDiff(active.content, out, instruction);
+            } else {
+              setError("Could not match the selection to apply the edit.");
+            }
+          } else {
+            setError("Model didn't return a search/replace block.");
+          }
+        }
+      });
 
-    await ipc.ollamaChat(rid, {
-      model: chatModel,
-      messages: [{ role: "user", content: userMessage }],
-      system,
-      temperature: 0.2,
-    });
+      await ipc.ollamaChat(rid, {
+        model: chatModel,
+        messages: [{ role: "user", content: userMessage }],
+        system,
+        temperature: 0.2,
+        purpose: "inline_edit",
+        title: `Inline edit ${active?.path ?? ""}`,
+      });
+    } catch (e) {
+      off?.();
+      setStreaming(false);
+      setError(e instanceof Error ? e.message : String(e));
+    }
   };
 
   return (
@@ -184,7 +204,6 @@ type usage). Do not include backticks or commentary.`;
                 inputRef.current?.focus();
               }}
               title="Pre-fill the prompt with a 'fix these errors' instruction"
-              aria-label={`Pre-fill prompt to fix ${overlappingDiags.length} diagnostic${overlappingDiags.length === 1 ? "" : "s"}`}
             >
               Fix these
             </button>

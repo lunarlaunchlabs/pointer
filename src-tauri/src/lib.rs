@@ -5,6 +5,7 @@ pub mod services;
 mod state;
 
 use state::AppState;
+use tauri::Manager;
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
@@ -88,20 +89,32 @@ pub fn run() {
             commands::ollama::ollama_cancel,
             commands::ollama::ollama_unload_model,
             commands::ollama::ollama_ps,
-            // Models / HF
+            commands::inference::inference_status,
+            commands::inference::inference_cancel,
+            // Models / Ollama library
             commands::models::recommend_models,
             commands::models::system_memory_gb,
-            commands::models::set_hf_token,
-            commands::models::get_hf_token,
-            commands::models::clear_hf_token,
-            commands::models::hf_token_status,
-            commands::models::hf_search_models,
-            commands::models::hf_import_gguf,
+            commands::models::ollama_library_catalog,
             // Context
             commands::context::index_workspace,
             commands::context::search_codebase,
             commands::context::chunk_file,
             commands::context::index_status,
+            // Project diagnostics — language/toolchain agnostic check
+            // detection surfaced in the Problems panel.
+            commands::diagnostics::project_check_detect,
+            commands::diagnostics::project_check_run,
+            // Language servers — persistent stdio LSP clients for
+            // repo-local/PATH language servers, with Monaco fallbacks
+            // on the frontend when no external server is available.
+            commands::lsp::lsp_status,
+            commands::lsp::lsp_did_open,
+            commands::lsp::lsp_did_change,
+            commands::lsp::lsp_hover,
+            commands::lsp::lsp_definition,
+            commands::lsp::lsp_completion,
+            commands::lsp::lsp_completion_resolve,
+            commands::lsp::lsp_document_symbols,
             // Agent
             commands::agent::agent_run,
             commands::agent::agent_continue,
@@ -138,6 +151,12 @@ pub fn run() {
             // Factory reset
             commands::app_state::reset_app_state,
         ])
+        .on_window_event(|window, event| {
+            if matches!(event, tauri::WindowEvent::CloseRequested { .. }) {
+                let app = window.app_handle();
+                shutdown_owned_processes(app);
+            }
+        })
         .setup(|app| {
             #[cfg(target_os = "macos")]
             {
@@ -148,29 +167,59 @@ pub fn run() {
             }
             // Install the native menu bar. We swallow errors here because a
             // missing menu is an annoyance, not a reason to abort startup.
-            if let Err(e) = menu::install(&app.handle()) {
+            if let Err(e) = menu::install(app.handle()) {
                 log::warn!("failed to install native menu: {e}");
             }
             Ok(())
         })
         .build(tauri::generate_context!())
         .expect("error while building Pointer")
-        .run(|app_handle, event| {
-            use tauri::Manager;
-            match event {
-                tauri::RunEvent::ExitRequested { .. } | tauri::RunEvent::Exit => {
-                    let state = app_handle.state::<AppState>();
-                    state.shutdown_ollama();
-                    // Reap MCP children synchronously on the runtime so no
-                    // user-spawned MCP server outlives the editor.
-                    let mcp = state.mcp.clone();
-                    let _ = tokio::runtime::Handle::try_current().map(|h| {
-                        h.block_on(async move {
-                            mcp.shutdown_all().await;
-                        })
-                    });
-                }
-                _ => {}
+        .run(|app_handle, event| match event {
+            tauri::RunEvent::ExitRequested { .. } | tauri::RunEvent::Exit => {
+                shutdown_owned_processes(app_handle);
             }
+            _ => {}
         });
+}
+
+fn shutdown_owned_processes(app_handle: &tauri::AppHandle) {
+    use tauri::Manager;
+
+    let state = app_handle.state::<AppState>();
+    if !state.begin_shutdown() {
+        return;
+    }
+
+    log::info!("Pointer shutdown: terminating owned child processes");
+    state.cancel_all_requests();
+    state.shutdown_opencode();
+    commands::terminal::shutdown_all();
+
+    let models = state.inference.touched_models();
+    let mcp = state.mcp.clone();
+    let lsp = state.lsp.clone();
+    run_shutdown_future(async move {
+        commands::ollama::unload_models_by_name(models).await;
+        mcp.shutdown_all().await;
+        lsp.shutdown_all().await;
+    });
+
+    state.shutdown_ollama();
+}
+
+fn run_shutdown_future<F>(future: F)
+where
+    F: std::future::Future<Output = ()>,
+{
+    if let Ok(handle) = tokio::runtime::Handle::try_current() {
+        handle.block_on(future);
+        return;
+    }
+    match tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+    {
+        Ok(runtime) => runtime.block_on(future),
+        Err(e) => log::warn!("failed to create shutdown runtime: {e}"),
+    }
 }

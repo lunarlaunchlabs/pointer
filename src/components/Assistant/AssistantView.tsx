@@ -8,18 +8,36 @@
  * change" without restarting.
  */
 import { useEffect, useRef } from "react";
-import { Bot, Plus, Trash2 } from "lucide-react";
+import {
+  AlertCircle,
+  Bot,
+  CheckCircle2,
+  CircleDashed,
+  FileText,
+  Plus,
+  Search,
+  Trash2,
+  Wrench,
+} from "lucide-react";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import { useAssistant, type AssistantSession } from "@/store/assistant";
+import type { AssistantMode } from "@/store/assistant";
 import {
   featureBlockReason,
   isFeatureUsable,
+  type AiFeature,
   useSettings,
 } from "@/store/settings";
 import { useEditorStore } from "@/store/editor";
 import { useWorkspace } from "@/store/workspace";
 import { buildContext } from "@/lib/buildContext";
+import {
+  agentActivityItems,
+  visibleEventOutputs,
+  type ActivityItem,
+  type EventOutput,
+} from "@/lib/assistantDisplay";
 import { Composer } from "@/components/Chat/Composer";
 import { ModePicker } from "./ModePicker";
 import { PlanCard } from "./PlanCard";
@@ -31,6 +49,7 @@ export function AssistantView() {
   const ensureActive = useAssistant((s) => s.ensureActive);
   const newSession = useAssistant((s) => s.newSession);
   const setSessionMode = useAssistant((s) => s.setSessionMode);
+  const setSessionModel = useAssistant((s) => s.setSessionModel);
   const deleteSession = useAssistant((s) => s.deleteSession);
   const selectSession = useAssistant((s) => s.selectSession);
   const send = useAssistant((s) => s.send);
@@ -40,8 +59,7 @@ export function AssistantView() {
   const removeRef = useAssistant((s) => s.removeRef);
 
   const chatModel = useSettings((s) => s.chatModel);
-  const chatUsable = useSettings((s) => isFeatureUsable("chat", s));
-  const chatBlock = useSettings((s) => featureBlockReason("chat", s));
+  const agentModel = useSettings((s) => s.agentModel);
   const indexUsable = useSettings((s) => isFeatureUsable("indexing", s));
   const embedModel = useSettings((s) => s.embedModel);
   const editor = useEditorStore((s) => s.getActive());
@@ -51,10 +69,18 @@ export function AssistantView() {
   // chat is usable. New sessions default to Ask mode — the picker
   // is one click away if the user wants Plan/Agent.
   useEffect(() => {
-    if (!activeId && chatUsable) {
+    if (!activeId && isFeatureUsable("chat")) {
       ensureActive(chatModel, "ask");
     }
-  }, [activeId, chatUsable, chatModel, ensureActive]);
+  }, [activeId, chatModel, ensureActive]);
+
+  useEffect(() => {
+    if (!active || active.status === "running") return;
+    const model = modelForMode(active.mode, chatModel, agentModel);
+    if (model && active.model !== model) {
+      setSessionModel(active.id, model);
+    }
+  }, [active, chatModel, agentModel, setSessionModel]);
 
   const scrollRef = useRef<HTMLDivElement | null>(null);
   useEffect(() => {
@@ -62,7 +88,7 @@ export function AssistantView() {
       top: scrollRef.current.scrollHeight,
       behavior: "smooth",
     });
-  }, [active?.messages.length, active?.status]);
+  }, [active?.messages.length, active?.events.length, active?.status]);
 
   const buildAssistantContext = (refs: Parameters<typeof buildContext>[0]) =>
     buildContext(refs, {
@@ -76,12 +102,16 @@ export function AssistantView() {
 
   const onSend = (text: string) => {
     void send(text, {
-      defaultModel: chatModel,
+      defaultModel: modelForMode(active?.mode ?? "ask", chatModel, agentModel),
       buildContext: buildAssistantContext,
     });
   };
 
   const running = active?.status === "running";
+  const activeMode = active?.mode ?? "ask";
+  const activeFeature = featureForMode(activeMode);
+  const modeUsable = useSettings((s) => isFeatureUsable(activeFeature, s));
+  const modeBlock = useSettings((s) => featureBlockReason(activeFeature, s));
 
   return (
     <div className="flex flex-col h-full bg-noir-bg">
@@ -95,8 +125,12 @@ export function AssistantView() {
       />
       <div className="px-3 py-2 border-b border-noir-line bg-noir-chrome/30 flex items-center gap-2">
         <ModePicker
-          value={active?.mode ?? "ask"}
-          onChange={(m) => active && setSessionMode(active.id, m)}
+          value={activeMode}
+          onChange={(m) => {
+            if (!active) return;
+            setSessionMode(active.id, m);
+            setSessionModel(active.id, modelForMode(m, chatModel, agentModel));
+          }}
           disabled={running || !active}
         />
         {running && (
@@ -105,10 +139,10 @@ export function AssistantView() {
           </span>
         )}
       </div>
-      {!chatUsable && chatBlock && (
+      {!modeUsable && modeBlock && (
         <div className="mx-3 mt-3 rounded-md border border-noir-warn/40 bg-noir-warn/5 px-3 py-2 text-[11px] font-sans text-noir-warn">
           <div className="font-medium">Assistant isn't ready</div>
-          <div className="text-[10.5px] opacity-80 mt-0.5">{chatBlock}</div>
+          <div className="text-[10.5px] opacity-80 mt-0.5">{modeBlock}</div>
         </div>
       )}
       <div ref={scrollRef} className="flex-1 overflow-y-auto">
@@ -121,6 +155,8 @@ export function AssistantView() {
               <MessageRow key={m.id} role={m.role} content={m.content} />
             ))}
             <PlanCard session={active} />
+            <EventOutputs session={active} />
+            <ActivityTrace session={active} />
             {active.ledger.length > 0 && <LedgerTrace session={active} />}
           </>
         ) : (
@@ -128,7 +164,7 @@ export function AssistantView() {
         )}
       </div>
       <Composer
-        disabled={!chatUsable || !active}
+        disabled={!modeUsable || !active}
         streaming={running}
         onSend={onSend}
         onCancel={() => void cancel()}
@@ -136,10 +172,18 @@ export function AssistantView() {
         onAddReference={addRef}
         onRemoveReference={removeRef}
         placeholder={placeholderFor(active?.mode ?? "ask")}
-        submitHint={`${active?.mode ?? "ask"} mode · ⌘↩ to send`}
+        submitHint={`${active?.mode ?? "ask"} mode · send`}
       />
     </div>
   );
+}
+
+function featureForMode(mode: AssistantMode): AiFeature {
+  return mode === "ask" ? "chat" : "agent";
+}
+
+function modelForMode(mode: AssistantMode, chatModel: string, agentModel: string): string {
+  return mode === "ask" ? chatModel : agentModel;
 }
 
 function placeholderFor(mode: "ask" | "plan" | "agent"): string {
@@ -187,6 +231,107 @@ function MessageRow({ role, content }: { role: "user" | "assistant" | "system"; 
   );
 }
 
+function EventOutputs({ session }: { session: AssistantSession }) {
+  const visibleMessages = session.messages
+    .filter((m) => m.role === "assistant")
+    .map((m) => m.content);
+  const outputs = visibleEventOutputs(session.events, visibleMessages);
+  if (outputs.length === 0) return null;
+  return (
+    <>
+      {outputs.map((output) => (
+        <OutputCard key={output.key} output={output} />
+      ))}
+    </>
+  );
+}
+
+function OutputCard({ output }: { output: EventOutput }) {
+  const error = output.tone === "error";
+  const clarify = output.tone === "clarify";
+  return (
+    <div
+      className={[
+        "mx-3 my-3 rounded-md border px-3 py-2",
+        error
+          ? "border-noir-err/40 bg-noir-err/5"
+          : clarify
+            ? "border-noir-warn/40 bg-noir-warn/5"
+            : "border-noir-line bg-noir-canvas/20",
+      ].join(" ")}
+    >
+      <div className="flex items-center gap-2 text-[10px] uppercase tracking-wider text-noir-mute font-sans mb-1.5">
+        {error ? (
+          <AlertCircle size={12} className="text-noir-err" aria-hidden="true" />
+        ) : clarify ? (
+          <CircleDashed size={12} className="text-noir-warn" aria-hidden="true" />
+        ) : (
+          <Bot size={12} className="text-noir-accent" aria-hidden="true" />
+        )}
+        <span>{output.title}</span>
+      </div>
+      <div className="text-[11.5px] leading-relaxed text-noir-text font-sans prose-pn">
+        <ReactMarkdown remarkPlugins={[remarkGfm]}>{output.text}</ReactMarkdown>
+      </div>
+    </div>
+  );
+}
+
+function ActivityTrace({ session }: { session: AssistantSession }) {
+  const items = agentActivityItems(session.events);
+  if (items.length === 0) return null;
+  const running = session.status === "running";
+  return (
+    <details
+      open={running}
+      className="mx-3 my-3 rounded-md border border-noir-line bg-noir-canvas/15"
+    >
+      <summary className="cursor-pointer select-none px-3 py-2 text-[10px] uppercase tracking-wider text-noir-mute font-sans">
+        Activity · {items.length} recent step{items.length === 1 ? "" : "s"}
+      </summary>
+      <ul className="border-t border-noir-line/70 px-3 py-2 space-y-1.5">
+        {items.map((item) => (
+          <ActivityRow key={item.key} item={item} />
+        ))}
+      </ul>
+    </details>
+  );
+}
+
+function ActivityRow({ item }: { item: ActivityItem }) {
+  const Icon =
+    item.tone === "ok"
+      ? CheckCircle2
+      : item.tone === "error"
+        ? AlertCircle
+        : item.label.startsWith("Searched")
+          ? Search
+          : item.label.startsWith("Read") || item.label.startsWith("Listed")
+            ? FileText
+            : Wrench;
+  const color =
+    item.tone === "ok"
+      ? "text-noir-ok"
+      : item.tone === "warn"
+        ? "text-noir-warn"
+        : item.tone === "error"
+          ? "text-noir-err"
+          : "text-noir-mute";
+  return (
+    <li className="flex gap-2 text-[10.5px] font-sans text-noir-mute leading-relaxed">
+      <Icon size={12} className={`${color} mt-0.5 shrink-0`} aria-hidden="true" />
+      <div className="min-w-0">
+        <div className="text-noir-text truncate">{item.label}</div>
+        {item.detail && (
+          <div className="font-mono text-[10px] text-noir-mute truncate">
+            {item.detail}
+          </div>
+        )}
+      </div>
+    </li>
+  );
+}
+
 /** Compact "what's in the ledger" footer. Lets the user see the
  *  factual record Pointer is carrying into the next turn so the
  *  intelligent-history behaviour isn't a black box. */
@@ -195,19 +340,19 @@ function LedgerTrace({ session }: { session: AssistantSession }) {
   // happened recently without dominating the panel.
   const recent = session.ledger.slice(-5);
   return (
-    <div className="mx-3 my-3 rounded-md border border-noir-line bg-noir-canvas/20">
-      <div className="px-3 py-1.5 border-b border-noir-line text-[10px] uppercase tracking-wider text-noir-mute font-sans">
-        Ledger · last {recent.length} of {session.ledger.length}
-      </div>
+    <details className="mx-3 my-3 rounded-md border border-noir-line bg-noir-canvas/10">
+      <summary className="cursor-pointer select-none px-3 py-2 text-[10px] uppercase tracking-wider text-noir-mute font-sans">
+        Memory carried forward · {session.ledger.length}
+      </summary>
       <ul className="px-3 py-1.5 space-y-0.5 text-[10.5px] font-mono text-noir-mute">
         {recent.map((entry, i) => (
           <li key={i}>
-            <span className="text-noir-accent">T{entry.turn}</span>{" "}
+            <span className="text-noir-accent">Turn {entry.turn}</span>{" "}
             {describeEntry(entry)}
           </li>
         ))}
       </ul>
-    </div>
+    </details>
   );
 }
 

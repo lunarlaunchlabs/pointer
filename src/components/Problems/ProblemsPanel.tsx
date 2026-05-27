@@ -17,7 +17,9 @@ import {
   Bot,
   ChevronDown,
   Info,
+  Loader2,
   MessageSquare,
+  RefreshCw,
   Sparkles,
   X,
 } from "lucide-react";
@@ -29,15 +31,22 @@ import {
   sendDiagnosticToAI,
 } from "@/lib/sendToAI";
 import { isFeatureUsable, useSettings } from "@/store/settings";
+import { useWorkspace } from "@/store/workspace";
+import { pathFromMonacoUri } from "@/lib/monacoUri";
 
 export function ProblemsPanel({ onClose }: { onClose: () => void }) {
   const byUri = useDiagnostics((s) => s.byUri);
+  const runProjectCheck = useDiagnostics((s) => s.runProjectCheck);
+  const clearProjectDiagnostics = useDiagnostics((s) => s.clearProjectDiagnostics);
+  const projectCheck = useDiagnostics((s) => s.projectCheck);
+  const projectDiagnosticFiles = useDiagnostics((s) => Object.keys(s.projectByUri).length);
   const revealAt = useEditorStore((s) => s.revealAt);
-  // We don't *disable* the send buttons when chat / agent are off (the
+  const root = useWorkspace((s) => s.root);
+  // We don't *disable* the send buttons when Ask / Agent are off (the
   // user might be staging refs to inspect later), but we surface the
   // unavailable state in the tooltip so they know what to expect when
   // they hit Enter in the picker.
-  const chatUsable = useSettings((s) => isFeatureUsable("chat", s));
+  const askUsable = useSettings((s) => isFeatureUsable("chat", s));
   const agentUsable = useSettings((s) => isFeatureUsable("agent", s));
 
   // Build a stable grouped view. Sorted by severity → file → line so the
@@ -70,9 +79,7 @@ export function ProblemsPanel({ onClose }: { onClose: () => void }) {
     // come through as `file:///C:/...` — slicing off `file://` gives the
     // path with a leading `/C:/`, which the file-open IPC tolerates after
     // a trim.
-    const path = d.uri
-      .replace(/^file:\/\//, "")
-      .replace(/^\/([A-Za-z]):/, "$1:");
+    const path = pathFromMonacoUri(d.uri);
     revealAt(path, d.startLine, d.startCol).catch(() => {});
   };
 
@@ -95,7 +102,37 @@ export function ProblemsPanel({ onClose }: { onClose: () => void }) {
           {total === 0 ? "none" : `${total} item${total === 1 ? "" : "s"}`}
         </span>
         <div className="flex-1" />
-        {/* Batch actions: send every diagnostic to chat or agent in one
+        <button
+          onClick={() => runProjectCheck().catch(() => {})}
+          disabled={!root || projectCheck.status === "running"}
+          className="text-[10.5px] font-sans px-1.5 py-0.5 rounded text-noir-subtext hover:text-noir-accent hover:bg-noir-ridge/60 disabled:opacity-40 disabled:cursor-not-allowed inline-flex items-center gap-1"
+          title={
+            !root
+              ? "Open a folder first"
+              : projectCheck.detected
+              ? `Run ${projectCheck.detected.command}`
+              : "Auto-detect and run this project's check command"
+          }
+          aria-label="Run project check"
+        >
+          {projectCheck.status === "running" ? (
+            <Loader2 size={10} aria-hidden="true" className="animate-spin" />
+          ) : (
+            <RefreshCw size={10} aria-hidden="true" />
+          )}
+          Check
+        </button>
+        {projectDiagnosticFiles > 0 && (
+          <button
+            onClick={clearProjectDiagnostics}
+            className="text-[10.5px] font-sans px-1.5 py-0.5 rounded text-noir-subtext hover:text-noir-text hover:bg-noir-ridge/60 inline-flex items-center gap-1"
+            title="Clear project-check diagnostics"
+            aria-label="Clear project-check diagnostics"
+          >
+            <X size={10} aria-hidden="true" /> Check
+          </button>
+        )}
+        {/* Batch actions: send every diagnostic to Ask or Agent in one
             click. Cheaper than the per-row buttons when the user wants
             to bring the agent in to do a wider sweep. Hidden when
             there's nothing to send so the toolbar stays light. */}
@@ -103,21 +140,21 @@ export function ProblemsPanel({ onClose }: { onClose: () => void }) {
           <>
             <button
               onClick={() =>
-                sendAllDiagnosticsToAI("chat").catch(() => {})
+                sendAllDiagnosticsToAI("ask").catch(() => {})
               }
               className="text-[10.5px] font-sans px-1.5 py-0.5 rounded text-noir-subtext hover:text-noir-accent hover:bg-noir-ridge/60 inline-flex items-center gap-1"
               title={
-                chatUsable
-                  ? `Attach all ${total} diagnostics to chat`
-                  : "Chat isn't ready, but you can still stage diagnostics."
+                askUsable
+                  ? `Attach all ${total} diagnostics to Ask`
+                  : "Ask isn't ready, but you can still stage diagnostics."
               }
               aria-label={
-                chatUsable
-                  ? `Attach all ${total} diagnostics to chat`
-                  : "Stage all diagnostics for chat (chat is not ready)"
+                askUsable
+                  ? `Attach all ${total} diagnostics to Ask`
+                  : "Stage all diagnostics for Ask (Ask is not ready)"
               }
             >
-              <MessageSquare size={10} aria-hidden="true" /> All → Chat
+              <MessageSquare size={10} aria-hidden="true" /> All → Ask
             </button>
             <button
               onClick={() =>
@@ -152,7 +189,8 @@ export function ProblemsPanel({ onClose }: { onClose: () => void }) {
       <div className="flex-1 min-h-0 overflow-y-auto py-1">
         {groups.length === 0 ? (
           <div className="px-4 py-3 text-[12px] text-noir-mute font-sans">
-            No problems detected. Lint results from open files will appear here.
+            {projectCheck.error ??
+              "No problems detected. Open-file diagnostics and project checks will appear here."}
           </div>
         ) : (
           groups.map((g) => (
@@ -215,11 +253,11 @@ function FileGroup({
             <button
               onClick={(e) => {
                 e.stopPropagation();
-                sendDiagnosticToAI("chat", d).catch(() => {});
+                sendDiagnosticToAI("ask", d).catch(() => {});
               }}
               className="p-1 rounded text-noir-subtext hover:text-noir-accent hover:bg-noir-ridge/80"
-              title="Send to chat"
-              aria-label="Send this diagnostic to chat"
+              title="Send to Ask"
+              aria-label="Send this diagnostic to Ask"
             >
               <MessageSquare size={11} aria-hidden="true" />
             </button>

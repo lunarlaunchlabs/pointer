@@ -69,7 +69,6 @@ export function MCPPanel() {
             onClick={() => refresh()}
             className="pn-button font-sans text-[10.5px] inline-flex items-center gap-1"
             title="Refresh server status"
-            aria-label="Refresh MCP server status"
           >
             <RefreshCw size={10} aria-hidden="true" />
             Refresh
@@ -78,7 +77,7 @@ export function MCPPanel() {
             onClick={() => setShowAdd((v) => !v)}
             className="pn-button-accent font-sans text-[10.5px] inline-flex items-center gap-1"
             aria-expanded={showAdd}
-            aria-label={showAdd ? "Cancel adding MCP server" : "Add a new MCP server"}
+            title={showAdd ? "Cancel adding MCP server" : "Add a new MCP server"}
           >
             {showAdd ? <X size={10} aria-hidden="true" /> : <Plus size={10} aria-hidden="true" />}
             {showAdd ? "Cancel" : "Add server"}
@@ -217,8 +216,9 @@ function ServerRow({ snapshot }: { snapshot: McpServerSnapshot }) {
         <button
           onClick={onToggleExpand}
           className="text-noir-mute hover:text-noir-text"
-          aria-label={`${expanded ? "Collapse" : "Expand"} ${snapshot.name}`}
+          aria-label={expanded ? "Collapse" : "Expand"}
           aria-expanded={expanded}
+          title={`${expanded ? "Collapse" : "Expand"} ${snapshot.name}`}
         >
           {expanded ? <ChevronDown size={11} aria-hidden="true" /> : <ChevronRight size={11} aria-hidden="true" />}
         </button>
@@ -242,7 +242,6 @@ function ServerRow({ snapshot }: { snapshot: McpServerSnapshot }) {
               disabled={busy !== null}
               className="pn-button font-sans text-[10.5px] inline-flex items-center gap-1"
               title="Stop the subprocess"
-              aria-label={`Stop ${snapshot.name}`}
             >
               {busy === "stop" ? (
                 <Loader2 size={10} className="animate-spin" aria-hidden="true" />
@@ -257,7 +256,6 @@ function ServerRow({ snapshot }: { snapshot: McpServerSnapshot }) {
               disabled={busy !== null || snapshot.config.disabled}
               className="pn-button-accent font-sans text-[10.5px] inline-flex items-center gap-1"
               title={snapshot.config.disabled ? "Server is disabled in mcp.json" : "Start the subprocess"}
-              aria-label={snapshot.config.disabled ? `${snapshot.name} is disabled in mcp.json` : `Start ${snapshot.name}`}
             >
               {busy === "start" ? (
                 <Loader2 size={10} className="animate-spin" aria-hidden="true" />
@@ -272,7 +270,6 @@ function ServerRow({ snapshot }: { snapshot: McpServerSnapshot }) {
             disabled={busy !== null}
             className="pn-button font-sans text-[10.5px] inline-flex items-center gap-1"
             title="Stop then start"
-            aria-label={`Restart ${snapshot.name}`}
           >
             {busy === "restart" ? (
               <Loader2 size={10} className="animate-spin" aria-hidden="true" />
@@ -653,7 +650,7 @@ function AddServerForm({
           type="button"
           onClick={onDone}
           className="pn-button font-sans text-[10.5px]"
-          aria-label="Cancel server changes"
+          title="Cancel server changes"
         >
           Cancel
         </button>
@@ -661,7 +658,7 @@ function AddServerForm({
           type="submit"
           disabled={!canSave}
           className="pn-button-accent font-sans text-[10.5px] inline-flex items-center gap-1"
-          aria-label={existingName ? `Save changes to ${existingName}` : "Add MCP server"}
+          title={existingName ? `Save changes to ${existingName}` : "Add MCP server"}
         >
           {saving ? (
             <Loader2 size={10} className="animate-spin" aria-hidden="true" />

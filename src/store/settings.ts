@@ -120,7 +120,6 @@ export type FeatureCapability =
 
 type Settings = {
   ollamaReady: boolean;
-  hasHfToken: boolean;
   hydrated: boolean;
   onboarded: boolean;
 
@@ -207,7 +206,6 @@ type Settings = {
   setTreeSort: (m: "type" | "name") => void;
   setGitInlineBlame: (b: boolean) => void;
 
-  setHasHfToken: (b: boolean) => void;
   setOllamaReady: (b: boolean) => void;
 
   /**
@@ -261,17 +259,15 @@ const DEFAULTS = {
 
 export const useSettings = create<Settings>((set, get) => ({
   ollamaReady: false,
-  hasHfToken: false,
   hydrated: false,
   onboarded: false,
   installedModels: [],
   ...DEFAULTS,
   init: async () => {
-    const [persisted, onboarded, status, hf] = await Promise.all([
+    const [persisted, onboarded, status] = await Promise.all([
       getItem<PersistedSettings>(SETTINGS_KEY).catch(() => undefined),
       getItem<boolean>(ONBOARDED_KEY).catch(() => false),
       ipc.ollamaStatus().catch(() => null),
-      ipc.hfTokenStatus().catch(() => null),
     ]);
     // Honour the user's saved assignments verbatim. If the model they chose
     // isn't currently installed, we leave the slot as the persisted name —
@@ -284,7 +280,6 @@ export const useSettings = create<Settings>((set, get) => ({
       hydrated: true,
       onboarded: !!onboarded,
       ollamaReady: !!status?.running,
-      hasHfToken: !!hf?.present,
     });
   },
   markOnboarded: () => {
@@ -341,7 +336,6 @@ export const useSettings = create<Settings>((set, get) => ({
   setTreeSort: (m) => persist(set, get, { treeSort: m }),
   setGitInlineBlame: (b) => persist(set, get, { gitInlineBlame: b }),
 
-  setHasHfToken: (b) => set({ hasHfToken: b }),
   setOllamaReady: (b) => set({ ollamaReady: b }),
 
   unsetMissingModels: (installed) => {

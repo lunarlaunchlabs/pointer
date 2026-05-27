@@ -110,13 +110,15 @@ fn take_snapshot(self_pid: u32, owned_ollama_pid: Option<u32>) -> SystemSnapshot
         let is_pointer_self = pid_u == self_pid;
         let is_descendant = pointer_descendants.contains(&pid_u);
         let owned_ollama = owned_ollama_pid == Some(pid_u);
-        let is_ollama_runner =
-            lower_name.contains("ollama") && (lower_cmd.contains("runner") || lower_cmd.contains("llama-server"));
+        let is_ollama_runner = lower_name.contains("ollama")
+            && (lower_cmd.contains("runner") || lower_cmd.contains("llama-server"));
         let is_ollama = lower_name == "ollama" || lower_name.starts_with("ollama");
 
         let kind = if is_pointer_self {
             "pointer"
-        } else if is_descendant && (lower_name.contains("pointer") || is_pointer_renderer(&lower_name, &lower_cmd)) {
+        } else if is_descendant
+            && (lower_name.contains("pointer") || is_pointer_renderer(&lower_name, &lower_cmd))
+        {
             "renderer"
         } else if owned_ollama || is_ollama {
             "ollama"
@@ -191,7 +193,10 @@ fn collect_descendants(sys: &System, root: u32) -> std::collections::HashSet<u32
     let mut by_parent: std::collections::HashMap<u32, Vec<u32>> = std::collections::HashMap::new();
     for (pid, proc) in sys.processes() {
         if let Some(parent) = proc.parent() {
-            by_parent.entry(parent.as_u32()).or_default().push(pid.as_u32());
+            by_parent
+                .entry(parent.as_u32())
+                .or_default()
+                .push(pid.as_u32());
         }
     }
     let mut out = std::collections::HashSet::new();
@@ -361,10 +366,7 @@ fn detect_gpu_windows() -> Option<String> {
 /// Best-effort kill: only works for processes Pointer started (the Ollama child
 /// or its descendants). We refuse to nuke arbitrary PIDs.
 #[tauri::command]
-pub async fn kill_owned_process(
-    state: State<'_, AppState>,
-    pid: u32,
-) -> AppResult<bool> {
+pub async fn kill_owned_process(state: State<'_, AppState>, pid: u32) -> AppResult<bool> {
     let owned_pid = state.ollama_child.lock().as_ref().map(|c| c.id());
     if owned_pid == Some(pid) {
         state.shutdown_ollama();

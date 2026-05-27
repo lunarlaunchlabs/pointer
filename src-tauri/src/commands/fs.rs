@@ -191,27 +191,20 @@ pub async fn delete_path(state: State<'_, AppState>, path: String) -> AppResult<
 }
 
 #[tauri::command]
-pub async fn rename_path(
-    state: State<'_, AppState>,
-    from: String,
-    to: String,
-) -> AppResult<()> {
+pub async fn rename_path(state: State<'_, AppState>, from: String, to: String) -> AppResult<()> {
     let ws = state.workspace.lock().clone();
     let (a, b) = match ws {
-        Some(w) => (
-            canonical_within(&w, Path::new(&from))?,
-            {
-                let abs = if Path::new(&to).is_absolute() {
-                    PathBuf::from(&to)
-                } else {
-                    w.join(&to)
-                };
-                if !abs.starts_with(&w) {
-                    return Err(AppError::Forbidden(abs.display().to_string()));
-                }
-                abs
-            },
-        ),
+        Some(w) => (canonical_within(&w, Path::new(&from))?, {
+            let abs = if Path::new(&to).is_absolute() {
+                PathBuf::from(&to)
+            } else {
+                w.join(&to)
+            };
+            if !abs.starts_with(&w) {
+                return Err(AppError::Forbidden(abs.display().to_string()));
+            }
+            abs
+        }),
         None => (PathBuf::from(&from), PathBuf::from(&to)),
     };
     std::fs::rename(a, b)?;
@@ -249,14 +242,14 @@ pub async fn search_files(
         if !dent.file_type().map(|t| t.is_file()).unwrap_or(false) {
             continue;
         }
-        let name = dent
-            .file_name()
-            .to_string_lossy()
-            .to_string();
+        let name = dent.file_name().to_string_lossy().to_string();
         let path_str = dent.path().display().to_string();
         let path_lower = path_str.to_lowercase();
         if q.is_empty() || subsequence_match(&path_lower, &q) {
-            hits.push(FileHit { path: path_str, name });
+            hits.push(FileHit {
+                path: path_str,
+                name,
+            });
             if hits.len() >= limit * 4 {
                 break;
             }
@@ -305,14 +298,14 @@ pub async fn search_directories(
         if dent.path() == root {
             continue;
         }
-        let name = dent
-            .file_name()
-            .to_string_lossy()
-            .to_string();
+        let name = dent.file_name().to_string_lossy().to_string();
         let path_str = dent.path().display().to_string();
         let path_lower = path_str.to_lowercase();
         if q.is_empty() || subsequence_match(&path_lower, &q) {
-            hits.push(FileHit { path: path_str, name });
+            hits.push(FileHit {
+                path: path_str,
+                name,
+            });
             if hits.len() >= limit * 4 {
                 break;
             }
@@ -402,9 +395,7 @@ pub async fn search_text(
             // regex" instead of zero results. We turn the regex
             // error into a runtime error which Tauri will propagate.
             Err(e) => {
-                return Err(crate::error::AppError::Msg(format!(
-                    "invalid regex: {e}"
-                )));
+                return Err(crate::error::AppError::Msg(format!("invalid regex: {e}")));
             }
         }
     } else {
@@ -444,13 +435,9 @@ pub async fn search_text(
             let mut matched = false;
             if let Some(rx) = &regex {
                 if let Some(m) = rx.find(line) {
-                    if opts.whole_word
-                        || !opts.whole_word
-                    {
-                        col = m.start() as i32;
-                        match_len = (m.end() - m.start()) as u32;
-                        matched = true;
-                    }
+                    col = m.start() as i32;
+                    match_len = (m.end() - m.start()) as u32;
+                    matched = true;
                 }
             } else {
                 let haystack: std::borrow::Cow<str> = if opts.case_sensitive {
@@ -500,12 +487,8 @@ fn is_word_boundary_match(haystack: &str, start: usize, end: usize) -> bool {
             .last()
             .map(is_word)
             .unwrap_or(false);
-    let after_ok = end >= haystack.len()
-        || !haystack[end..]
-            .chars()
-            .next()
-            .map(is_word)
-            .unwrap_or(false);
+    let after_ok =
+        end >= haystack.len() || !haystack[end..].chars().next().map(is_word).unwrap_or(false);
     before_ok && after_ok
 }
 
@@ -543,9 +526,7 @@ pub async fn replace_text(
         {
             Ok(r) => Some(r),
             Err(e) => {
-                return Err(crate::error::AppError::Msg(format!(
-                    "invalid regex: {e}"
-                )));
+                return Err(crate::error::AppError::Msg(format!("invalid regex: {e}")));
             }
         }
     } else {

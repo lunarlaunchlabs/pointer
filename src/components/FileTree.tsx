@@ -35,6 +35,7 @@ import { useTreeSelection } from "@/store/treeSelection";
 import { languageFromPath } from "@/lib/lang";
 import { toast } from "@/components/Toast";
 import { useTerminals, nextTerminalTitle } from "@/store/terminal";
+import { useSession } from "@/store/session";
 
 /** Spawn a fresh terminal tab whose initial working directory is
  *  `cwd`. Reused by the file-tree context menu and the "Open in
@@ -103,6 +104,15 @@ function cssEscape(s: string): string {
     return (CSS as { escape: (s: string) => string }).escape(s);
   }
   return s.replace(/[^a-zA-Z0-9_-]/g, (c) => `\\${c}`);
+}
+
+function focusTreeRow(path: string): void {
+  requestAnimationFrame(() => {
+    const row = document.querySelector(
+      `[data-tree-path="${cssEscape(path)}"]`,
+    ) as HTMLElement | null;
+    row?.focus();
+  });
 }
 
 /** Stable sort comparator. Default puts directories first then alphabetical;
@@ -343,7 +353,9 @@ export function FileTree() {
       await refreshDir(pending.parentDir).catch(() => {});
       await refresh().catch(() => {});
     } catch (e) {
-      console.warn("create failed", e);
+      toast.error(`Couldn't create ${pending.kind}`, {
+        body: e instanceof Error ? e.message : String(e),
+      });
     }
   };
 
@@ -356,18 +368,13 @@ export function FileTree() {
     if (newPath === oldPath) return;
     try {
       await ipc.renamePath(oldPath, newPath);
-      // Editor: rename open tab paths transparently.
-      const tabs = useEditorStore.getState().tabs;
-      for (const t of tabs) {
-        if (t.path === oldPath || t.path.startsWith(oldPath + "/")) {
-          closeTab(t.path);
-          await openFile(t.path.replace(oldPath, newPath));
-        }
-      }
+      useEditorStore.getState().rewritePathPrefix(oldPath, newPath);
       await refreshDir(parent).catch(() => {});
       await refresh().catch(() => {});
     } catch (e) {
-      console.warn("rename failed", e);
+      toast.error("Couldn't rename", {
+        body: e instanceof Error ? e.message : String(e),
+      });
     }
   };
 
@@ -395,21 +402,10 @@ export function FileTree() {
     let failed = 0;
     for (const src of valid) {
       const name = src.split(/[\\/]/).pop() ?? src;
-      const dest = `${targetDir}/${name}`;
+      const dest = pathLib.join(targetDir, name);
       try {
         await ipc.renamePath(src, dest);
-        // Rewrite any open tabs that referenced the old path so the
-        // editor doesn't break when you save next.
-        useEditorStore.setState((s) => ({
-          tabs: s.tabs.map((t) =>
-            t.path === src
-              ? { ...t, path: dest, name }
-              : t.path.startsWith(src + "/")
-              ? { ...t, path: dest + t.path.slice(src.length) }
-              : t,
-          ),
-          activePath: s.activePath === src ? dest : s.activePath,
-        }));
+        useEditorStore.getState().rewritePathPrefix(src, dest);
         moved++;
       } catch (e) {
         failed++;
@@ -447,18 +443,21 @@ export function FileTree() {
     });
     if (!ok) return;
     try {
-      const tabs = useEditorStore.getState().tabs;
-      for (const t of tabs) {
-        if (t.path === target || t.path.startsWith(target + "/")) {
-          closeTab(t.path);
-        }
-      }
+      const tabsToClose = useEditorStore
+        .getState()
+        .tabs.filter((t) => t.path === target || t.path.startsWith(target + "/"));
       await ipc.deletePath(target);
+      for (const t of tabsToClose) {
+        useSession.getState().noteHotExit(t.path, null);
+        closeTab(t.path);
+      }
       const parent = pathLib.dirname(target);
       await refreshDir(parent).catch(() => {});
       await refresh().catch(() => {});
     } catch (e) {
-      console.warn("delete failed", e);
+      toast.error("Couldn't delete", {
+        body: e instanceof Error ? e.message : String(e),
+      });
     }
   };
 
@@ -608,13 +607,14 @@ export function FileTree() {
     const dirty = new Set<string>();
     for (const target of targets) {
       try {
-        const tabs = useEditorStore.getState().tabs;
-        for (const t of tabs) {
-          if (t.path === target || t.path.startsWith(target + "/")) {
-            closeTab(t.path);
-          }
-        }
+        const tabsToClose = useEditorStore
+          .getState()
+          .tabs.filter((t) => t.path === target || t.path.startsWith(target + "/"));
         await ipc.deletePath(target);
+        for (const t of tabsToClose) {
+          useSession.getState().noteHotExit(t.path, null);
+          closeTab(t.path);
+        }
         dirty.add(pathLib.dirname(target));
         ok_n++;
       } catch (e) {
@@ -738,6 +738,12 @@ export function FileTree() {
             onToggle={toggle}
             onOpenFile={openFile}
             onContextMenu={onContextMenu}
+            beginRename={setRenaming}
+            deleteSelection={(path) => {
+              const sel = useTreeSelection.getState().selected;
+              if (sel.has(path) && sel.size > 1) void removeMany(Array.from(sel));
+              else void remove(path);
+            }}
             renaming={renaming}
             submitRename={submitRename}
             cancelRename={() => setRenaming(null)}
@@ -772,6 +778,8 @@ function TreeNode({
   onToggle,
   onOpenFile,
   onContextMenu,
+  beginRename,
+  deleteSelection,
   renaming,
   submitRename,
   cancelRename,
@@ -791,6 +799,8 @@ function TreeNode({
   onToggle: (p: string) => void;
   onOpenFile: (p: string) => void;
   onContextMenu: (e: React.MouseEvent, entry: FsEntry | null) => void;
+  beginRename: (path: string) => void;
+  deleteSelection: (path: string) => void;
   renaming: string | null;
   submitRename: (oldPath: string, newName: string) => void;
   cancelRename: () => void;
@@ -833,7 +843,6 @@ function TreeNode({
     return false;
   };
   const visible = !filter || matchesSelf || (entry.is_dir && anyDescendantMatches(children));
-  if (!visible) return null;
   // Subscribe to git status here so each row re-renders only when its own
   // status changes (well, when the whole map changes — but the dot lookup
   // is O(1) and React reconciliation handles the rest). Directories don't
@@ -864,6 +873,24 @@ function TreeNode({
   const isSelected = useTreeSelection((s) => s.selected.has(entry.path));
   const selectionSize = useTreeSelection((s) => s.selected.size);
   const [dragOver, setDragOver] = React.useState(false);
+  const focusVisible = (offset: number) => {
+    const idx = visibleOrder.indexOf(entry.path);
+    if (idx < 0) return;
+    const next = visibleOrder[idx + offset];
+    if (next) focusTreeRow(next);
+  };
+  const focusParent = () => {
+    const parent = pathLib.dirname(entry.path);
+    if (parent && parent !== "." && visibleOrder.includes(parent)) {
+      focusTreeRow(parent);
+    }
+  };
+  const primaryAction = () => {
+    useTreeSelection.getState().set([entry.path], entry.path);
+    if (entry.is_dir) onToggle(entry.path);
+    else Promise.resolve(onOpenFile(entry.path)).catch(() => {});
+  };
+  if (!visible) return null;
 
   return (
     <div>
@@ -947,15 +974,33 @@ function TreeNode({
             }
             // Plain click — collapse selection to just this row and
             // perform the row's primary action.
-            sel.set([entry.path], entry.path);
-            if (entry.is_dir) onToggle(entry.path);
-            else {
-              // `openFile` is async and surfaces its own toast on
-              // failure; we just need to swallow the resulting
-              // rejection so it doesn't become an unhandled
-              // promise (and so a transient read error doesn't
-              // log a noisy console error on every click).
-              Promise.resolve(onOpenFile(entry.path)).catch(() => {});
+            primaryAction();
+          }}
+          onKeyDown={(e) => {
+            if (e.key === "ArrowDown") {
+              e.preventDefault();
+              focusVisible(1);
+            } else if (e.key === "ArrowUp") {
+              e.preventDefault();
+              focusVisible(-1);
+            } else if (e.key === "ArrowRight") {
+              if (!entry.is_dir) return;
+              e.preventDefault();
+              if (!isOpen) onToggle(entry.path);
+              else focusVisible(1);
+            } else if (e.key === "ArrowLeft") {
+              e.preventDefault();
+              if (entry.is_dir && isOpen) onToggle(entry.path);
+              else focusParent();
+            } else if (e.key === "Enter" || e.key === " ") {
+              e.preventDefault();
+              primaryAction();
+            } else if (e.key === "F2") {
+              e.preventDefault();
+              beginRename(entry.path);
+            } else if (e.key === "Delete" || e.key === "Backspace") {
+              e.preventDefault();
+              deleteSelection(entry.path);
             }
           }}
           onContextMenu={(e) => {
@@ -1074,6 +1119,8 @@ function TreeNode({
               onToggle={onToggle}
               onOpenFile={onOpenFile}
               onContextMenu={onContextMenu}
+              beginRename={beginRename}
+              deleteSelection={deleteSelection}
               renaming={renaming}
               submitRename={submitRename}
               cancelRename={cancelRename}

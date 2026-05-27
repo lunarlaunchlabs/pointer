@@ -23,6 +23,12 @@ npm run eval:stability
 # Specific surface only.
 node scripts/quality/run.mjs --only=chat,agent
 
+# Terminal workbench that mirrors the app's Ask / Plan / Agent flows.
+npm run assistant:terminal -- --repo /Users/sameer/express
+
+# Fast terminal smoke across real repos.
+npm run eval:terminal
+
 # Different model:
 POINTER_MODEL=qwen2.5-coder:14b-instruct npm run eval
 ```
@@ -178,3 +184,42 @@ If you change any of these, update the corresponding harness file:
   `detectCycle` inside `evalAgent.mjs::driveAgent`.
 * `src-tauri/src/commands/agent.rs` :: `run_grep` (regex-with-literal-
   fallback) → harness `runTool` grep branch in `evalAgent.mjs`.
+
+### Terminal workbench (`pointerTerminal.mjs`)
+
+Runs a REPL that mimics the unified Assistant UI from a terminal so we
+can test like a real user without waiting on GUI automation. It loads a
+real repo into the same in-memory VFS used by `evalAgent.mjs`, resolves
+implicit file mentions, attaches the active editor file to Ask mode,
+routes Plan/Agent through the production agent system prompt, and prompts
+for approvals when running `agent-ask`.
+
+Useful commands inside the REPL:
+
+```sh
+/mode ask|chat|plan|agent|agent-ask
+/repo /Users/sameer/express
+/open lib/application.js
+/ref lib/request.js
+/send Tell me about application.js
+/execute
+/diff
+/suite smoke
+```
+
+For scripted runs:
+
+```sh
+node scripts/quality/pointerTerminal.mjs --suite=smoke
+node scripts/quality/pointerTerminal.mjs --suite=real
+node scripts/quality/pointerTerminal.mjs --repo=/Users/sameer/tauri-markdown --mode=plan --prompt="Plan a fix for the drag overlay sticking after an unsupported drop"
+```
+
+The suite can also be exported as neutral JSON/JSONL so another coding
+agent harness, such as opencode or a unified CLI runner, can replay the
+same real-developer scenarios and compare outputs:
+
+```sh
+node scripts/quality/pointerTerminal.mjs --suite=real --export=jsonl
+node scripts/quality/pointerTerminal.mjs --suite=plan --export=json
+```

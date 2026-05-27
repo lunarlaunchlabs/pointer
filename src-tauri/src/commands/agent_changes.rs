@@ -250,10 +250,7 @@ pub struct ChangeDiff {
 }
 
 #[tauri::command]
-pub async fn agent_change_diff(
-    app: AppHandle,
-    change_id: String,
-) -> AppResult<ChangeDiff> {
+pub async fn agent_change_diff(app: AppHandle, change_id: String) -> AppResult<ChangeDiff> {
     let dir = snapshot_dir(&app, &change_id)?;
     let before_bytes = std::fs::read(dir.join("before")).map_err(AppError::Io)?;
     let after_bytes = std::fs::read(dir.join("after")).map_err(AppError::Io)?;
@@ -284,10 +281,7 @@ pub struct UndoChangeRequest {
 }
 
 #[tauri::command]
-pub async fn agent_undo_change(
-    app: AppHandle,
-    req: UndoChangeRequest,
-) -> AppResult<()> {
+pub async fn agent_undo_change(app: AppHandle, req: UndoChangeRequest) -> AppResult<()> {
     let dir = snapshot_dir(&app, &req.change_id)?;
     let abs_path = resolve(&req.workspace, &req.path);
     match req.kind {
@@ -328,10 +322,7 @@ pub async fn agent_undo_change(
 }
 
 #[tauri::command]
-pub async fn agent_keep_change(
-    app: AppHandle,
-    change_id: String,
-) -> AppResult<()> {
+pub async fn agent_keep_change(app: AppHandle, change_id: String) -> AppResult<()> {
     let dir = snapshot_dir(&app, &change_id)?;
     // Keep is a pure bookkeeping op: the file on disk is already in
     // its "kept" state. We just drop the snapshot so the next purge
@@ -341,10 +332,7 @@ pub async fn agent_keep_change(
 }
 
 #[tauri::command]
-pub async fn agent_purge_changes(
-    app: AppHandle,
-    change_ids: Vec<String>,
-) -> AppResult<()> {
+pub async fn agent_purge_changes(app: AppHandle, change_ids: Vec<String>) -> AppResult<()> {
     for id in change_ids {
         if let Ok(dir) = snapshot_dir(&app, &id) {
             let _ = std::fs::remove_dir_all(&dir);
@@ -358,9 +346,7 @@ pub async fn agent_purge_changes(
 /// path is relative; passthrough otherwise.
 fn resolve(workspace: &str, path: &str) -> PathBuf {
     let p = Path::new(path);
-    if p.is_absolute() {
-        p.to_path_buf()
-    } else if workspace.is_empty() {
+    if p.is_absolute() || workspace.is_empty() {
         p.to_path_buf()
     } else {
         PathBuf::from(workspace).join(p)
@@ -382,15 +368,13 @@ mod tests {
         // No `..`, no slashes — the id is concatenated with a fs
         // path, so anything outside the UUID alphabet is a forbid.
         assert!(!is_valid_change_id("../etc/passwd"));
-        assert!(!is_valid_change_id("550e8400-e29b-41d4-a716-446655440000/.."));
+        assert!(!is_valid_change_id(
+            "550e8400-e29b-41d4-a716-446655440000/.."
+        ));
         assert!(!is_valid_change_id("nope"));
         assert!(!is_valid_change_id(""));
-        assert!(!is_valid_change_id(
-            "550e8400-e29b-41d4-a716-44665544000"
-        )); // 35 chars
-        assert!(!is_valid_change_id(
-            "550e8400xe29bx41d4xa716x446655440000"
-        )); // missing hyphens
+        assert!(!is_valid_change_id("550e8400-e29b-41d4-a716-44665544000")); // 35 chars
+        assert!(!is_valid_change_id("550e8400xe29bx41d4xa716x446655440000")); // missing hyphens
     }
 
     #[test]

@@ -81,6 +81,12 @@ impl Indexer {
     }
 }
 
+impl Default for Indexer {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 pub fn detect_language(path: &Path) -> &'static str {
     match path.extension().and_then(|e| e.to_str()).unwrap_or("") {
         "rs" => "rust",
@@ -120,31 +126,37 @@ pub fn chunk_text(path: &Path, text: &str) -> Vec<Chunk> {
     let is_boundary = |line: &str| -> bool {
         let trimmed = line.trim_start();
         match language.as_str() {
-            "rust" => trimmed.starts_with("fn ")
-                || trimmed.starts_with("pub fn ")
-                || trimmed.starts_with("pub(crate) fn ")
-                || trimmed.starts_with("async fn ")
-                || trimmed.starts_with("pub async fn ")
-                || trimmed.starts_with("struct ")
-                || trimmed.starts_with("pub struct ")
-                || trimmed.starts_with("enum ")
-                || trimmed.starts_with("impl ")
-                || trimmed.starts_with("trait ")
-                || trimmed.starts_with("mod "),
-            "typescript" | "javascript" => trimmed.starts_with("export function ")
-                || trimmed.starts_with("export async function ")
-                || trimmed.starts_with("function ")
-                || trimmed.starts_with("async function ")
-                || trimmed.starts_with("export class ")
-                || trimmed.starts_with("class ")
-                || trimmed.starts_with("export const ")
-                || trimmed.starts_with("export default ")
-                || trimmed.starts_with("export interface ")
-                || trimmed.starts_with("interface ")
-                || trimmed.starts_with("type "),
-            "python" => trimmed.starts_with("def ")
-                || trimmed.starts_with("async def ")
-                || trimmed.starts_with("class "),
+            "rust" => {
+                trimmed.starts_with("fn ")
+                    || trimmed.starts_with("pub fn ")
+                    || trimmed.starts_with("pub(crate) fn ")
+                    || trimmed.starts_with("async fn ")
+                    || trimmed.starts_with("pub async fn ")
+                    || trimmed.starts_with("struct ")
+                    || trimmed.starts_with("pub struct ")
+                    || trimmed.starts_with("enum ")
+                    || trimmed.starts_with("impl ")
+                    || trimmed.starts_with("trait ")
+                    || trimmed.starts_with("mod ")
+            }
+            "typescript" | "javascript" => {
+                trimmed.starts_with("export function ")
+                    || trimmed.starts_with("export async function ")
+                    || trimmed.starts_with("function ")
+                    || trimmed.starts_with("async function ")
+                    || trimmed.starts_with("export class ")
+                    || trimmed.starts_with("class ")
+                    || trimmed.starts_with("export const ")
+                    || trimmed.starts_with("export default ")
+                    || trimmed.starts_with("export interface ")
+                    || trimmed.starts_with("interface ")
+                    || trimmed.starts_with("type ")
+            }
+            "python" => {
+                trimmed.starts_with("def ")
+                    || trimmed.starts_with("async def ")
+                    || trimmed.starts_with("class ")
+            }
             "go" => trimmed.starts_with("func ") || trimmed.starts_with("type "),
             _ => false,
         }

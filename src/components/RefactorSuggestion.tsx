@@ -89,7 +89,7 @@ export function RefactorSuggestion() {
           onClick={dismiss}
           disabled={applying}
           className="rounded border border-pn-border bg-pn-surface px-2 py-1 text-xs hover:bg-pn-surface-3 disabled:opacity-50"
-          aria-label="Dismiss workspace rename suggestion"
+          title="Dismiss workspace rename suggestion"
         >
           Dismiss
         </button>
@@ -98,7 +98,7 @@ export function RefactorSuggestion() {
           onClick={onApply}
           disabled={applying}
           className="rounded bg-pn-accent px-2 py-1 text-xs font-medium text-pn-accent-foreground hover:bg-pn-accent/90 disabled:opacity-50"
-          aria-label={
+          title={
             applying
               ? "Applying rename, please wait"
               : `Apply rename from ${active.oldName} to ${active.newName} across ${fileCount} file${fileCount === 1 ? "" : "s"}`

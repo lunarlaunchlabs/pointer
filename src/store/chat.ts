@@ -325,6 +325,8 @@ export const useChat = create<State>((set, get) => ({
       // chats start feeling robotic; lower if logic regressions
       // creep back.
       temperature: 0.2,
+      purpose: "chat",
+      title: active.title,
     });
   },
 

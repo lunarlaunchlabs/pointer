@@ -1,11 +1,13 @@
 import { useMemo, useState } from "react";
 import { Pin, X } from "lucide-react";
 import { useEditorStore } from "@/store/editor";
-import { confirm } from "@/components/Confirm";
+import { choose } from "@/components/Confirm";
 import { FileIconFor } from "@/lib/fileIcon";
 import { ContextMenu, type MenuItem } from "@/components/ContextMenu";
 import { dispatchAction } from "@/lib/actions";
 import { useGit, gitStatusColor, gitStatusLetter } from "@/store/git";
+import { useSession } from "@/store/session";
+import { toast } from "@/components/Toast";
 
 /**
  * Tab strip with the full IDE-grade interactions:
@@ -46,25 +48,52 @@ export function Tabs() {
   /** Same Save / Discard / Cancel flow as ⌘W and File → Close Tab. */
   const closeWithGuard = async (path: string) => {
     const tab = useEditorStore.getState().tabs.find((t) => t.path === path);
-    if (!tab) return;
+    if (!tab) return true;
+    let pathToClose = path;
     if (tab.dirty) {
       setActive(path);
-      const save = await confirm({
+      const choice = await choose({
         title: `Save changes to ${tab.name}?`,
         body: "This file has unsaved edits. Closing without saving will lose them.",
         confirmLabel: "Save & close",
-        cancelLabel: "Discard",
+        secondaryLabel: "Discard",
+        cancelLabel: "Cancel",
       });
-      if (save) await useEditorStore.getState().saveActive();
+      if (choice === "cancel") return false;
+      if (choice === "confirm") {
+        try {
+          await useEditorStore.getState().saveActive();
+        } catch (e) {
+          toast.error("Couldn't save before closing", {
+            body: e instanceof Error ? e.message : String(e),
+          });
+          return false;
+        }
+        const after = useEditorStore.getState();
+        const savedTab =
+          after.tabs.find((t) => t.path === path) ??
+          (after.activePath ? after.tabs.find((t) => t.path === after.activePath) : null);
+        if (savedTab?.dirty) return false;
+        pathToClose = savedTab?.path ?? path;
+      } else {
+        useSession.getState().noteHotExit(path, null);
+      }
     }
-    closeTab(path);
+    closeTab(pathToClose);
+    return true;
   };
 
   const closeOthers = async (keepPath: string) => {
     const others = useEditorStore
       .getState()
       .tabs.filter((t) => t.path !== keepPath && !pinned.includes(t.path));
-    for (const t of others) await closeWithGuard(t.path);
+    for (const t of others) {
+      const closed = await closeWithGuard(t.path);
+      if (!closed) break;
+    }
+    if (useEditorStore.getState().tabs.some((t) => t.path === keepPath)) {
+      setActive(keepPath);
+    }
   };
 
   const closeToRight = async (path: string) => {
@@ -72,12 +101,21 @@ export function Tabs() {
     const i = all.findIndex((t) => t.path === path);
     if (i < 0) return;
     const after = all.slice(i + 1).filter((t) => !pinned.includes(t.path));
-    for (const t of after) await closeWithGuard(t.path);
+    for (const t of after) {
+      const closed = await closeWithGuard(t.path);
+      if (!closed) break;
+    }
+    if (useEditorStore.getState().tabs.some((t) => t.path === path)) {
+      setActive(path);
+    }
   };
 
   const closeAll = async () => {
     const all = useEditorStore.getState().tabs.filter((t) => !pinned.includes(t.path));
-    for (const t of all) await closeWithGuard(t.path);
+    for (const t of all) {
+      const closed = await closeWithGuard(t.path);
+      if (!closed) break;
+    }
   };
 
   const copyPath = (path: string, relative = false) => {

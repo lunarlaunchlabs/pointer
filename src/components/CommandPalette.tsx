@@ -11,14 +11,14 @@ import { Clock } from "lucide-react";
 export function CommandPalette({
   onClose,
   openFinder,
-  toggleChat,
+  toggleAssistant,
   openOnboarding,
   openAIPanel,
   openMonitor,
 }: {
   onClose: () => void;
   openFinder: () => void;
-  toggleChat: () => void;
+  toggleAssistant: () => void;
   openOnboarding: () => void;
   openAIPanel: () => void;
   openMonitor: () => void;
@@ -214,6 +214,24 @@ export function CommandPalette({
                 shortcut="⌘G"
                 onSelect={() =>
                   run("goto_line", () => dispatchAction("editor:goto_line"))
+                }
+              />
+              <Item
+                label="Go to Definition"
+                shortcut="F12"
+                onSelect={() =>
+                  run("goto_definition", () =>
+                    dispatchAction("editor:goto_definition"),
+                  )
+                }
+              />
+              <Item
+                label="Peek Definition"
+                shortcut="⌥F12"
+                onSelect={() =>
+                  run("peek_definition", () =>
+                    dispatchAction("editor:peek_definition"),
+                  )
                 }
               />
               <Item
@@ -438,6 +456,12 @@ export function CommandPalette({
                 }
               />
               <Item
+                label="Run Project Check"
+                onSelect={() =>
+                  run("check", () => dispatchAction("diagnostics:run_project_check"))
+                }
+              />
+              <Item
                 label="Toggle Minimap"
                 onSelect={() =>
                   run("minimap", () => dispatchAction("view:toggle_minimap"))
@@ -586,7 +610,7 @@ export function CommandPalette({
               <Item
                 label="Toggle Assistant"
                 shortcut="⌘L"
-                onSelect={() => run("assistant", toggleChat)}
+                onSelect={() => run("assistant", toggleAssistant)}
               />
               <Item
                 label="Assistant: Ask Mode"

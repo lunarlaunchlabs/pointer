@@ -1,11 +1,10 @@
 /**
  * Map a file path to a Monaco language id.
  *
- * The table is deliberately exhaustive. Monaco's basic-languages bundle
- * ships syntax + tokenization for *every* id we return here (we extend the
- * defaults in `setupMonaco.ts` for the ones it doesn't, like `mdx` and
- * `dockerfile`). When in doubt: a missing id falls back to plaintext, which
- * is still searchable / editable but loses colour.
+ * The table is deliberately exhaustive. IDs here are either native Monaco
+ * languages or TextMate/Shiki-backed languages registered in `setupMonaco`.
+ * When in doubt: a missing id falls back to plaintext, which is still
+ * searchable / editable but loses colour.
  *
  * We also key on basenames (Dockerfile, Makefile, etc.) because real-world
  * repos rely on case-sensitive basename detection just as much as extensions.
@@ -15,19 +14,33 @@ const BASENAME: Record<string, string> = {
   dockerfile: "dockerfile",
   containerfile: "dockerfile",
   makefile: "makefile",
+  "gnumakefile": "makefile",
   rakefile: "ruby",
   gemfile: "ruby",
   podfile: "ruby",
   "package.json": "json",
+  "package-lock.json": "json",
   "tsconfig.json": "json",
   "jsconfig.json": "json",
+  "deno.json": "json",
+  "deno.jsonc": "json",
   "cargo.toml": "toml",
+  "cargo.lock": "toml",
   "pyproject.toml": "toml",
   "go.mod": "go",
   "go.sum": "go",
+  "go.work": "go",
   ".gitignore": "plaintext",
   ".gitattributes": "plaintext",
+  ".editorconfig": "ini",
+  ".npmrc": "ini",
+  ".yarnrc": "ini",
   ".env": "shell",
+  ".eslintrc": "json",
+  ".prettierrc": "json",
+  ".babelrc": "json",
+  ".stylelintrc": "json",
+  ".swcrc": "json",
   ".dockerignore": "plaintext",
   "license": "plaintext",
 };
@@ -35,22 +48,32 @@ const BASENAME: Record<string, string> = {
 const EXT: Record<string, string> = {
   // JS/TS family
   ts: "typescript",
-  tsx: "typescript",
+  tsx: "tsx",
   cts: "typescript",
   mts: "typescript",
   js: "javascript",
-  jsx: "javascript",
+  jsx: "jsx",
   mjs: "javascript",
   cjs: "javascript",
   // Other web languages
-  vue: "html",
-  svelte: "html",
-  astro: "html",
+  vue: "vue",
+  svelte: "svelte",
+  astro: "astro",
   // Markup
   html: "html",
   htm: "html",
   xml: "xml",
   svg: "xml",
+  plist: "xml",
+  pug: "pug",
+  jade: "pug",
+  hbs: "handlebars",
+  handlebars: "handlebars",
+  ejs: "ejs",
+  tmpl: "ejs",
+  liquid: "liquid",
+  twig: "twig",
+  cshtml: "razor",
   // Style
   css: "css",
   scss: "scss",
@@ -58,7 +81,7 @@ const EXT: Record<string, string> = {
   less: "less",
   // Data
   json: "json",
-  jsonc: "jsonc",
+  jsonc: "json",
   json5: "json",
   yaml: "yaml",
   yml: "yaml",
@@ -85,15 +108,23 @@ const EXT: Record<string, string> = {
   py: "python",
   pyi: "python",
   rb: "ruby",
+  erb: "erb",
   php: "php",
   lua: "lua",
   pl: "perl",
+  dart: "dart",
+  ex: "elixir",
+  exs: "elixir",
+  jl: "julia",
+  r: "r",
+  rmd: "r",
   // JVM
   java: "java",
   kt: "kotlin",
   kts: "kotlin",
   scala: "scala",
   groovy: "groovy",
+  gradle: "groovy",
   clj: "clojure",
   cljs: "clojure",
   cljc: "clojure",
@@ -101,6 +132,7 @@ const EXT: Record<string, string> = {
   cs: "csharp",
   fs: "fsharp",
   fsx: "fsharp",
+  fsi: "fsharp",
   vb: "vb",
   // Apple
   swift: "swift",
@@ -117,12 +149,22 @@ const EXT: Record<string, string> = {
   // SQL / DB
   sql: "sql",
   // Misc
+  bicep: "bicep",
   dockerfile: "dockerfile",
   graphql: "graphql",
   gql: "graphql",
   proto: "proto",
-  prisma: "plaintext",
+  prisma: "prisma",
+  sol: "solidity",
+  wgsl: "wgsl",
+  qs: "qsharp",
+  tsp: "typespec",
+  sv: "system-verilog",
+  svh: "system-verilog",
+  v: "verilog",
+  vh: "verilog",
   tf: "hcl",
+  tfvars: "hcl",
   hcl: "hcl",
   // Notebooks (loaded raw, but at least JSON gets the right tokens)
   ipynb: "json",
@@ -140,6 +182,9 @@ function basename(path: string): string {
 export function languageFromPath(path: string): string {
   if (!path) return "plaintext";
   const name = basename(path);
+  if (/^(dockerfile|containerfile)(\..+)?$/.test(name)) return "dockerfile";
+  if (/^makefile(\..+)?$/.test(name)) return "makefile";
+  if (/^\.env(\..+)?$/.test(name)) return "shell";
   if (BASENAME[name]) return BASENAME[name];
   // Dotfiles like ".eslintrc" -> treat as JSON if the contents start with
   // `{`, but we can't peek here. Fall back to plaintext rather than risk

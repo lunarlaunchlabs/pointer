@@ -1,6 +1,12 @@
 // Chat-surface quality evaluator.
 //
-// Replicates Pointer's chat path:
+// Replicates both Pointer chat paths:
+//   A. Legacy patch-producing chat, where responses must contain
+//      SEARCH/REPLACE or <file> blocks.
+//   B. Unified Assistant Ask mode, where responses must be prose
+//      answers only: no edits, no tool tags, no shell commands.
+//
+// Patch path:
 //   1. Send our actual `chatSystemPrompt(context)` as the system msg.
 //   2. Send a user task referencing a fixture file's path/contents.
 //   3. Receive a streamed response.
@@ -84,6 +90,45 @@ HARD RULES
 ${context ? "User-provided context follows.\n\n" + context : ""}`;
 }
 
+function askSystem(brief) {
+  return `You are Pointer, an AI pair programmer running entirely on the user's machine via local open-source models. Be concise.
+
+You are in ASK mode — answer questions and explain code. Do NOT
+emit edit blocks, tool tags, shell commands, or triple-backtick code
+fences. If the user asks you to change code, do not provide a patch or
+replacement implementation in Ask mode; briefly tell them to switch to
+Plan mode for an implementation plan or Agent mode to apply the edit.
+
+ASK MODE OUTPUT CONTRACT:
+- Prose only. The literal string \`\`\` is forbidden.
+- Inline code spans like \`profile.name\` are OK; multi-line code examples are not.
+- If the context includes a <file> block for a named file, answer from that
+  file. Do not claim you lack access to it.
+- For "tell me about <file>" style questions, answer with the file's purpose,
+  important imports/exports, state or data flow, and any notable risks or
+  neighboring files worth checking. Prefer a tight, skimmable explanation.
+- When explaining core framework/runtime files, name concrete configuration
+  defaults, compatibility hooks, and routing/middleware paths visible in the
+  file instead of smoothing them into generic summaries.
+- Name important top-level functions and methods by their literal identifiers
+  (for example \`app.handle\`, \`app.use\`, \`defaultConfiguration\`) when they
+  are central to the file.
+- Do not compress literal setting names into "configuration"; if keys such as
+  \`trust proxy\`, \`etag\`, or \`query parser\` appear in the file, name them.
+- For direct edit requests ("change this file", "fix this", "add X"),
+  your ENTIRE response must be exactly:
+  "Switch to Agent mode and I can apply that edit, or Plan mode if you want to review the plan first."
+  Do not show the changed code. Do not explain the change.
+
+${
+  brief && brief.trim().length
+    ? "Workspace brief — a compact snapshot of the project the user has open. Use it for orientation; if you need more, ask.\n\n" +
+      brief +
+      "\n"
+    : ""
+}`;
+}
+
 // Helper — render a file as the editor would inject it into chat
 // context: a labelled markdown fence.
 function fenced(filePath, contents, lang = "javascript") {
@@ -150,6 +195,49 @@ const scenarios = [
     ],
   },
   {
+    id: "edit-existing-preserve-edge-order",
+    description:
+      "Add validation to an existing function without making it unreachable behind an earlier return.",
+    fixturePath: "src/pageSize.js",
+    fixture: `export function pageSize(input) {
+  if (input == null || input === "") return 25;
+  const n = Number(input);
+  if (!Number.isFinite(n)) return 25;
+  return Math.min(100, Math.max(1, Math.floor(n)));
+}
+`,
+    userTask:
+      "Update pageSize.js so negative numbers and zero throw RangeError('pageSize must be positive') instead of being clamped to 1. Keep null, empty string, and non-numeric inputs defaulting to 25.",
+    fnName: "pageSize",
+    cases: [
+      { args: [null], expected: 25 },
+      { args: [""], expected: 25 },
+      { args: ["abc"], expected: 25 },
+      { args: [101], expected: 100 },
+      { args: [10.9], expected: 10 },
+      { args: [0], expectedThrows: /pageSize must be positive/ },
+      { args: [-2], expectedThrows: /pageSize must be positive/ },
+    ],
+  },
+  {
+    id: "edit-existing-normalize-collection",
+    description:
+      "Implement a realistic data-cleanup change while preserving order and filtering invalid entries.",
+    fixturePath: "src/tags.js",
+    fixture: `export function normalizeTags(tags) {
+  return tags.map((tag) => tag.toLowerCase());
+}
+`,
+    userTask:
+      "Make normalizeTags trim whitespace, lowercase each tag, remove empty tags, and de-duplicate while preserving first-seen order.",
+    fnName: "normalizeTags",
+    cases: [
+      { args: [[" Foo ", "foo", "", "BAR", " bar "]], expected: ["foo", "bar"] },
+      { args: [["One", "Two", "one"]], expected: ["one", "two"] },
+      { args: [[]], expected: [] },
+    ],
+  },
+  {
     id: "create-new-file",
     description:
       "Generate a brand-new utility file. Must use either an empty-SEARCH block or a <file> block — both are accepted by Pointer's parser.",
@@ -164,6 +252,88 @@ const scenarios = [
       { args: [[1, 1, 2, 3, 2]], expected: [1, 2, 3] },
       { args: [["a", "b", "a"]], expected: ["a", "b"] },
     ],
+  },
+];
+
+const askScenarios = [
+  {
+    id: "ask-implicit-file-context-app-jsx",
+    context:
+      workspaceSummary({ moduleSystem: "ESM" }) +
+      "\n\nImplicitly attached file:\n" +
+      `<file path="src/App.jsx">
+\`\`\`jsx
+import { useState } from "react";
+import Header from "./components/Header.jsx";
+import Counter from "./components/Counter.jsx";
+
+export default function App() {
+  const [count, setCount] = useState(0);
+  return (
+    <main>
+      <Header title="Pointer Demo" />
+      <Counter value={count} onIncrement={() => setCount((n) => n + 1)} />
+    </main>
+  );
+}
+\`\`\`
+</file>`,
+    userTask: "Tell me about App.jsx",
+    expect: [/App\.jsx|App/i, /Header/i, /Counter/i, /useState|state|count/i],
+    reject: [/do(?:n't| not) have access/i, /share (?:the )?contents/i],
+  },
+  {
+    id: "ask-explain-cache-bug",
+    context:
+      workspaceSummary({ moduleSystem: "ESM" }) +
+      "\n\nCurrently open file:\n" +
+      fenced(
+        "src/cache.js",
+        `const cache = new Map();
+
+export async function getUser(id, loadUser) {
+  if (!cache.has(id)) {
+    cache.set(id, loadUser(id));
+  }
+  return cache.get(id);
+}
+`,
+      ),
+    userTask:
+      "Explain why concurrent calls to getUser with the same id only invoke loadUser once. Don't change the code.",
+    expect: [/cache/i, /same\s+`?id`?/i, /promise|loadUser\(id\)/i, /once|single/i],
+  },
+  {
+    id: "ask-diagnose-stacktrace",
+    context:
+      workspaceSummary({ moduleSystem: "ESM" }) +
+      "\n\nCurrently open file:\n" +
+      fenced(
+        "src/profile.js",
+        `export function displayName(user) {
+  return user.profile.name.trim();
+}
+`,
+      ),
+    userTask:
+      "I get TypeError: Cannot read properties of undefined (reading 'name') from displayName. What is likely wrong and what should I check first? Don't edit anything.",
+    expect: [/profile/i, /undefined|missing/i, /check|valid|guard|optional|validate/i],
+  },
+  {
+    id: "ask-does-not-edit-on-change-request",
+    context:
+      workspaceSummary({ moduleSystem: "ESM" }) +
+      "\n\nCurrently open file:\n" +
+      fenced(
+        "src/double.js",
+        `export function double(x) {
+  return x + x;
+}
+`,
+      ),
+    userTask:
+      "Change double.js to return x * 2 instead.",
+    expect: [/Plan|Agent|switch/i, /change|edit/i],
   },
 ];
 
@@ -353,7 +523,58 @@ export async function runChat() {
       }
     }
   }
+  for (const s of askScenarios) {
+    const t0 = Date.now();
+    let response = "";
+    try {
+      response = await chat({
+        system: askSystem(workspaceSummary({ moduleSystem: "ESM" })),
+        messages: [{ role: "user", content: `${s.context}\n\n${s.userTask}` }],
+        options: { temperature: 0.2, num_predict: 800 },
+      });
+    } catch (e) {
+      results.push({ id: s.id, pass: false, why: `chat: ${e.message}` });
+      console.log(`  ${emoji(false)}  ${s.id} — chat failed: ${e.message}`);
+      continue;
+    }
+    const ms = Date.now() - t0;
+    const v = assessAsk(s, response);
+    results.push({ id: s.id, ms, ...v, responseHead: response.slice(0, 240) });
+    const marker = emoji(v.pass);
+    console.log(`  ${marker}  ${s.id}  (${ms}ms)`);
+    if (!v.pass) {
+      console.log(`         why: ${v.why}`);
+      console.log(`         response head: ${JSON.stringify(response.slice(0, 360))}`);
+    }
+  }
   return results;
+}
+
+function assessAsk(s, response) {
+  const forbidden = [
+    "<<<<<<< SEARCH",
+    ">>>>>>> REPLACE",
+    "<read_file",
+    "<apply_diff",
+    "<write_file",
+    "<run_shell",
+    "```",
+  ];
+  const hit = forbidden.find((needle) => response.includes(needle));
+  if (hit) {
+    return { pass: false, why: `Ask mode emitted forbidden edit/tool syntax: ${hit}` };
+  }
+  for (const needle of s.expect) {
+    if (!needle.test(response)) {
+      return { pass: false, why: `answer missing ${needle}` };
+    }
+  }
+  for (const needle of s.reject ?? []) {
+    if (needle.test(response)) {
+      return { pass: false, why: `answer contained rejected phrase ${needle}` };
+    }
+  }
+  return { pass: true };
 }
 
 if (import.meta.url === `file://${process.argv[1]}`) {

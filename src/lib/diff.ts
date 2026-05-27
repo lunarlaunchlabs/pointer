@@ -6,7 +6,7 @@ export type SearchReplaceHunk = {
 };
 
 const HUNK_RE =
-  /(?:```[\w-]*\n)?(?:<<<<<<<\s*SEARCH(?:\s+([^\n]+))?\n)([\s\S]*?)\n?=======\n([\s\S]*?)\n>>>>>>>\s*REPLACE(?:\n```)?/g;
+  /(?:```[\w-]*\n)?(?:<<<<<<<[ \t]*SEARCH(?:[ \t]+([^\n]+))?[ \t]*\n)([\s\S]*?)\n?=======\n([\s\S]*?)\n>>>>>>>\s*REPLACE(?:\n```)?/g;
 
 const NEW_FILE_RE =
   /<file\s+(?:action="?(?:create|new|overwrite)"?\s+)?path="([^"]+)"\s*>\n?([\s\S]*?)\n?<\/file>/gi;
@@ -40,7 +40,18 @@ export function parseSearchReplace(text: string): SearchReplaceHunk[] {
   let m: RegExpExecArray | null;
   HUNK_RE.lastIndex = 0;
   while ((m = HUNK_RE.exec(text)) !== null) {
-    hunks.push({ path: m[1]?.trim(), search: m[2] ?? "", replace: m[3] ?? "" });
+    const rawPath = m[1]?.trim();
+    let search = m[2] ?? "";
+    let path = rawPath;
+    if (!path) {
+      const nl = search.indexOf("\n");
+      const first = nl === -1 ? search.trim() : search.slice(0, nl).trim();
+      if (nl !== -1 && looksLikePath(first)) {
+        path = first;
+        search = search.slice(nl + 1);
+      }
+    }
+    hunks.push({ path, search, replace: m[3] ?? "" });
   }
   NEW_FILE_RE.lastIndex = 0;
   while ((m = NEW_FILE_RE.exec(text)) !== null) {

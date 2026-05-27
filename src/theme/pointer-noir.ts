@@ -1,4 +1,5 @@
 import type { editor } from "monaco-editor";
+import type { ThemeRegistration } from "shiki";
 
 export const POINTER_NOIR_ID = "pointer-noir";
 
@@ -76,3 +77,158 @@ export const pointerNoirTheme: editor.IStandaloneThemeData = {
     "minimap.background": "#0A0A0C",
   },
 };
+
+export const pointerNoirShikiTheme = {
+  name: POINTER_NOIR_ID,
+  displayName: "Pointer Noir",
+  type: "dark",
+  fg: "#E8E8F2",
+  bg: "#0A0A0C",
+  colors: pointerNoirTheme.colors,
+  settings: [
+    {
+      settings: {
+        foreground: "#E8E8F2",
+        background: "#0A0A0C",
+      },
+    },
+    {
+      scope: [
+        "comment",
+        "punctuation.definition.comment",
+        "string.comment",
+      ],
+      settings: { foreground: "#6B6B7B", fontStyle: "italic" },
+    },
+    {
+      scope: [
+        "keyword",
+        "keyword.control",
+        "keyword.operator.expression",
+        "storage",
+        "storage.type",
+        "storage.modifier",
+      ],
+      settings: { foreground: "#FF7AB2", fontStyle: "italic" },
+    },
+    {
+      scope: [
+        "keyword.operator",
+        "punctuation",
+        "punctuation.separator",
+        "punctuation.terminator",
+        "meta.brace",
+      ],
+      settings: { foreground: "#8C8CA0" },
+    },
+    {
+      scope: [
+        "string",
+        "string.quoted",
+        "string.template",
+        "constant.other.symbol",
+        "markup.inline.raw",
+      ],
+      settings: { foreground: "#FFD480" },
+    },
+    {
+      scope: [
+        "constant.numeric",
+        "constant.language",
+        "constant.character",
+        "support.constant",
+        "variable.other.enummember",
+      ],
+      settings: { foreground: "#FFB3CE" },
+    },
+    {
+      scope: [
+        "entity.name.function",
+        "meta.function-call",
+        "support.function",
+        "variable.function",
+      ],
+      settings: { foreground: "#7CF0BD" },
+    },
+    {
+      scope: [
+        "entity.name.type",
+        "entity.name.class",
+        "entity.name.struct",
+        "entity.name.enum",
+        "entity.name.interface",
+        "support.type",
+        "support.class",
+      ],
+      settings: { foreground: "#8AD9FF" },
+    },
+    {
+      scope: [
+        "variable.parameter",
+        "variable.other.readwrite.alias",
+        "meta.object-literal.key",
+      ],
+      settings: { foreground: "#D6BCFF" },
+    },
+    {
+      scope: [
+        "variable",
+        "variable.other",
+        "entity.name.variable",
+        "support.variable",
+        "support.variable.property",
+        "variable.other.property",
+        "meta.property-name",
+      ],
+      settings: { foreground: "#E8E8F2" },
+    },
+    {
+      scope: [
+        "entity.name.tag",
+        "punctuation.definition.tag",
+        "meta.tag",
+      ],
+      settings: { foreground: "#FF7AB2" },
+    },
+    {
+      scope: [
+        "entity.other.attribute-name",
+        "entity.other.attribute-name.class",
+        "entity.other.attribute-name.id",
+      ],
+      settings: { foreground: "#D6BCFF" },
+    },
+    {
+      scope: [
+        "markup.heading",
+        "markup.heading entity.name",
+        "entity.name.section",
+      ],
+      settings: { foreground: "#8AD9FF", fontStyle: "bold" },
+    },
+    {
+      scope: ["markup.bold"],
+      settings: { fontStyle: "bold" },
+    },
+    {
+      scope: ["markup.italic"],
+      settings: { fontStyle: "italic" },
+    },
+    {
+      scope: ["markup.inserted"],
+      settings: { foreground: "#7CF0BD" },
+    },
+    {
+      scope: ["markup.deleted"],
+      settings: { foreground: "#FF6F91" },
+    },
+    {
+      scope: [
+        "invalid",
+        "invalid.illegal",
+        "diagnostic.error",
+      ],
+      settings: { foreground: "#FF6F91" },
+    },
+  ],
+} satisfies ThemeRegistration;

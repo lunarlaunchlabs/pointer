@@ -33,6 +33,8 @@
 //! The ledger is **per-session** and is persisted alongside the
 //! transcript. It is **not** shared across sessions.
 
+#![allow(clippy::too_many_arguments)]
+
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 
@@ -239,7 +241,12 @@ pub fn render_previous_work(ledger: &ActionLedger) -> Option<String> {
                 LedgerKind::Renamed { from, to } => {
                     lines.push(format!("- T{turn} renamed {from} -> {to}"));
                 }
-                LedgerKind::SymbolRenamed { old, new, files, references_replaced } => {
+                LedgerKind::SymbolRenamed {
+                    old,
+                    new,
+                    files,
+                    references_replaced,
+                } => {
                     let preview = if files.len() <= 4 {
                         files.join(", ")
                     } else {
@@ -253,7 +260,10 @@ pub fn render_previous_work(ledger: &ActionLedger) -> Option<String> {
                         "- T{turn} renamed symbol {old} -> {new} ({references_replaced} refs in: {preview})"
                     ));
                 }
-                LedgerKind::RanShell { command_summary, exit_code } => {
+                LedgerKind::RanShell {
+                    command_summary,
+                    exit_code,
+                } => {
                     lines.push(format!(
                         "- T{turn} ran shell: {command_summary} -> exit {exit_code}"
                     ));
@@ -289,7 +299,12 @@ pub fn render_previous_work(ledger: &ActionLedger) -> Option<String> {
             } else {
                 format!(
                     "{}, +{} more",
-                    read_paths.iter().take(4).cloned().collect::<Vec<_>>().join(", "),
+                    read_paths
+                        .iter()
+                        .take(4)
+                        .cloned()
+                        .collect::<Vec<_>>()
+                        .join(", "),
                     read_paths.len() - 4
                 )
             };
@@ -297,11 +312,20 @@ pub fn render_previous_work(ledger: &ActionLedger) -> Option<String> {
         }
         if !search_qs.is_empty() {
             let preview = if search_qs.len() <= 3 {
-                search_qs.iter().map(|q| format!("`{q}`")).collect::<Vec<_>>().join(", ")
+                search_qs
+                    .iter()
+                    .map(|q| format!("`{q}`"))
+                    .collect::<Vec<_>>()
+                    .join(", ")
             } else {
                 format!(
                     "{}, +{} more",
-                    search_qs.iter().take(3).map(|q| format!("`{q}`")).collect::<Vec<_>>().join(", "),
+                    search_qs
+                        .iter()
+                        .take(3)
+                        .map(|q| format!("`{q}`"))
+                        .collect::<Vec<_>>()
+                        .join(", "),
                     search_qs.len() - 3
                 )
             };
@@ -313,7 +337,11 @@ pub fn render_previous_work(ledger: &ActionLedger) -> Option<String> {
         }
     }
 
-    let mode_attr = if modes_attr.is_empty() { "agent".to_string() } else { modes_attr };
+    let mode_attr = if modes_attr.is_empty() {
+        "agent".to_string()
+    } else {
+        modes_attr
+    };
     let header = format!(
         "<previous_work mode=\"{}\" turns=\"{}\">\n{}</previous_work>",
         mode_attr,
@@ -333,10 +361,7 @@ The current request is in <current_request>...</current_request> below.\n\
 fn truncate_one_line(s: &str, max_chars: usize) -> String {
     // Compress whitespace to a single space so multi-line
     // assistant turns flatten to a clean preview.
-    let collapsed: String = s
-        .split_whitespace()
-        .collect::<Vec<_>>()
-        .join(" ");
+    let collapsed: String = s.split_whitespace().collect::<Vec<_>>().join(" ");
     if collapsed.chars().count() <= max_chars {
         collapsed
     } else {
@@ -375,7 +400,11 @@ pub fn entry_for_tool(
                 .and_then(|b| b.as_u64())
                 .map(|n| n as usize)
                 .unwrap_or(body.len());
-            LedgerKind::Wrote { path, bytes, hunks: 1 }
+            LedgerKind::Wrote {
+                path,
+                bytes,
+                hunks: 1,
+            }
         }
         "apply_diff" | "edit_file" => {
             let path = attrs.get("path").cloned()?;
@@ -393,7 +422,11 @@ pub fn entry_for_tool(
                 .and_then(|b| b.as_u64())
                 .map(|n| n as usize)
                 .unwrap_or(body.len());
-            LedgerKind::Wrote { path, bytes, hunks: applied }
+            LedgerKind::Wrote {
+                path,
+                bytes,
+                hunks: applied,
+            }
         }
         "delete_path" => {
             let path = attrs
@@ -424,7 +457,12 @@ pub fn entry_for_tool(
                 .and_then(|n| n.as_u64())
                 .map(|n| n as usize)
                 .unwrap_or(0);
-            LedgerKind::SymbolRenamed { old, new, files, references_replaced }
+            LedgerKind::SymbolRenamed {
+                old,
+                new,
+                files,
+                references_replaced,
+            }
         }
         "run_shell" => {
             let command_summary = body
@@ -442,14 +480,20 @@ pub fn entry_for_tool(
                 .and_then(|c| c.as_i64())
                 .map(|n| n as i32)
                 .unwrap_or(0);
-            LedgerKind::RanShell { command_summary, exit_code }
+            LedgerKind::RanShell {
+                command_summary,
+                exit_code,
+            }
         }
         "read_file" => {
             let path = attrs.get("path").cloned()?;
             LedgerKind::Read { paths: vec![path] }
         }
         "list_dir" => {
-            let path = attrs.get("path").cloned().unwrap_or_else(|| ".".to_string());
+            let path = attrs
+                .get("path")
+                .cloned()
+                .unwrap_or_else(|| ".".to_string());
             LedgerKind::Searched {
                 queries: vec![format!("list_dir:{path}")],
             }
@@ -522,7 +566,10 @@ mod tests {
     use serde_json::json;
 
     fn attrs(pairs: &[(&str, &str)]) -> HashMap<String, String> {
-        pairs.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect()
+        pairs
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect()
     }
 
     // ── entry_for_tool: per-kind happy paths ────────────────────────
@@ -531,7 +578,9 @@ mod tests {
     fn ledger_records_writes_renames_shell_answer() {
         // write_file
         let e = entry_for_tool(
-            1, 100, "agent",
+            1,
+            100,
+            "agent",
             "write_file",
             &attrs(&[("path", "src/foo.ts")]),
             "export const x = 1;",
@@ -540,11 +589,15 @@ mod tests {
             Some(&json!({"bytes": 19})),
         )
         .unwrap();
-        assert!(matches!(e.kind, LedgerKind::Wrote { ref path, bytes: 19, hunks: 1 } if path == "src/foo.ts"));
+        assert!(
+            matches!(e.kind, LedgerKind::Wrote { ref path, bytes: 19, hunks: 1 } if path == "src/foo.ts")
+        );
 
         // apply_diff
         let e = entry_for_tool(
-            2, 200, "agent",
+            2,
+            200,
+            "agent",
             "apply_diff",
             &attrs(&[("path", "src/foo.ts")]),
             "<<<<<<< SEARCH\nfoo\n=======\nbar\n>>>>>>> REPLACE\n",
@@ -553,11 +606,15 @@ mod tests {
             Some(&json!({"applied": 1, "total": 1})),
         )
         .unwrap();
-        assert!(matches!(e.kind, LedgerKind::Wrote { ref path, hunks: 1, .. } if path == "src/foo.ts"));
+        assert!(
+            matches!(e.kind, LedgerKind::Wrote { ref path, hunks: 1, .. } if path == "src/foo.ts")
+        );
 
         // edit_file (multiple hunks)
         let e = entry_for_tool(
-            3, 300, "agent",
+            3,
+            300,
+            "agent",
             "edit_file",
             &attrs(&[("path", "src/bar.ts")]),
             "...",
@@ -570,7 +627,9 @@ mod tests {
 
         // rename_path
         let e = entry_for_tool(
-            4, 400, "agent",
+            4,
+            400,
+            "agent",
             "rename_path",
             &attrs(&[("from", "a.ts"), ("to", "b.ts")]),
             "",
@@ -589,7 +648,9 @@ mod tests {
 
         // rename_symbol
         let e = entry_for_tool(
-            5, 500, "agent",
+            5,
+            500,
+            "agent",
             "rename_symbol",
             &attrs(&[("old", "Foo"), ("new", "Bar")]),
             "",
@@ -599,7 +660,12 @@ mod tests {
         )
         .unwrap();
         match e.kind {
-            LedgerKind::SymbolRenamed { old, new, files, references_replaced } => {
+            LedgerKind::SymbolRenamed {
+                old,
+                new,
+                files,
+                references_replaced,
+            } => {
                 assert_eq!(old, "Foo");
                 assert_eq!(new, "Bar");
                 assert_eq!(files, vec!["a.ts", "b.ts"]);
@@ -610,7 +676,9 @@ mod tests {
 
         // run_shell — exit code from extra
         let e = entry_for_tool(
-            6, 600, "agent",
+            6,
+            600,
+            "agent",
             "run_shell",
             &HashMap::new(),
             "cargo check\n",
@@ -620,7 +688,10 @@ mod tests {
         )
         .unwrap();
         match e.kind {
-            LedgerKind::RanShell { command_summary, exit_code } => {
+            LedgerKind::RanShell {
+                command_summary,
+                exit_code,
+            } => {
                 assert!(command_summary.contains("cargo check"));
                 assert_eq!(exit_code, 0);
             }
@@ -629,7 +700,9 @@ mod tests {
 
         // delete_path
         let e = entry_for_tool(
-            7, 700, "agent",
+            7,
+            700,
+            "agent",
             "delete_path",
             &attrs(&[("path", "old.ts")]),
             "",
@@ -642,7 +715,9 @@ mod tests {
 
         // read_file
         let e = entry_for_tool(
-            8, 800, "agent",
+            8,
+            800,
+            "agent",
             "read_file",
             &attrs(&[("path", "src/foo.ts")]),
             "",
@@ -658,7 +733,9 @@ mod tests {
 
         // grep
         let e = entry_for_tool(
-            9, 900, "agent",
+            9,
+            900,
+            "agent",
             "grep",
             &HashMap::new(),
             "useState",
@@ -693,7 +770,9 @@ mod tests {
         // didn't actually happen, and recording it would falsely
         // tell the next turn the file was changed.
         let none = entry_for_tool(
-            1, 0, "agent",
+            1,
+            0,
+            "agent",
             "write_file",
             &attrs(&[("path", "x.ts")]),
             "content",
@@ -704,7 +783,9 @@ mod tests {
         assert!(none.is_none());
 
         let none = entry_for_tool(
-            1, 0, "agent",
+            1,
+            0,
+            "agent",
             "apply_diff",
             &attrs(&[("path", "x.ts")]),
             "hunks",
@@ -720,24 +801,34 @@ mod tests {
     #[test]
     fn render_emits_facts_with_anti_redo_note() {
         let mut led = ActionLedger::new();
-        led.push(entry_for_tool(
-            1, 100, "agent",
-            "write_file",
-            &attrs(&[("path", "src/foo.ts")]),
-            "hi",
-            "ok",
-            "ok",
-            Some(&json!({"bytes": 2})),
-        ).unwrap());
-        led.push(entry_for_tool(
-            1, 110, "agent",
-            "run_shell",
-            &HashMap::new(),
-            "cargo check\n",
-            "ok",
-            "ok",
-            Some(&json!({"exit_code": 0})),
-        ).unwrap());
+        led.push(
+            entry_for_tool(
+                1,
+                100,
+                "agent",
+                "write_file",
+                &attrs(&[("path", "src/foo.ts")]),
+                "hi",
+                "ok",
+                "ok",
+                Some(&json!({"bytes": 2})),
+            )
+            .unwrap(),
+        );
+        led.push(
+            entry_for_tool(
+                1,
+                110,
+                "agent",
+                "run_shell",
+                &HashMap::new(),
+                "cargo check\n",
+                "ok",
+                "ok",
+                Some(&json!({"exit_code": 0})),
+            )
+            .unwrap(),
+        );
         let block = render_previous_work(&led).unwrap();
         // Header carries the mode + total turns.
         assert!(block.contains("<previous_work mode=\"agent\" turns=\"1\">"));
@@ -757,14 +848,22 @@ mod tests {
         let mut led = ActionLedger::new();
         for path in ["a.ts", "b.ts", "c.ts", "d.ts", "e.ts"] {
             led.push(LedgerEntry {
-                turn: 1, timestamp_ms: 0, mode: "agent".to_string(),
-                kind: LedgerKind::Read { paths: vec![path.to_string()] },
+                turn: 1,
+                timestamp_ms: 0,
+                mode: "agent".to_string(),
+                kind: LedgerKind::Read {
+                    paths: vec![path.to_string()],
+                },
             });
         }
         for q in ["alpha", "beta", "gamma", "delta"] {
             led.push(LedgerEntry {
-                turn: 1, timestamp_ms: 0, mode: "agent".to_string(),
-                kind: LedgerKind::Searched { queries: vec![format!("grep:{q}")] },
+                turn: 1,
+                timestamp_ms: 0,
+                mode: "agent".to_string(),
+                kind: LedgerKind::Searched {
+                    queries: vec![format!("grep:{q}")],
+                },
             });
         }
         let block = render_previous_work(&led).unwrap();
@@ -788,16 +887,33 @@ mod tests {
     fn written_paths_dedups_across_kinds() {
         let mut led = ActionLedger::new();
         led.push(LedgerEntry {
-            turn: 1, timestamp_ms: 0, mode: "agent".into(),
-            kind: LedgerKind::Wrote { path: "a.ts".into(), bytes: 10, hunks: 1 },
+            turn: 1,
+            timestamp_ms: 0,
+            mode: "agent".into(),
+            kind: LedgerKind::Wrote {
+                path: "a.ts".into(),
+                bytes: 10,
+                hunks: 1,
+            },
         });
         led.push(LedgerEntry {
-            turn: 2, timestamp_ms: 0, mode: "agent".into(),
-            kind: LedgerKind::Wrote { path: "a.ts".into(), bytes: 20, hunks: 2 },
+            turn: 2,
+            timestamp_ms: 0,
+            mode: "agent".into(),
+            kind: LedgerKind::Wrote {
+                path: "a.ts".into(),
+                bytes: 20,
+                hunks: 2,
+            },
         });
         led.push(LedgerEntry {
-            turn: 3, timestamp_ms: 0, mode: "agent".into(),
-            kind: LedgerKind::Renamed { from: "a.ts".into(), to: "b.ts".into() },
+            turn: 3,
+            timestamp_ms: 0,
+            mode: "agent".into(),
+            kind: LedgerKind::Renamed {
+                from: "a.ts".into(),
+                to: "b.ts".into(),
+            },
         });
         let written = led.written_paths();
         assert!(written.contains("a.ts"));

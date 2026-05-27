@@ -37,6 +37,8 @@
 //! integration, find_similar_paths suggestions, fuzzy
 //! SEARCH/REPLACE matching, etc.).
 
+#![allow(clippy::doc_lazy_continuation, clippy::doc_overindented_list_items)]
+
 use std::collections::HashMap;
 use std::path::Path;
 
@@ -237,8 +239,16 @@ struct LintSnapshot {
 }
 
 async fn run_lint_signatures(workspace: &str, cmd: &str) -> LintSnapshot {
-    let (sh, flag) = if cfg!(windows) { ("cmd", "/C") } else { ("/bin/sh", "-c") };
-    let ws = if workspace.is_empty() { ".".to_string() } else { workspace.to_string() };
+    let (sh, flag) = if cfg!(windows) {
+        ("cmd", "/C")
+    } else {
+        ("/bin/sh", "-c")
+    };
+    let ws = if workspace.is_empty() {
+        ".".to_string()
+    } else {
+        workspace.to_string()
+    };
     let cmd_s = cmd.to_string();
     let result = tokio::task::spawn_blocking(move || -> Result<(String, String), String> {
         let out = std::process::Command::new(sh)
@@ -291,7 +301,12 @@ pub(crate) fn parse_lint_errors(s: &str) -> Vec<String> {
             continue;
         }
         let lineno_trim = lineno.trim();
-        if !lineno_trim.chars().next().map(|c| c.is_ascii_digit()).unwrap_or(false) {
+        if !lineno_trim
+            .chars()
+            .next()
+            .map(|c| c.is_ascii_digit())
+            .unwrap_or(false)
+        {
             continue;
         }
         // We only keep things that look like errors. Warnings are
@@ -454,9 +469,8 @@ pub(crate) fn run_rename_symbol(
             .strip_prefix(workspace)
             .map(|p| p.to_string_lossy().to_string())
             .unwrap_or_else(|_| rel.to_string());
-        std::fs::write(&abs, &replaced).map_err(|e| {
-            format!("rename_symbol write {}: {}", workspace_rel, e)
-        })?;
+        std::fs::write(&abs, &replaced)
+            .map_err(|e| format!("rename_symbol write {}: {}", workspace_rel, e))?;
         let _ = crate::commands::agent_changes::record_modify(
             app,
             step,
@@ -473,7 +487,11 @@ pub(crate) fn run_rename_symbol(
     let leftover_count = if leftover_hits.message == "no matches" {
         0
     } else {
-        leftover_hits.message.lines().filter(|l| l.contains(':')).count()
+        leftover_hits
+            .message
+            .lines()
+            .filter(|l| l.contains(':'))
+            .count()
     };
 
     let mut message = format!(
@@ -495,7 +513,7 @@ pub(crate) fn run_rename_symbol(
     }
 
     Ok(ToolOutput {
-        status: if leftover_count > 0 { "ok".into() } else { "ok".into() },
+        status: "ok".into(),
         message,
         extra: Some(json!({
             "old": old_name,
@@ -534,10 +552,7 @@ pub(crate) fn is_valid_identifier(s: &str) -> bool {
 /// available (indexing might be off, the embed model might be
 /// missing). The lexical fallback below works in every workspace
 /// the agent has filesystem access to.
-pub(crate) fn run_discover(
-    workspace: &str,
-    call: &ToolCall,
-) -> Result<ToolOutput, String> {
+pub(crate) fn run_discover(workspace: &str, call: &ToolCall) -> Result<ToolOutput, String> {
     let topic = call.body.trim();
     if topic.is_empty() {
         return Err(
@@ -611,7 +626,11 @@ pub(crate) fn run_discover(
         .map(|(path, (count, snippets))| {
             let distinct = keywords
                 .iter()
-                .filter(|k| snippets.iter().any(|s| s.to_lowercase().contains(&k.to_lowercase())))
+                .filter(|k| {
+                    snippets
+                        .iter()
+                        .any(|s| s.to_lowercase().contains(&k.to_lowercase()))
+                })
                 .count();
             (path, count + distinct * 10, snippets)
         })
@@ -726,8 +745,8 @@ pub(crate) fn extract_keywords(topic: &str) -> Vec<String> {
 ///
 /// Detection (first match wins):
 ///   * `Cargo.toml`        → `cargo check --message-format=short`
-///   * `package.json`      → look for `scripts.check`, then
-///                           `scripts.typecheck`, then fall back to
+///   * `package.json`      → look for check/typecheck scripts, then
+///                           lint/build scripts, then fall back to
 ///                           `npx --yes tsc --noEmit` if a
 ///                           `tsconfig*.json` exists.
 ///   * `pyproject.toml`    → `python -m mypy .` if `mypy` is in
@@ -751,8 +770,9 @@ pub(crate) async fn run_run_check(
 
     let Some(detected) = detect_check_command(root) else {
         return Err(
-            "run_check: could not detect a check command. Looked for Cargo.toml, package.json (scripts.check / scripts.typecheck), pyproject.toml, go.mod. \
-             Either add a `check` script to your manifest, or invoke <run_shell>your-check-command</run_shell> directly.".into(),
+             "run_check: could not detect a check command. Looked for Cargo.toml, package.json (check/typecheck/lint/build scripts), pyproject.toml, go.mod. \
+             Either add a `check` script to your manifest, or invoke <run_shell>your-check-command</run_shell> directly. \
+             If the user asked for a specific build or test verification, run that exact one-shot command (for example <run_shell>npm run build</run_shell> or <run_shell>npm test</run_shell>).".into(),
         );
     };
 
@@ -817,7 +837,15 @@ pub(crate) fn detect_check_command(root: &Path) -> Option<CheckCommand> {
         if let Ok(pkg) = std::fs::read_to_string(root.join("package.json")) {
             if let Ok(v) = serde_json::from_str::<Value>(&pkg) {
                 if let Some(scripts) = v.get("scripts").and_then(|s| s.as_object()) {
-                    for name in ["check", "typecheck", "type-check", "tsc"] {
+                    for name in [
+                        "check",
+                        "typecheck",
+                        "type-check",
+                        "tsc",
+                        "lint",
+                        "lint:check",
+                        "build",
+                    ] {
                         if scripts.contains_key(name) {
                             return Some(CheckCommand {
                                 kind: "node",
@@ -890,7 +918,8 @@ mod tests {
 
     #[test]
     fn extract_keywords_drops_stopwords_and_dedupes() {
-        let kw = extract_keywords("How does the authentication middleware work with the session store?");
+        let kw =
+            extract_keywords("How does the authentication middleware work with the session store?");
         // "how", "does", "the", "with" are stop words. "work" is 4
         // chars so it stays.
         assert!(kw.iter().any(|k| k.eq_ignore_ascii_case("authentication")));
@@ -985,9 +1014,39 @@ src/api.ts:42:1: error TS2345: Argument of type 'string' is not assignable.";
     }
 
     #[test]
+    fn detect_check_command_uses_lint_when_no_check_script_exists() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("package.json"),
+            "{\"scripts\": {\"lint\": \"eslint .\", \"test\": \"mocha\"}}",
+        )
+        .unwrap();
+        let c = detect_check_command(dir.path()).expect("detected");
+        assert_eq!(c.kind, "node");
+        assert_eq!(c.command, "npm run lint");
+    }
+
+    #[test]
+    fn detect_check_command_uses_build_as_last_node_repo_rule() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("package.json"),
+            "{\"scripts\": {\"build\": \"vite build\", \"test\": \"vitest\"}}",
+        )
+        .unwrap();
+        let c = detect_check_command(dir.path()).expect("detected");
+        assert_eq!(c.kind, "node");
+        assert_eq!(c.command, "npm run build");
+    }
+
+    #[test]
     fn detect_check_command_falls_back_to_tsc_when_no_script_but_tsconfig() {
         let dir = tempfile::tempdir().unwrap();
-        std::fs::write(dir.path().join("package.json"), "{\"scripts\": {\"test\": \"vitest\"}}").unwrap();
+        std::fs::write(
+            dir.path().join("package.json"),
+            "{\"scripts\": {\"test\": \"vitest\"}}",
+        )
+        .unwrap();
         std::fs::write(dir.path().join("tsconfig.json"), "{}").unwrap();
         let c = detect_check_command(dir.path()).expect("detected");
         assert_eq!(c.kind, "ts");
@@ -1042,10 +1101,17 @@ src/api.ts:42:1: error TS2345: Argument of type 'string' is not assignable.";
         // naive textual rename, and a real failure mode for small
         // models doing this by hand.
         let dir = tempfile::tempdir().unwrap();
-        std::fs::write(dir.path().join("a.ts"), "const Foo = 1;\nconst Foobar = 2;\n// Foo here\n").unwrap();
+        std::fs::write(
+            dir.path().join("a.ts"),
+            "const Foo = 1;\nconst Foobar = 2;\n// Foo here\n",
+        )
+        .unwrap();
         let (files, refs) = rename_symbol_inplace(dir.path(), "Foo", "Bar");
         assert_eq!(files, 1);
-        assert_eq!(refs, 2, "expected 2 whole-word matches (line 1 and the comment), not Foobar");
+        assert_eq!(
+            refs, 2,
+            "expected 2 whole-word matches (line 1 and the comment), not Foobar"
+        );
         let after = std::fs::read_to_string(dir.path().join("a.ts")).unwrap();
         assert!(after.contains("const Bar = 1;"));
         assert!(after.contains("const Foobar = 2;"));
@@ -1055,16 +1121,30 @@ src/api.ts:42:1: error TS2345: Argument of type 'string' is not assignable.";
     #[test]
     fn rename_symbol_logic_handles_multiple_files() {
         let dir = tempfile::tempdir().unwrap();
-        std::fs::write(dir.path().join("a.ts"), "import { Foo } from './b';\nFoo();\n").unwrap();
-        std::fs::write(dir.path().join("b.ts"), "export function Foo() { return 1; }\n").unwrap();
+        std::fs::write(
+            dir.path().join("a.ts"),
+            "import { Foo } from './b';\nFoo();\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("b.ts"),
+            "export function Foo() { return 1; }\n",
+        )
+        .unwrap();
         std::fs::write(dir.path().join("c.md"), "Foo is a utility.\n").unwrap();
         let (files, refs) = rename_symbol_inplace(dir.path(), "Foo", "Bar");
         assert_eq!(files, 3);
         assert_eq!(refs, 4);
         for name in ["a.ts", "b.ts", "c.md"] {
             let text = std::fs::read_to_string(dir.path().join(name)).unwrap();
-            assert!(!text.contains("Foo"), "{name} still mentions Foo after rename");
-            assert!(text.contains("Bar"), "{name} should mention Bar after rename");
+            assert!(
+                !text.contains("Foo"),
+                "{name} still mentions Foo after rename"
+            );
+            assert!(
+                text.contains("Bar"),
+                "{name} should mention Bar after rename"
+            );
         }
     }
 
@@ -1100,13 +1180,17 @@ src/api.ts:42:1: error TS2345: Argument of type 'string' is not assignable.";
             body: "authentication middleware".into(),
             fingerprint: 0,
         };
-        let out = run_discover(dir.path().to_str().unwrap(), &call).expect("discover should succeed");
+        let out =
+            run_discover(dir.path().to_str().unwrap(), &call).expect("discover should succeed");
         assert_eq!(out.status, "ok");
         // Both auth files should be ranked above utils.ts.
         assert!(out.message.contains("session.ts") || out.message.contains("middleware.ts"));
         assert!(out.message.contains("authentication"));
         // utils.ts has no relevant keywords; should not appear as a top hit.
-        assert!(!out.message.contains("utils.ts (score"), "utils.ts is unrelated and should not rank");
+        assert!(
+            !out.message.contains("utils.ts (score"),
+            "utils.ts is unrelated and should not rank"
+        );
     }
 
     #[test]
@@ -1133,7 +1217,8 @@ src/api.ts:42:1: error TS2345: Argument of type 'string' is not assignable.";
             body: "  \n  ".into(),
             fingerprint: 0,
         };
-        let err = run_discover(dir.path().to_str().unwrap(), &call).expect_err("should reject empty body");
+        let err = run_discover(dir.path().to_str().unwrap(), &call)
+            .expect_err("should reject empty body");
         assert!(err.contains("empty body"));
     }
 
@@ -1149,7 +1234,8 @@ src/api.ts:42:1: error TS2345: Argument of type 'string' is not assignable.";
             body: "the and for with what".into(),
             fingerprint: 0,
         };
-        let err = run_discover(dir.path().to_str().unwrap(), &call).expect_err("should surface keyword error");
+        let err = run_discover(dir.path().to_str().unwrap(), &call)
+            .expect_err("should surface keyword error");
         assert!(err.contains("keywords"));
     }
 }

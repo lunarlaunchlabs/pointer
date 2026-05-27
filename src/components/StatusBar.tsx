@@ -10,6 +10,7 @@ import {
   GitBranch,
   MessageSquare,
   Paperclip,
+  Server,
   Sparkles,
 } from "lucide-react";
 import { useEditorStore } from "@/store/editor";
@@ -22,11 +23,16 @@ import { useSession } from "@/store/session";
 import { usePulls } from "@/store/pulls";
 import { useDiagnostics } from "@/store/diagnostics";
 import { useGit } from "@/store/git";
-import { useChat } from "@/store/chat";
-import { useAgent } from "@/store/agentSessions";
-import { ipc, listenEvent, type SystemSnapshot } from "@/lib/ipc";
+import { useAssistant } from "@/store/assistant";
+import {
+  ipc,
+  listenEvent,
+  type LanguageServerStatus,
+  type SystemSnapshot,
+} from "@/lib/ipc";
 import { dispatchAction } from "@/lib/actions";
 import { subscribeHistory, type ToastHistoryEntry } from "@/components/Toast";
+import { useWorkspace } from "@/store/workspace";
 
 /** Platform-aware modifier label so chip tooltips read naturally on both
  *  macOS and Windows / Linux. */
@@ -39,6 +45,7 @@ export function StatusBar({ onOpenMonitor }: { onOpenMonitor?: () => void } = {}
   const active = useEditorStore((s) => s.getActive());
   const selection = useEditorStore((s) => s.selection);
   const cursor = useEditorStore((s) => s.cursor);
+  const workspaceRoot = useWorkspace((s) => s.root);
   const tabSize = useSettings((s) => s.editorTabSize);
   const insertSpaces = useSettings((s) => s.editorInsertSpaces ?? true);
   const wordWrap = useSettings((s) => s.editorWordWrap);
@@ -69,16 +76,14 @@ export function StatusBar({ onOpenMonitor }: { onOpenMonitor?: () => void } = {}
   const gitBehind = useGit((s) => s.status.behind);
   const gitDirty = useGit((s) => s.status.dirty_count);
   const warningCount = useDiagnostics((s) => s.warnings);
-  // Staged-reference counters: a glanceable hint that the user has
-  // attached context to chat / agent. Clicking the chip routes to the
-  // matching dock view so the user can find / remove what they
+  // Staged-reference counter: a glanceable hint that the user has
+  // attached context to the unified Assistant. Clicking the chip
+  // routes to the Assistant so the user can find / remove what they
   // attached without hunting through the dock.
-  const chatRefCount = useChat((s) => s.pendingRefs.length);
-  const agentDraft = useAgent((s) => s.getActive());
-  const agentRefCount =
-    agentDraft && agentDraft.status === "idle"
-      ? agentDraft.references.length
-      : 0;
+  const assistantRefCount = useAssistant((s) => s.pendingRefs.length);
+  const assistantMode = useAssistant(
+    (s) => s.sessions.find((x) => x.id === s.activeSessionId)?.mode ?? "ask",
+  );
   const [indexProgress, setIndexProgress] = useState<null | {
     files: number;
     chunks: number;
@@ -88,6 +93,7 @@ export function StatusBar({ onOpenMonitor }: { onOpenMonitor?: () => void } = {}
     mem: number;
     memTotal: number;
   } | null>(null);
+  const [lspStatuses, setLspStatuses] = useState<LanguageServerStatus[]>([]);
 
   useEffect(() => {
     let off: (() => void) | undefined;
@@ -130,6 +136,26 @@ export function StatusBar({ onOpenMonitor }: { onOpenMonitor?: () => void } = {}
     };
   }, []);
 
+  useEffect(() => {
+    let alive = true;
+    const refresh = () => {
+      ipc
+        .lspStatus(workspaceRoot ?? undefined)
+        .then((statuses) => {
+          if (alive) setLspStatuses(statuses);
+        })
+        .catch(() => {
+          if (alive) setLspStatuses([]);
+        });
+    };
+    refresh();
+    const id = window.setInterval(refresh, 5000);
+    return () => {
+      alive = false;
+      window.clearInterval(id);
+    };
+  }, [workspaceRoot, active?.path, active?.language]);
+
   const stats = active
     ? (() => {
         const lines = active.content.split("\n").length;
@@ -171,6 +197,9 @@ export function StatusBar({ onOpenMonitor }: { onOpenMonitor?: () => void } = {}
   const allEffectiveEmpty = effectiveModels.length === 0;
   const pullCount = Object.keys(activePulls).length;
   const dominantPull = Object.values(activePulls).find((p) => !p.error);
+  const activeLsp = active
+    ? lspStatuses.find((s) => s.language === normaliseStatusLanguage(active.language))
+    : null;
 
   // The status bar gets dense fast. Strategy:
   //   • Left side is overflow-hidden + flex; items truncate label-side and
@@ -276,28 +305,20 @@ export function StatusBar({ onOpenMonitor }: { onOpenMonitor?: () => void } = {}
             </span>
           </button>
         )}
-        {chatRefCount > 0 && (
+        {assistantRefCount > 0 && (
           <button
             onClick={() => noteDockView("assistant")}
             className="hidden md:flex items-center gap-1 hover:text-noir-text transition-colors shrink-0 text-noir-accent"
-            title={`${chatRefCount} reference${chatRefCount === 1 ? "" : "s"} staged on chat — click to review`}
-            aria-label={`${chatRefCount} reference${chatRefCount === 1 ? "" : "s"} staged on chat panel`}
+            title={`${assistantRefCount} reference${assistantRefCount === 1 ? "" : "s"} staged on ${assistantMode} — click to review`}
+            aria-label={`${assistantRefCount} reference${assistantRefCount === 1 ? "" : "s"} staged on Assistant ${assistantMode} mode`}
           >
-            <MessageSquare size={10} aria-hidden="true" />
+            {assistantMode === "ask" ? (
+              <MessageSquare size={10} aria-hidden="true" />
+            ) : (
+              <Bot size={10} aria-hidden="true" />
+            )}
             <Paperclip size={9} aria-hidden="true" className="-ml-0.5 opacity-70" />
-            <span className="font-mono tabular-nums">{chatRefCount}</span>
-          </button>
-        )}
-        {agentRefCount > 0 && (
-          <button
-            onClick={() => noteDockView("assistant")}
-            className="hidden md:flex items-center gap-1 hover:text-noir-text transition-colors shrink-0 text-noir-accent"
-            title={`${agentRefCount} reference${agentRefCount === 1 ? "" : "s"} staged on agent draft — click to review`}
-            aria-label={`${agentRefCount} reference${agentRefCount === 1 ? "" : "s"} staged on agent draft`}
-          >
-            <Bot size={10} aria-hidden="true" />
-            <Paperclip size={9} aria-hidden="true" className="-ml-0.5 opacity-70" />
-            <span className="font-mono tabular-nums">{agentRefCount}</span>
+            <span className="font-mono tabular-nums">{assistantRefCount}</span>
           </button>
         )}
         {gitBranch && (
@@ -408,10 +429,31 @@ export function StatusBar({ onOpenMonitor }: { onOpenMonitor?: () => void } = {}
         )}
         {active && stats && (
           <>
+            {activeLsp && (
+              <button
+                onClick={() => dispatchAction("editor:change_language")}
+                className={`hidden md:inline-flex items-center gap-1 hover:text-noir-text transition-colors ${
+                  activeLsp.status === "ready" || activeLsp.status === "available"
+                    ? "text-noir-accent"
+                    : activeLsp.status === "missing"
+                    ? "text-noir-warn"
+                    : ""
+                }`}
+                title={`${activeLsp.label} · ${activeLsp.detail}${
+                  activeLsp.command ? `\n${activeLsp.command}` : ""
+                }`}
+                aria-label={`Language server: ${activeLsp.label}, ${activeLsp.status}`}
+              >
+                <Server size={10} aria-hidden="true" />
+                <span>{shortLspLabel(activeLsp)}</span>
+              </button>
+            )}
             <button
               onClick={() => dispatchAction("editor:change_language")}
               className="hidden sm:inline hover:text-noir-text transition-colors"
-              title="Click to change language mode for this file"
+              title={`Click to change language mode for this file${
+                activeLsp ? `\n${activeLsp.detail}` : ""
+              }`}
             >
               {active.language}
             </button>
@@ -429,6 +471,39 @@ function fmtMb(n: number): string {
   if (n < 1024 * 1024) return `${(n / 1024).toFixed(0)} KB`;
   if (n < 1024 * 1024 * 1024) return `${(n / 1024 / 1024).toFixed(0)} MB`;
   return `${(n / 1024 / 1024 / 1024).toFixed(1)} GB`;
+}
+
+function normaliseStatusLanguage(language: string): string {
+  switch (language) {
+    case "typescriptreact":
+    case "tsx":
+    case "typescript":
+      return "typescript";
+    case "javascriptreact":
+    case "jsx":
+    case "javascript":
+      return "javascript";
+    case "scss":
+    case "less":
+      return "css";
+    case "mdx":
+      return "markdown";
+    case "solidity":
+      return "solidity";
+    case "system-verilog":
+      return "systemverilog";
+    default:
+      return language;
+  }
+}
+
+function shortLspLabel(status: LanguageServerStatus): string {
+  if (status.status === "monaco") return "Monaco";
+  if (status.status === "syntax") return "Syntax";
+  if (status.status === "missing") return "No LSP";
+  return status.label
+    .replace("-language-server", "")
+    .replace("rust-analyzer", "Rust LSP");
 }
 
 /** Inspect the buffer to figure out which line-ending sequence

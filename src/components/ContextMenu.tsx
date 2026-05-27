@@ -17,6 +17,11 @@ export function ContextMenu({
   onClose: () => void;
 }) {
   const ref = useRef<HTMLDivElement | null>(null);
+  const itemRefs = useRef<HTMLButtonElement[]>([]);
+  const enabledIndexes = items
+    .map((it, index) => ({ it, index }))
+    .filter(({ it }) => it.kind === "item" && !it.disabled)
+    .map(({ index }) => index);
 
   useEffect(() => {
     const onClick = (e: MouseEvent) => {
@@ -33,11 +38,33 @@ export function ContextMenu({
     };
   }, [onClose]);
 
+  useEffect(() => {
+    const first = enabledIndexes[0];
+    if (first != null) {
+      requestAnimationFrame(() => itemRefs.current[first]?.focus());
+    }
+    // Run only for this menu instance; changing focus while the user
+    // navigates would be maddening.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  const focusRelative = (delta: number) => {
+    if (enabledIndexes.length === 0) return;
+    const active = document.activeElement;
+    const current = itemRefs.current.findIndex((node) => node === active);
+    const enabledPos = Math.max(0, enabledIndexes.indexOf(current));
+    const next =
+      enabledIndexes[
+        (enabledPos + delta + enabledIndexes.length) % enabledIndexes.length
+      ];
+    itemRefs.current[next]?.focus();
+  };
+
   // Clamp to viewport so menus opened near the edges stay visible.
   const pad = 6;
   const w = 220;
-  const left = Math.min(x, window.innerWidth - w - pad);
-  const top = Math.min(y, window.innerHeight - 200);
+  const left = Math.max(pad, Math.min(x, window.innerWidth - w - pad));
+  const top = Math.max(pad, Math.min(y, window.innerHeight - 200 - pad));
 
   return createPortal(
     <div
@@ -46,6 +73,21 @@ export function ContextMenu({
       aria-label="Context menu"
       className="fixed z-pn-context-menu min-w-[220px] py-1 rounded-md border border-noir-line bg-noir-panel shadow-soft text-noir-text font-sans"
       style={{ left, top }}
+      onKeyDown={(e) => {
+        if (e.key === "ArrowDown") {
+          e.preventDefault();
+          focusRelative(1);
+        } else if (e.key === "ArrowUp") {
+          e.preventDefault();
+          focusRelative(-1);
+        } else if (e.key === "Home") {
+          e.preventDefault();
+          itemRefs.current[enabledIndexes[0]]?.focus();
+        } else if (e.key === "End") {
+          e.preventDefault();
+          itemRefs.current[enabledIndexes[enabledIndexes.length - 1]]?.focus();
+        }
+      }}
     >
       {items.map((it, i) =>
         it.kind === "separator" ? (
@@ -53,6 +95,9 @@ export function ContextMenu({
         ) : (
           <button
             key={i}
+            ref={(node) => {
+              if (node) itemRefs.current[i] = node;
+            }}
             role="menuitem"
             onClick={() => {
               if (it.disabled) return;

@@ -25,6 +25,8 @@ import {
 } from "@/lib/ipc";
 import { getItem, persistAsync } from "@/lib/persist";
 import { getWorkspaceBrief } from "@/lib/workspaceBrief";
+import { inferImplicitFileReferences, mergeReferences } from "@/lib/implicitContext";
+import { latestPlanText } from "@/lib/assistantPlans";
 import { useEditorStore } from "@/store/editor";
 import { useWorkspace } from "@/store/workspace";
 import type { Reference } from "@/store/chat";
@@ -101,6 +103,7 @@ type State = {
    *  transcript are preserved — the next turn just runs in the new
    *  mode. */
   setSessionMode: (id: string, mode: AssistantMode) => void;
+  setSessionModel: (id: string, model: string) => void;
   ensureActive: (model: string, mode: AssistantMode) => AssistantSession;
 
   addRef: (r: Reference) => void;
@@ -213,6 +216,14 @@ export const useAssistant = create<State>((set, get) => ({
     flush(get());
   },
 
+  setSessionModel: (id, model) => {
+    const st = get();
+    const s = st.sessions.find((x) => x.id === id);
+    if (!s || s.status === "running" || s.model === model) return;
+    patchSession(set, get, id, { model, updatedAt: Date.now() });
+    flush(get());
+  },
+
   ensureActive: (model, mode) => {
     const st = get();
     const found = st.sessions.find((s) => s.id === st.activeSessionId);
@@ -240,9 +251,21 @@ export const useAssistant = create<State>((set, get) => ({
 
   send: async (text, { defaultModel, buildContext }) => {
     if (!defaultModel) return;
-    const refs = get().pendingRefs;
+    const explicitRefs = get().pendingRefs;
     let active = get().ensureActive(defaultModel, "ask");
     if (!active.model) return;
+    const directAskRedirect =
+      active.mode === "ask" && isDirectAskEditRequest(text);
+
+    const editor = useEditorStore.getState();
+    const implicitRefs = directAskRedirect
+      ? []
+      : await inferImplicitFileReferences(text, {
+          existingRefs: explicitRefs,
+          activePath: editor.activePath,
+          openTabs: editor.tabs.map((t) => t.path),
+        });
+    const refs = mergeReferences(explicitRefs, implicitRefs);
 
     const userMsg: AssistantMessage = {
       id: crypto.randomUUID(),
@@ -259,15 +282,22 @@ export const useAssistant = create<State>((set, get) => ({
       get().renameSession(active.id, title);
     }
 
-    const context = (await buildContext?.(refs)) ?? undefined;
+    const context = directAskRedirect
+      ? undefined
+      : (await buildContext?.(refs)) ?? undefined;
+    const attachedFiles = attachedFilesFor(refs, editor.activePath, editor.tabs.map((t) => t.path));
 
     switch (active.mode) {
       case "ask":
-        await sendAsk(set, get, active.id, context);
+        if (directAskRedirect) {
+          appendAskRedirectAnswer(set, get, active.id);
+          break;
+        }
+        await sendAsk(set, get, active.id, context, attachedFiles);
         break;
       case "plan":
       case "agent":
-        await sendAgent(set, get, active.id, text, context);
+        await sendAgent(set, get, active.id, text, context, attachedFiles);
         break;
     }
   },
@@ -277,14 +307,11 @@ export const useAssistant = create<State>((set, get) => ({
     if (!session) return;
     if (session.status === "running") return;
     // Collect any <plan> blocks the model produced this session.
-    // We pass the raw concatenation — the BE handler prefixes it
+    // We pass the latest block — the BE handler prefixes it
     // with "Execute the following plan:" and routes it through
     // agent_continue when a transcript is available.
-    const planText = session.events
-      .filter((e) => e.kind === "plan")
-      .map((e) => (e.kind === "plan" ? e.text : ""))
-      .join("\n\n")
-      .trim();
+    const planText = latestPlanText(session.events);
+    if (!planText) return;
     patchSession(set, get, id, {
       mode: "agent",
       status: "running",
@@ -330,9 +357,18 @@ async function sendAsk(
   get: () => State,
   sessionId: string,
   context: string | undefined,
+  attachedFiles: string[],
 ) {
   const session = get().sessions.find((s) => s.id === sessionId);
   if (!session) return;
+
+  patchSession(set, get, sessionId, {
+    status: "running",
+    updatedAt: Date.now(),
+  });
+  set({
+    phase: { kind: "streaming", step: 0, warmupMs: 0 },
+  });
 
   const assistantMsg: AssistantMessage = {
     id: crypto.randomUUID(),
@@ -363,16 +399,17 @@ async function sendAsk(
     if ("error" in p)
       appendToken(set, get, sessionId, assistantMsg.id, `\n\n_Error: ${p.error}_`);
     if ("done" in p && p.done) {
+      const status: AgentStatus = "cancelled" in p && p.cancelled ? "cancelled" : "done";
       patchSession(set, get, sessionId, {
         messages: get()
           .sessions.find((s) => s.id === sessionId)!
           .messages.map((m) =>
             m.id === assistantMsg.id ? { ...m, streaming: false } : m,
           ),
-        status: "done",
+        status,
         updatedAt: Date.now(),
       });
-      set({ currentRequestId: null });
+      set({ phase: { kind: "idle" }, currentRequestId: null });
       flush(get());
       offStream();
     }
@@ -394,12 +431,13 @@ async function sendAsk(
       messages,
       system,
       system_extras: context,
+      attached_files: attachedFiles.length ? attachedFiles : undefined,
       temperature: 0.2,
     });
   } catch (e) {
     appendToken(set, get, sessionId, assistantMsg.id, `\n\n_Error: ${String(e)}_`);
     patchSession(set, get, sessionId, { status: "error" });
-    set({ currentRequestId: null });
+    set({ phase: { kind: "idle" }, currentRequestId: null });
     offStream();
     offLedger();
   }
@@ -415,6 +453,7 @@ async function sendAgent(
   sessionId: string,
   text: string,
   context: string | undefined,
+  attachedFiles: string[],
 ) {
   const session = get().sessions.find((s) => s.id === sessionId);
   if (!session) return;
@@ -450,6 +489,7 @@ async function sendAgent(
         context: context?.trim() ? context : undefined,
         open_tabs: openTabs.length ? openTabs : undefined,
         active_file: activeFile,
+        attached_files: attachedFiles.length ? attachedFiles : undefined,
       });
     } else {
       await ipc.agentContinue(rid, {
@@ -463,6 +503,7 @@ async function sendAgent(
         context: context?.trim() ? context : undefined,
         open_tabs: openTabs.length ? openTabs : undefined,
         active_file: activeFile,
+        attached_files: attachedFiles.length ? attachedFiles : undefined,
         ledger: session.ledger.length ? session.ledger : undefined,
       });
     }
@@ -533,6 +574,12 @@ async function subscribeAgentEvents(
         case "tool_result":
           set({ phase: { kind: "warming", step: 0, sinceMs: Date.now() } });
           break;
+        case "final":
+          appendAgentOutputMessage(set, get, sessionId, e.text);
+          break;
+        case "clarify":
+          appendAgentOutputMessage(set, get, sessionId, e.text);
+          break;
         case "done":
           patchSession(set, get, sessionId, { status: "done" });
           set({ phase: { kind: "idle" }, currentRequestId: null });
@@ -546,6 +593,7 @@ async function subscribeAgentEvents(
           flush(get());
           break;
         case "error":
+          appendAgentOutputMessage(set, get, sessionId, e.text);
           patchSession(set, get, sessionId, { status: "error" });
           set({ phase: { kind: "idle" }, currentRequestId: null });
           off();
@@ -645,6 +693,27 @@ function toAgentMode(m: AssistantMode): AgentMode {
   if (m === "plan") return "plan";
   if (m === "agent") return "auto";
   return "ask";
+}
+
+function attachedFilesFor(
+  refs: Reference[],
+  activePath: string | null,
+  openTabs: string[],
+): string[] {
+  const out: string[] = [];
+  const push = (path: string | null | undefined) => {
+    const p = path?.trim();
+    if (!p || out.includes(p)) return;
+    out.push(p);
+  };
+  for (const ref of refs) {
+    if (ref.kind === "file" || ref.kind === "selection" || ref.kind === "symbol" || ref.kind === "diagnostic") {
+      push(ref.path);
+    }
+  }
+  push(activePath);
+  for (const tab of openTabs.slice(0, 3)) push(tab);
+  return out.slice(0, 8);
 }
 
 function messagesFromAgentEvents(a: AgentSession): AssistantMessage[] {
@@ -831,6 +900,30 @@ function appendLedger(
   flush(get());
 }
 
+function appendAgentOutputMessage(
+  set: (p: Partial<State> | ((s: State) => Partial<State>)) => void,
+  get: () => State,
+  sessionId: string,
+  text: string,
+) {
+  const content = text.trim();
+  if (!content) return;
+  const session = get().sessions.find((s) => s.id === sessionId);
+  if (!session) return;
+  const normalized = normalizeMessageContent(content);
+  const alreadyVisible = session.messages.some(
+    (m) =>
+      m.role === "assistant" &&
+      normalizeMessageContent(m.content) === normalized,
+  );
+  if (alreadyVisible) return;
+  appendMessage(set, get, sessionId, {
+    id: crypto.randomUUID(),
+    role: "assistant",
+    content,
+  });
+}
+
 function appendChange(
   set: (p: Partial<State> | ((s: State) => Partial<State>)) => void,
   get: () => State,
@@ -888,12 +981,91 @@ function derivedTitle(text: string): string {
   return trimmed.length === 0 ? "New assistant" : trimmed;
 }
 
+const ASK_EDIT_REDIRECT =
+  "Switch to Agent mode and I can apply that edit, or Plan mode if you want to review the plan first.";
+
+function isDirectAskEditRequest(text: string): boolean {
+  const trimmed = normalizeMessageContent(text).toLowerCase();
+  if (!trimmed) return false;
+  if (/\bhow\b|\bwhy\b|\bwhat\b|\bexplain\b|\btell me\b|\bplan\b/.test(trimmed)) {
+    return false;
+  }
+  return /\b(change|edit|fix|add|remove|delete|rename|rewrite|implement|create|modify|update|patch)\b/.test(trimmed);
+}
+
+function appendAskRedirectAnswer(
+  set: (p: Partial<State> | ((s: State) => Partial<State>)) => void,
+  get: () => State,
+  sessionId: string,
+) {
+  appendMessage(set, get, sessionId, {
+    id: crypto.randomUUID(),
+    role: "assistant",
+    content: ASK_EDIT_REDIRECT,
+    streaming: false,
+  });
+  appendLedger(set, get, sessionId, {
+    turn: 0,
+    timestamp_ms: Date.now(),
+    mode: "ask",
+    kind: { type: "answered_only", summary: ASK_EDIT_REDIRECT },
+  });
+  patchSession(set, get, sessionId, {
+    status: "done",
+    updatedAt: Date.now(),
+  });
+  set({ phase: { kind: "idle" }, currentRequestId: null });
+  flush(get());
+}
+
+function normalizeMessageContent(text: string): string {
+  return text.trim().replace(/\s+/g, " ");
+}
+
 function askSystemPrompt(brief?: string): string {
   return `You are Pointer, an AI pair programmer running entirely on the user's machine via local open-source models. Be concise.
 
 You are in ASK mode — answer questions and explain code. Do NOT
-emit edit blocks, tool tags, or shell commands. If the user wants
-the code changed, suggest switching to Plan or Agent mode.
+emit edit blocks, tool tags, shell commands, or triple-backtick code
+fences. If the user asks you to change code, do not provide a patch or
+replacement implementation in Ask mode; briefly tell them to switch to
+Plan mode for an implementation plan or Agent mode to apply the edit.
+
+ASK MODE OUTPUT CONTRACT:
+- Prose only. The literal string \`\`\` is forbidden.
+- Inline code spans like \`profile.name\` are OK; multi-line code examples are not.
+- If the context includes a <file> block for a named file, answer from that
+  file. Do not claim you lack access to it.
+- For "tell me about <file>" style questions, answer with the file's purpose,
+  important imports/exports, state or data flow, and any notable risks or
+  neighboring files worth checking. Prefer a tight, skimmable explanation.
+- When a provided file defines object/property methods such as \`app.handle\`,
+  \`app.use\`, \`defaultConfiguration\`, or \`request.subdomains\`, include the
+  literal identifier names from the file. Do not paraphrase dotted assignments
+  into generic method names.
+- Preserve camelCase and dotted assignment names exactly: \`app.defaultConfiguration
+  = function defaultConfiguration()\` should be discussed as
+  \`app.defaultConfiguration\` / \`defaultConfiguration\`, not "default
+  configuration".
+- Include a compact "Key identifiers" sentence when explaining a file, naming
+  4-8 concrete symbols or setting keys that are actually visible in the
+  provided context.
+- This is mandatory, not optional: when strings like \`app.defaultConfiguration\`,
+  \`defaultConfiguration\`, \`trust proxy\`, \`query parser\`, \`etag\`, or
+  \`request.subdomains\` are visible in the supplied file, include those exact
+  strings in the answer.
+- When explaining core framework/runtime files, name concrete configuration
+  defaults, compatibility hooks, and routing/middleware paths visible in the
+  file instead of smoothing them into generic summaries.
+- Name important top-level functions and methods by their literal identifiers
+  (for example \`app.handle\`, \`app.use\`, \`defaultConfiguration\`) when they
+  are central to the file.
+- Do not compress literal setting names into "configuration"; if keys such as
+  \`trust proxy\`, \`etag\`, or \`query parser\` appear in the file, name them.
+- For direct edit requests ("change this file", "fix this", "add X"),
+  your ENTIRE response must be exactly:
+  "Switch to Agent mode and I can apply that edit, or Plan mode if you want to review the plan first."
+  Do not show the changed code. Do not explain the change.
 
 ${
   brief && brief.trim().length

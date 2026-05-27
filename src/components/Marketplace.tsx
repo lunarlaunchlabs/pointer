@@ -6,6 +6,7 @@ import {
   Download,
   Filter as FilterIcon,
   Loader2,
+  RefreshCw,
   Search as SearchIcon,
   ShieldAlert,
   X,
@@ -39,6 +40,10 @@ export function Marketplace({
   ollamaRunning,
   activePulls,
   onPull,
+  catalog = CATALOG,
+  loading = false,
+  error = null,
+  onRefresh,
 }: {
   hardware: HardwareProfile | null;
   installedModelIds: ReadonlyArray<string>;
@@ -47,10 +52,15 @@ export function Marketplace({
   activePulls: Record<string, { pct: number; status: string; error: string | null }>;
   /** Kick off a pull. The host owns retry/cancel; we just call this. */
   onPull: (id: string) => void;
+  catalog?: CatalogEntry[];
+  loading?: boolean;
+  error?: string | null;
+  onRefresh?: () => void;
 }) {
   const [filters, setFilters] = useState<MarketplaceFilters>({
     query: "",
     category: null,
+    family: null,
     // Default ON: hide blocked rows so users don't try to install models
     // that will OOM their machine. They can flip the filter to see them.
     hideBlocked: true,
@@ -72,22 +82,34 @@ export function Marketplace({
   const rows: MarketplaceRow[] = useMemo(
     () =>
       filterAndRank({
-        catalog: CATALOG,
+        catalog,
         filters,
         hardware: hardwareLike,
         installedModelIds,
       }),
-    [filters, hardwareLike, installedModelIds],
+    [catalog, filters, hardwareLike, installedModelIds],
   );
 
   // Live tally for the "X of Y" subtitle in the header.
   const total = useMemo(
     () =>
-      filters.category == null
-        ? CATALOG.length
-        : CATALOG.filter((e) => e.categories.includes(filters.category!)).length,
-    [filters.category],
+      catalog.filter((e) => {
+        const categoryOk =
+          filters.category == null || e.categories.includes(filters.category);
+        const familyOk =
+          filters.family == null || filters.family === "" || e.family === filters.family;
+        return categoryOk && familyOk;
+      }).length,
+    [catalog, filters.category, filters.family],
   );
+
+  const families = useMemo(() => {
+    const counts = new Map<string, number>();
+    for (const entry of catalog) {
+      counts.set(entry.family, (counts.get(entry.family) ?? 0) + 1);
+    }
+    return Array.from(counts.entries()).sort(([a], [b]) => a.localeCompare(b));
+  }, [catalog]);
 
   // The hardware ceiling shown in the budget banner. We keep this as a
   // user-visible "this is what we're flagging against" so the colour codes
@@ -138,6 +160,22 @@ export function Marketplace({
         </div>
 
         <select
+          value={filters.family ?? ""}
+          onChange={(e) =>
+            setFilters((f) => ({ ...f, family: e.target.value || null }))
+          }
+          className="pn-input text-[11.5px] max-w-[180px]"
+          aria-label="Family"
+        >
+          <option value="">Family: all</option>
+          {families.map(([family, count]) => (
+            <option key={family} value={family}>
+              {family} ({count})
+            </option>
+          ))}
+        </select>
+
+        <select
           value={filters.sort}
           onChange={(e) =>
             setFilters((f) => ({ ...f, sort: e.target.value as MarketplaceFilters["sort"] }))
@@ -151,6 +189,24 @@ export function Marketplace({
           <option value="largest">Sort: largest first</option>
         </select>
       </div>
+
+      {(loading || error || onRefresh) && (
+        <div className="flex items-center gap-2 text-[10.5px] text-noir-mute">
+          {onRefresh && (
+            <button
+              onClick={onRefresh}
+              disabled={loading}
+              className="pn-button font-sans inline-flex items-center gap-1 py-0.5 px-1.5"
+              title="Refresh Ollama library"
+            >
+              <RefreshCw size={10} className={loading ? "animate-spin" : ""} />
+              Refresh
+            </button>
+          )}
+          {loading && <span>Fetching Ollama library…</span>}
+          {error && <span className="text-noir-warn">{error}</span>}
+        </div>
+      )}
 
       <div className="flex items-center gap-3 text-[10.5px] text-noir-mute" role="group" aria-label="Marketplace filters">
         <FilterIcon size={10} aria-hidden="true" />
@@ -182,7 +238,7 @@ export function Marketplace({
         {rows.length === 0 ? (
           <div className="px-3 py-4 text-[11px] text-noir-mute text-center">
             {filters.query
-              ? "No models match. Try a broader search, or turn off 'Hide models I can't run'."
+              ? "No models match. Try a broader search, another family, or turn off 'Hide models I can't run'."
               : "No models match the current filters."}
           </div>
         ) : (
@@ -270,7 +326,7 @@ function CategoryPills({
             key={String(c)}
             role="tab"
             aria-selected={isActive}
-            aria-label={`Filter by ${label}`}
+            aria-label={label}
             onClick={() => onChange(c)}
             className={`text-[10.5px] px-2 py-0.5 rounded-md border transition ${
               isActive
@@ -407,6 +463,8 @@ function ModelCard({
           {entry.description}
         </div>
         <div className="text-[10px] text-noir-mute font-sans mt-0.5 flex gap-2 flex-wrap">
+          <span>{entry.family}</span>
+          <span>·</span>
           <span>{entry.publisher}</span>
           <span>·</span>
           <span>{entry.params}B params</span>
@@ -420,6 +478,18 @@ function ModelCard({
           <span className="truncate" title={entry.license}>
             {entry.license}
           </span>
+          {entry.pulls && (
+            <>
+              <span>·</span>
+              <span>{entry.pulls} pulls</span>
+            </>
+          )}
+          {entry.updated && (
+            <>
+              <span>·</span>
+              <span>updated {entry.updated}</span>
+            </>
+          )}
         </div>
         {pullError && (
           <div className="text-[10px] text-noir-err font-sans mt-1">

@@ -81,8 +81,8 @@ const GROUPS: Group[] = [
   {
     name: "AI",
     items: [
-      { keys: `${MOD} L`, label: "Toggle chat / send selection to chat" },
-      { keys: `${MOD} ${SHIFT} L`, label: "Send selection to agent" },
+      { keys: `${MOD} L`, label: "Toggle Assistant / send selection to Ask" },
+      { keys: `${MOD} ${SHIFT} L`, label: "Send selection to Agent" },
       { keys: `${MOD} K`, label: "Inline edit (selection or current line)" },
       { keys: `${MOD} ${SHIFT} ,`, label: "AI control panel" },
     ],

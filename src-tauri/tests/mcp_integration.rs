@@ -133,7 +133,12 @@ async fn lifecycle_initialize_list_call_stop() {
     m.sync_from_config(&config_with_echo(&python)).await;
 
     let snap = m.start_server("echo").await.expect("start_server");
-    assert_eq!(snap.status, ServerStatus::Ready, "expected ready, got {:?}", snap);
+    assert_eq!(
+        snap.status,
+        ServerStatus::Ready,
+        "expected ready, got {:?}",
+        snap
+    );
     assert!(
         snap.server_info.is_some(),
         "initialize must populate server_info"
@@ -150,7 +155,10 @@ async fn lifecycle_initialize_list_call_stop() {
             .contains("Echo"),
         "description should be propagated"
     );
-    assert!(tools[0].input_schema.is_some(), "input_schema should be populated");
+    assert!(
+        tools[0].input_schema.is_some(),
+        "input_schema should be populated"
+    );
 
     let result = m
         .call_tool("echo", "echo", json!({"text": "hello"}))

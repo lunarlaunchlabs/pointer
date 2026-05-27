@@ -9,8 +9,9 @@
  */
 
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { render, screen } from "@testing-library/react";
+import { act, render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
+import { listen } from "@tauri-apps/api/event";
 import { InlineEdit } from "./InlineEdit";
 import { useEditorStore } from "@/store/editor";
 import { useDiagnostics, type Diagnostic } from "@/store/diagnostics";
@@ -174,5 +175,45 @@ describe("InlineEdit + context enrichment", () => {
     expect(userMessage).toContain("Recent file: /proj/src/utils.ts");
     expect(userMessage).toContain("export function format");
     expect(userMessage).toContain("Instruction: Rename line11 to row11");
+  });
+
+  it("applies streamed search/replace output from the event buffer", async () => {
+    let emit: ((payload: unknown) => void) | null = null;
+    vi.mocked(listen).mockImplementation(async (_event, cb) => {
+      emit = (payload: unknown) => cb({ payload } as never);
+      return () => {};
+    });
+    vi.spyOn(ipcModule.ipc, "ollamaChat").mockResolvedValue();
+    const onProposeDiff = vi.fn();
+
+    const user = userEvent.setup();
+    render(
+      <InlineEdit
+        selection={{ startLine: 1, endLine: 1, text: "let foo = bar;" }}
+        position={{ top: 100, left: 100 }}
+        onClose={vi.fn()}
+        onProposeDiff={onProposeDiff}
+      />,
+    );
+
+    await user.type(screen.getByPlaceholderText(/Refactor this/i), "Use baz");
+    await user.click(screen.getByRole("button", { name: /Generate/i }));
+    await waitFor(() => expect(emit).not.toBeNull());
+
+    act(() => {
+      emit?.({
+        token:
+          "<<<<<<< SEARCH /proj/src/foo.ts\nlet foo = bar;\n=======\nlet foo = baz;\n>>>>>>> REPLACE\n",
+      });
+      emit?.({ done: true });
+    });
+
+    await waitFor(() =>
+      expect(onProposeDiff).toHaveBeenCalledWith(
+        "let foo = bar;",
+        "let foo = baz;",
+        "Use baz",
+      ),
+    );
   });
 });

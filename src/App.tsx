@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useRef, useState } from "react";
+import { lazy, Suspense, useCallback, useEffect, useRef, useState } from "react";
 
 /** Run `fn` exactly once for the lifetime of this module. We can't use a
  *  React ref because StrictMode unmounts/remounts; we need a process-wide
@@ -84,13 +84,11 @@ import { Breadcrumbs } from "@/components/Breadcrumbs";
 import { Editor } from "@/components/Editor";
 import { DiffView } from "@/components/DiffView";
 import { OpenRecentPicker } from "@/components/OpenRecentPicker";
-import { MarkdownView } from "@/components/MarkdownView";
 import { WorkspaceSymbols } from "@/components/WorkspaceSymbols";
 import { NotificationCenter } from "@/components/NotificationCenter";
 import { TasksPicker } from "@/components/TasksPicker";
 import { BookmarksPicker } from "@/components/BookmarksPicker";
 import { LanguagePicker } from "@/components/LanguagePicker";
-import { TerminalPanel } from "@/components/Terminal/TerminalPanel";
 import { useTerminals, nextTerminalTitle } from "@/store/terminal";
 import { ProblemsPanel } from "@/components/Problems/ProblemsPanel";
 import { StatusBar } from "@/components/StatusBar";
@@ -99,9 +97,7 @@ import { FileFinder } from "@/components/FileFinder";
 import { FindInFiles } from "@/components/FindInFiles";
 import { Onboarding } from "@/components/Onboarding/Wizard";
 import { RightDock } from "@/components/RightDock";
-import { SystemMonitor } from "@/components/SystemMonitor";
 import { ShortcutsHelp } from "@/components/ShortcutsHelp";
-import { SettingsPage } from "@/components/SettingsPage";
 import { ToastHost, toast } from "@/components/Toast";
 import { RefactorSuggestion } from "@/components/RefactorSuggestion";
 import { createRefactorWatcher } from "@/lib/refactorWatcher";
@@ -120,8 +116,24 @@ import { useSession } from "@/store/session";
 import { useAssistant } from "@/store/assistant";
 import { dispatchAction, onAction, type ActionId } from "@/lib/actions";
 import { ipc, listenEvent } from "@/lib/ipc";
-import { useConfirm, ConfirmModalHost } from "@/components/Confirm";
+import { choose, useConfirm, ConfirmModalHost } from "@/components/Confirm";
+import { open as openDialog } from "@tauri-apps/plugin-dialog";
 import { open as shellOpen } from "@tauri-apps/plugin-shell";
+
+const MarkdownView = lazy(() =>
+  import("@/components/MarkdownView").then((m) => ({ default: m.MarkdownView })),
+);
+const TerminalPanel = lazy(() =>
+  import("@/components/Terminal/TerminalPanel").then((m) => ({
+    default: m.TerminalPanel,
+  })),
+);
+const SystemMonitor = lazy(() =>
+  import("@/components/SystemMonitor").then((m) => ({ default: m.SystemMonitor })),
+);
+const SettingsPage = lazy(() =>
+  import("@/components/SettingsPage").then((m) => ({ default: m.SettingsPage })),
+);
 
 export default function App() {
   const [showPalette, setShowPalette] = useState(false);
@@ -188,7 +200,7 @@ export default function App() {
 
   const root = useWorkspace((s) => s.root);
   const setRoot = useWorkspace((s) => s.setRoot);
-  const openFolder = useWorkspace((s) => s.openFolder);
+  const terminalOpen = useTerminals((s) => s.open);
 
   const openFile = useEditorStore((s) => s.openFile);
   const setActive = useEditorStore((s) => s.setActive);
@@ -344,26 +356,92 @@ export default function App() {
     }
   }, []);
 
+  /** Close a tab; if dirty, prompt to Save / Discard / Cancel. */
+  const closeTabWithGuard = useCallback(async (path: string): Promise<boolean> => {
+    const editor = useEditorStore.getState();
+    const tab = editor.tabs.find((t) => t.path === path);
+    if (!tab) return true;
+    let pathToClose = path;
+    if (tab.dirty) {
+      editor.setActive(path);
+      const choice = await choose({
+        title: `Save changes to ${tab.name}?`,
+        body: "This file has unsaved edits. Closing without saving will lose them.",
+        confirmLabel: "Save & close",
+        secondaryLabel: "Discard",
+        cancelLabel: "Cancel",
+      });
+      if (choice === "cancel") return false;
+      if (choice === "confirm") {
+        try {
+          await useEditorStore.getState().saveActive();
+        } catch (e) {
+          toast.error("Couldn't save before closing", {
+            body: e instanceof Error ? e.message : String(e),
+          });
+          return false;
+        }
+        const after = useEditorStore.getState();
+        const savedTab =
+          after.tabs.find((t) => t.path === path) ??
+          (after.activePath ? after.tabs.find((t) => t.path === after.activePath) : null);
+        if (savedTab?.dirty) return false;
+        pathToClose = savedTab?.path ?? path;
+      } else {
+        useSession.getState().noteHotExit(path, null);
+      }
+    }
+    useEditorStore.getState().closeTab(pathToClose);
+    return true;
+  }, []);
+
   /** Close the active tab; if dirty, prompt to save / discard. */
   const closeActiveTab = useCallback(async () => {
     const editor = useEditorStore.getState();
     const tab = editor.tabs.find((t) => t.path === editor.activePath);
     if (!tab) return;
-    if (tab.dirty) {
-      const save = await askConfirm({
-        title: `Save changes to ${tab.name}?`,
-        body: "This file has unsaved edits. Closing without saving will lose them.",
-        confirmLabel: "Save & close",
-        cancelLabel: "Discard",
-      });
-      if (save) {
-        await editor.saveActive();
+    await closeTabWithGuard(tab.path);
+  }, [closeTabWithGuard]);
+
+  const closeTabsWithGuard = useCallback(
+    async (paths: string[], restoreActivePath?: string | null) => {
+      for (const path of paths) {
+        const closed = await closeTabWithGuard(path);
+        if (!closed) break;
       }
-      // Cancel here means "discard and close" — the user chose the secondary
-      // path on a save-flavoured confirm. Either way, we proceed to close.
+      if (
+        restoreActivePath &&
+        useEditorStore.getState().tabs.some((t) => t.path === restoreActivePath)
+      ) {
+        useEditorStore.getState().setActive(restoreActivePath);
+      }
+    },
+    [closeTabWithGuard],
+  );
+
+  const switchWorkspaceRoot = useCallback(
+    async (nextRoot: string): Promise<boolean> => {
+      const currentRoot = useWorkspace.getState().root;
+      if (currentRoot === nextRoot) return true;
+      const openPaths = useEditorStore.getState().tabs.map((t) => t.path);
+      if (openPaths.length > 0) {
+        await closeTabsWithGuard(openPaths);
+        if (useEditorStore.getState().tabs.length > 0) return false;
+      }
+      useDiffViewer.getState().close();
+      setMdPreview({});
+      await setRoot(nextRoot);
+      return true;
+    },
+    [closeTabsWithGuard, setRoot],
+  );
+
+  const openFolder = useCallback(async () => {
+    const selected = await openDialog({ directory: true, multiple: false });
+    if (typeof selected === "string") {
+      await switchWorkspaceRoot(selected);
     }
-    editor.closeTab(tab.path);
-  }, [askConfirm]);
+  }, [switchWorkspaceRoot]);
 
   /** ⌘K chord state. After ⌘K is pressed without a follow-up
    *  modifier, we enter "chord mode" and wait up to 1.5s for a
@@ -652,7 +730,7 @@ export default function App() {
               const { stat } = await import("@tauri-apps/plugin-fs");
               const meta = await stat(paths[0]);
               if (meta.isDirectory) {
-                await useWorkspace.getState().setRoot(paths[0]);
+                await switchWorkspaceRoot(paths[0]);
                 return;
               }
             } catch {
@@ -678,7 +756,7 @@ export default function App() {
         /* no-op */
       }
     };
-  }, []);
+  }, [switchWorkspaceRoot]);
 
   // Bridge: the native macOS menu emits `menu:action` from Rust. Re-dispatch
   // each one through the same action bus the in-app shortcuts use — so File →
@@ -940,19 +1018,23 @@ export default function App() {
         const ed = useEditorStore.getState();
         const active = ed.activePath;
         if (!active) return;
-        for (const t of [...ed.tabs]) {
-          if (t.path !== active) ed.closeTab(t.path);
-        }
+        void closeTabsWithGuard(
+          ed.tabs.filter((t) => t.path !== active).map((t) => t.path),
+          active,
+        );
       }),
       onAction("tabs:close_to_right", () => {
         const ed = useEditorStore.getState();
         const i = ed.tabs.findIndex((t) => t.path === ed.activePath);
         if (i < 0) return;
-        for (const t of ed.tabs.slice(i + 1)) ed.closeTab(t.path);
+        void closeTabsWithGuard(
+          ed.tabs.slice(i + 1).map((t) => t.path),
+          ed.activePath,
+        );
       }),
       onAction("tabs:close_all", () => {
         const ed = useEditorStore.getState();
-        for (const t of [...ed.tabs]) ed.closeTab(t.path);
+        void closeTabsWithGuard(ed.tabs.map((t) => t.path));
       }),
       onAction("tabs:next", () => {
         const ed = useEditorStore.getState();
@@ -971,6 +1053,16 @@ export default function App() {
       onAction("editor:goto_line", () => {
         window.dispatchEvent(new CustomEvent("pointer:editor_command", {
           detail: { id: "editor.action.gotoLine" },
+        }));
+      }),
+      onAction("editor:goto_definition", () => {
+        window.dispatchEvent(new CustomEvent("pointer:editor_command", {
+          detail: { id: "editor.action.revealDefinition" },
+        }));
+      }),
+      onAction("editor:peek_definition", () => {
+        window.dispatchEvent(new CustomEvent("pointer:editor_command", {
+          detail: { id: "editor.action.peekDefinition" },
         }));
       }),
       onAction("editor:goto_symbol_file", () => {
@@ -1275,6 +1367,10 @@ export default function App() {
       }),
       onAction("editor:next_problem", () => navigateProblem("next")),
       onAction("editor:prev_problem", () => navigateProblem("prev")),
+      onAction("diagnostics:run_project_check", () => {
+        setShowProblems(true);
+        void useDiagnostics.getState().runProjectCheck();
+      }),
       onAction("editor:nav_back", async () => {
         const { useNavHistory } = await import("@/store/navHistory");
         const entry = useNavHistory.getState().back();
@@ -1409,7 +1505,9 @@ export default function App() {
                   ready={ready}
                   onOpen={openFolder}
                   recents={recents}
-                  onOpenRecent={(p) => setRoot(p)}
+                  onOpenRecent={(p) => {
+                    void switchWorkspaceRoot(p);
+                  }}
                   onRemoveRecent={removeRecent}
                   onShowAIPanel={() => noteDockView("ai")}
                 />
@@ -1420,7 +1518,11 @@ export default function App() {
             {showProblems && (
               <ProblemsPanel onClose={() => setShowProblems(false)} />
             )}
-            {!zenMode && <TerminalPanel />}
+            {!zenMode && terminalOpen && (
+              <Suspense fallback={null}>
+                <TerminalPanel />
+              </Suspense>
+            )}
           </div>
         </main>
         {!zenMode && <RightDock />}
@@ -1443,7 +1545,7 @@ export default function App() {
             setShowPalette(false);
             setShowFinder(true);
           }}
-          toggleChat={() => toggleDockView("assistant")}
+          toggleAssistant={() => toggleDockView("assistant")}
           openOnboarding={() => setShowOnboarding(true)}
           openAIPanel={() => noteDockView("ai")}
           openMonitor={() => setShowMonitor(true)}
@@ -1454,14 +1556,23 @@ export default function App() {
         <FindInFiles onClose={() => setShowFindInFiles(false)} />
       )}
       {showMonitor && (
-        <SystemMonitor onClose={() => setShowMonitor(false)} />
+        <Suspense fallback={<OverlayLoading label="Opening monitor" />}>
+          <SystemMonitor onClose={() => setShowMonitor(false)} />
+        </Suspense>
       )}
       {showShortcutsHelp && (
         <ShortcutsHelp onClose={() => setShowShortcutsHelp(false)} />
       )}
-      {showSettings && <SettingsPage onClose={() => setShowSettings(false)} />}
+      {showSettings && (
+        <Suspense fallback={<OverlayLoading label="Opening settings" />}>
+          <SettingsPage onClose={() => setShowSettings(false)} />
+        </Suspense>
+      )}
       {showOpenRecent && (
-        <OpenRecentPicker onClose={() => setShowOpenRecent(false)} />
+        <OpenRecentPicker
+          onClose={() => setShowOpenRecent(false)}
+          onOpenRecent={switchWorkspaceRoot}
+        />
       )}
       {showWorkspaceSymbols && (
         <WorkspaceSymbols onClose={() => setShowWorkspaceSymbols(false)} />
@@ -1513,7 +1624,6 @@ function Welcome({
   onShowAIPanel: () => void;
 }) {
   const ollamaReady = useSettings((s) => s.ollamaReady);
-  const hasHfToken = useSettings((s) => s.hasHfToken);
   // The "Models" chip on the welcome screen used to light up the moment
   // the user had ever picked a chat model — even if they later uninstalled
   // it. That was misleading: the chip claimed setup was done while the
@@ -1586,10 +1696,9 @@ function Welcome({
                 {setupComplete ? "Ready" : "Action needed"}
               </div>
             </div>
-            <div className="grid grid-cols-3 gap-2 text-[11px]">
+            <div className="grid grid-cols-2 gap-2 text-[11px]">
               <SetupChip on={ollamaReady} label="Ollama" />
               <SetupChip on={!!effectiveChat} label="Models" />
-              <SetupChip on={hasHfToken} label="HF token" optional />
             </div>
           </button>
         )}
@@ -1653,6 +1762,16 @@ function Welcome({
   );
 }
 
+function OverlayLoading({ label }: { label: string }) {
+  return (
+    <div className="fixed inset-0 z-pn-modal flex items-center justify-center bg-black/45 backdrop-blur-md">
+      <div className="rounded-md border border-noir-line bg-noir-panel px-3 py-2 text-[11px] font-sans text-noir-subtext shadow-soft">
+        {label}…
+      </div>
+    </div>
+  );
+}
+
 function SetupChip({
   on,
   label,
@@ -1703,11 +1822,13 @@ function ActiveMarkdownPreview({
   const set = (m: "preview" | "split" | null) =>
     setState((p) => ({ ...p, [active]: m }));
   return (
-    <MarkdownView
-      path={active}
-      mode={mode}
-      onSetMode={set}
-      onClose={close}
-    />
+    <Suspense fallback={null}>
+      <MarkdownView
+        path={active}
+        mode={mode}
+        onSetMode={set}
+        onClose={close}
+      />
+    </Suspense>
   );
 }

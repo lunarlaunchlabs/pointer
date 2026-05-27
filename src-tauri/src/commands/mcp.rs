@@ -33,10 +33,7 @@ fn ensure_config_path(app: &AppHandle, state: &State<'_, AppState>) -> AppResult
 }
 
 #[tauri::command]
-pub async fn mcp_load_config(
-    app: AppHandle,
-    state: State<'_, AppState>,
-) -> AppResult<McpConfig> {
+pub async fn mcp_load_config(app: AppHandle, state: State<'_, AppState>) -> AppResult<McpConfig> {
     ensure_config_path(&app, &state)?;
     let cfg = state.mcp.load_config().map_err(AppError::Msg)?;
     state.mcp.sync_from_config(&cfg).await;
@@ -120,10 +117,7 @@ pub async fn mcp_restart_server(
 }
 
 #[tauri::command]
-pub async fn mcp_list_tools(
-    state: State<'_, AppState>,
-    name: String,
-) -> AppResult<Vec<McpTool>> {
+pub async fn mcp_list_tools(state: State<'_, AppState>, name: String) -> AppResult<Vec<McpTool>> {
     // Always refresh so the UI sees the server's live state. Falls back to
     // the cached list on error.
     match state.mcp.refresh_tools(&name).await {
@@ -162,9 +156,6 @@ pub async fn mcp_call_tool(
 }
 
 #[tauri::command]
-pub async fn mcp_get_logs(
-    state: State<'_, AppState>,
-    name: String,
-) -> AppResult<Vec<String>> {
+pub async fn mcp_get_logs(state: State<'_, AppState>, name: String) -> AppResult<Vec<String>> {
     Ok(state.mcp.get_logs(&name))
 }

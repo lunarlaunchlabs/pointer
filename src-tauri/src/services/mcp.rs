@@ -130,13 +130,22 @@ impl Frame {
 /// the dispatch loop and is what we test against.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum InboundKind {
-    Response { id: i64 },
-    ResponseStr { id: String },
-    Notification { method: String },
+    Response {
+        id: i64,
+    },
+    ResponseStr {
+        id: String,
+    },
+    Notification {
+        method: String,
+    },
     /// Server-initiated request (e.g. `sampling/createMessage`). We
     /// acknowledge with an error reply since Pointer doesn't yet
     /// implement reverse sampling.
-    ServerRequest { id: Value, method: String },
+    ServerRequest {
+        id: Value,
+        method: String,
+    },
     Unknown,
 }
 
@@ -184,18 +193,10 @@ pub struct ServerConfig {
     pub disabled: bool,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct McpConfig {
     #[serde(default, rename = "mcpServers")]
     pub servers: HashMap<String, ServerConfig>,
-}
-
-impl Default for McpConfig {
-    fn default() -> Self {
-        Self {
-            servers: HashMap::new(),
-        }
-    }
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -290,10 +291,7 @@ impl ServerRuntime {
             Ok(Err(_)) => Err("response channel closed".into()),
             Err(_) => {
                 self.pending.lock().remove(&id);
-                Err(format!(
-                    "request timed out after {}s",
-                    CALL_TIMEOUT_SECS
-                ))
+                Err(format!("request timed out after {}s", CALL_TIMEOUT_SECS))
             }
         }
     }
@@ -322,7 +320,10 @@ impl Server {
             config: self.config.clone(),
             status: self.status,
             error: self.error.clone(),
-            server_info: self.runtime.as_ref().and_then(|rt| rt.server_info.read().clone()),
+            server_info: self
+                .runtime
+                .as_ref()
+                .and_then(|rt| rt.server_info.read().clone()),
             started_at_ms: self.started_at.map(|i| {
                 // Coarse — millis since epoch, not Instant.elapsed.
                 let now = std::time::SystemTime::now()
@@ -391,7 +392,8 @@ impl McpManager {
             None => return Err("MCP config path not set".into()),
         };
         if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent).map_err(|e| format!("mkdir {}: {e}", parent.display()))?;
+            std::fs::create_dir_all(parent)
+                .map_err(|e| format!("mkdir {}: {e}", parent.display()))?;
         }
         let pretty = serde_json::to_vec_pretty(cfg).map_err(|e| e.to_string())?;
         let tmp = path.with_extension("json.tmp");
@@ -442,12 +444,8 @@ impl McpManager {
     }
 
     pub fn list_servers(&self) -> Vec<ServerSnapshot> {
-        let mut v: Vec<ServerSnapshot> = self
-            .servers
-            .read()
-            .values()
-            .map(|s| s.snapshot())
-            .collect();
+        let mut v: Vec<ServerSnapshot> =
+            self.servers.read().values().map(|s| s.snapshot()).collect();
         v.sort_by(|a, b| a.name.cmp(&b.name));
         v
     }
@@ -474,7 +472,9 @@ impl McpManager {
                 }
             }
         }
-        out.sort_by(|a, b| (a.0.as_str(), a.1.name.as_str()).cmp(&(b.0.as_str(), b.1.name.as_str())));
+        out.sort_by(|a, b| {
+            (a.0.as_str(), a.1.name.as_str()).cmp(&(b.0.as_str(), b.1.name.as_str()))
+        });
         out
     }
 
@@ -482,7 +482,11 @@ impl McpManager {
         self.servers
             .read()
             .get(server)
-            .and_then(|s| s.runtime.as_ref().map(|rt| rt.stderr.read().iter().cloned().collect()))
+            .and_then(|s| {
+                s.runtime
+                    .as_ref()
+                    .map(|rt| rt.stderr.read().iter().cloned().collect())
+            })
             .unwrap_or_default()
     }
 
@@ -513,7 +517,9 @@ impl McpManager {
             Ok(rt) => {
                 let snap = {
                     let mut servers = self.servers.write();
-                    let s = servers.get_mut(name).ok_or_else(|| "server vanished".to_string())?;
+                    let s = servers
+                        .get_mut(name)
+                        .ok_or_else(|| "server vanished".to_string())?;
                     s.runtime = Some(rt);
                     s.status = ServerStatus::Ready;
                     s.error = None;
@@ -535,7 +541,11 @@ impl McpManager {
         }
     }
 
-    async fn spawn_and_init(&self, name: &str, cfg: &ServerConfig) -> Result<Arc<ServerRuntime>, String> {
+    async fn spawn_and_init(
+        &self,
+        name: &str,
+        cfg: &ServerConfig,
+    ) -> Result<Arc<ServerRuntime>, String> {
         let mut cmd = Command::new(&cfg.command);
         cmd.args(&cfg.args);
         for (k, v) in &cfg.env {
@@ -637,12 +647,14 @@ impl McpManager {
                                 InboundKind::Response { id } => {
                                     if let Some(tx) = pending.lock().remove(&id) {
                                         let result = if let Some(err) = v.get("error") {
-                                            let parsed: RpcError = serde_json::from_value(err.clone())
-                                                .unwrap_or(RpcError {
-                                                    code: -32000,
-                                                    message: "malformed error".into(),
-                                                    data: None,
-                                                });
+                                            let parsed: RpcError = serde_json::from_value(
+                                                err.clone(),
+                                            )
+                                            .unwrap_or(RpcError {
+                                                code: -32000,
+                                                message: "malformed error".into(),
+                                                data: None,
+                                            });
                                             Err(parsed)
                                         } else {
                                             Ok(v.get("result").cloned().unwrap_or(Value::Null))
@@ -651,7 +663,9 @@ impl McpManager {
                                     }
                                 }
                                 InboundKind::ResponseStr { id } => {
-                                    log::debug!("mcp[{server_name}] string-id response ignored: {id}");
+                                    log::debug!(
+                                        "mcp[{server_name}] string-id response ignored: {id}"
+                                    );
                                 }
                                 InboundKind::Notification { method } => {
                                     log::debug!("mcp[{server_name}] notification: {method}");
@@ -793,6 +807,12 @@ impl McpManager {
     }
 }
 
+impl Default for McpManager {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 fn configs_equal(a: &ServerConfig, b: &ServerConfig) -> bool {
     a.command == b.command
         && a.args == b.args
@@ -845,7 +865,8 @@ mod tests {
 
     #[test]
     fn classifies_server_initiated_request() {
-        let v = json!({ "jsonrpc": "2.0", "id": 9, "method": "sampling/createMessage", "params": {} });
+        let v =
+            json!({ "jsonrpc": "2.0", "id": 9, "method": "sampling/createMessage", "params": {} });
         assert_eq!(
             classify_inbound(&v),
             InboundKind::ServerRequest {
@@ -887,7 +908,10 @@ mod tests {
                 "fs".into(),
                 ServerConfig {
                     command: "npx".into(),
-                    args: vec!["-y".into(), "@modelcontextprotocol/server-filesystem".into()],
+                    args: vec![
+                        "-y".into(),
+                        "@modelcontextprotocol/server-filesystem".into(),
+                    ],
                     env,
                     cwd: None,
                     disabled: false,
@@ -907,14 +931,20 @@ mod tests {
         let a = ServerConfig {
             command: "x".into(),
             args: vec!["a".into(), "b".into()],
-            env: HashMap::from([("A".to_string(), "1".to_string()), ("B".to_string(), "2".to_string())]),
+            env: HashMap::from([
+                ("A".to_string(), "1".to_string()),
+                ("B".to_string(), "2".to_string()),
+            ]),
             cwd: None,
             disabled: false,
         };
         let b = ServerConfig {
             command: "x".into(),
             args: vec!["a".into(), "b".into()],
-            env: HashMap::from([("B".to_string(), "2".to_string()), ("A".to_string(), "1".to_string())]),
+            env: HashMap::from([
+                ("B".to_string(), "2".to_string()),
+                ("A".to_string(), "1".to_string()),
+            ]),
             cwd: None,
             disabled: false,
         };

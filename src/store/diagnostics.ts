@@ -16,6 +16,7 @@
 
 import { create } from "zustand";
 import type { Monaco } from "@monaco-editor/react";
+import { ipc, type ProjectCheckInfo } from "@/lib/ipc";
 
 export type DiagnosticSeverity = "error" | "warning" | "info" | "hint";
 
@@ -41,9 +42,19 @@ type State = {
   /** Map URI → ordered diagnostic list. We store per-URI so refreshing one
    *  file doesn't disturb the others' references (helps React memoisation). */
   byUri: Record<string, Diagnostic[]>;
+  monacoByUri: Record<string, Diagnostic[]>;
+  projectByUri: Record<string, Diagnostic[]>;
   errors: number;
   warnings: number;
+  projectCheck: {
+    status: "idle" | "running";
+    detected: ProjectCheckInfo | null;
+    lastOutput: string | null;
+    error: string | null;
+  };
   installFromMonaco: (monaco: Monaco) => void;
+  runProjectCheck: () => Promise<void>;
+  clearProjectDiagnostics: () => void;
   /** Counts for a single file path. Used by the file tree to badge
    *  individual rows. Returns `{ errors: 0, warnings: 0 }` for
    *  files with no markers — callers can branch on that without a
@@ -76,10 +87,40 @@ function recomputeCounts(byUri: Record<string, Diagnostic[]>): {
   return { errors, warnings };
 }
 
+function mergeDiagnostics(
+  monacoByUri: Record<string, Diagnostic[]>,
+  projectByUri: Record<string, Diagnostic[]>,
+): Record<string, Diagnostic[]> {
+  const out: Record<string, Diagnostic[]> = {};
+  for (const [uri, list] of Object.entries(monacoByUri)) {
+    out[uri] = [...list];
+  }
+  for (const [uri, list] of Object.entries(projectByUri)) {
+    out[uri] = [...(out[uri] ?? []), ...list];
+  }
+  return out;
+}
+
+function groupByUri(list: Diagnostic[]): Record<string, Diagnostic[]> {
+  const out: Record<string, Diagnostic[]> = {};
+  for (const d of list) {
+    out[d.uri] = [...(out[d.uri] ?? []), d];
+  }
+  return out;
+}
+
 export const useDiagnostics = create<State>((set, get) => ({
   byUri: {},
+  monacoByUri: {},
+  projectByUri: {},
   errors: 0,
   warnings: 0,
+  projectCheck: {
+    status: "idle",
+    detected: null,
+    lastOutput: null,
+    error: null,
+  },
   countsForPath: (path) => {
     // Monaco model URIs are `file:///abs/path` on every OS we ship
     // on. Match the suffix to handle both styles defensively.
@@ -96,12 +137,70 @@ export const useDiagnostics = create<State>((set, get) => ({
     }
     return { errors, warnings };
   },
+  runProjectCheck: async () => {
+    set((s) => ({
+      projectCheck: { ...s.projectCheck, status: "running", error: null },
+    }));
+    try {
+      const result = await ipc.projectCheckRun();
+      const projectByUri = groupByUri(
+        result.diagnostics.map((d) => ({
+          ...d,
+          severity: d.severity ?? "error",
+          source: d.source || "project-check",
+          code: d.code ?? undefined,
+        })),
+      );
+      const byUri = mergeDiagnostics(get().monacoByUri, projectByUri);
+      const { errors, warnings } = recomputeCounts(byUri);
+      set({
+        byUri,
+        projectByUri,
+        errors,
+        warnings,
+        projectCheck: {
+          status: "idle",
+          detected: result.detected,
+          lastOutput: result.rawOutput,
+          error: result.timedOut
+            ? "Project check timed out after 180s."
+            : result.detected
+            ? result.exitCode !== null &&
+              result.exitCode !== 0 &&
+              result.diagnostics.length === 0
+              ? `Project check exited ${result.exitCode} without parseable file diagnostics.\n${result.rawOutput}`
+              : null
+            : result.rawOutput,
+        },
+      });
+    } catch (e) {
+      set((s) => ({
+        projectCheck: {
+          ...s.projectCheck,
+          status: "idle",
+          error: e instanceof Error ? e.message : String(e),
+        },
+      }));
+    }
+  },
+  clearProjectDiagnostics: () => {
+    const projectByUri: Record<string, Diagnostic[]> = {};
+    const byUri = mergeDiagnostics(get().monacoByUri, projectByUri);
+    const { errors, warnings } = recomputeCounts(byUri);
+    set((s) => ({
+      byUri,
+      projectByUri,
+      errors,
+      warnings,
+      projectCheck: { ...s.projectCheck, lastOutput: null, error: null },
+    }));
+  },
   installFromMonaco: (monaco) => {
     if (installed) return;
     installed = true;
 
     const refresh = (uris: { toString: () => string }[]) => {
-      const updates: Record<string, Diagnostic[]> = { ...get().byUri };
+      const updates: Record<string, Diagnostic[]> = { ...get().monacoByUri };
       for (const uri of uris) {
         const key = uri.toString();
         const markers = monaco.editor.getModelMarkers({
@@ -124,8 +223,9 @@ export const useDiagnostics = create<State>((set, get) => ({
           code: typeof m.code === "string" ? m.code : m.code?.value,
         }));
       }
-      const { errors, warnings } = recomputeCounts(updates);
-      set({ byUri: updates, errors, warnings });
+      const byUri = mergeDiagnostics(updates, get().projectByUri);
+      const { errors, warnings } = recomputeCounts(byUri);
+      set({ monacoByUri: updates, byUri, errors, warnings });
     };
 
     monaco.editor.onDidChangeMarkers((uris) =>

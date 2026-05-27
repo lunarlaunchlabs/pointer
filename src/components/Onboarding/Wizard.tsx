@@ -6,17 +6,16 @@ import {
   Loader2,
   Server,
   Sparkles,
-  Key,
   ChevronRight,
   AlertCircle,
 } from "lucide-react";
-import { ipc, type HfTokenStatus } from "@/lib/ipc";
+import { ipc } from "@/lib/ipc";
 import { useSettings } from "@/store/settings";
 import { usePulls } from "@/store/pulls";
 import { confirm } from "@/components/Confirm";
 
-type Step = "intro" | "ollama" | "hf" | "models" | "done";
-const ORDER: Step[] = ["intro", "ollama", "hf", "models", "done"];
+type Step = "intro" | "ollama" | "models" | "done";
+const ORDER: Step[] = ["intro", "ollama", "models", "done"];
 
 export function Onboarding({ onDone }: { onDone: () => void }) {
   const [step, setStep] = useState<Step>("intro");
@@ -24,7 +23,6 @@ export function Onboarding({ onDone }: { onDone: () => void }) {
   // something important (an install, a pull) is happening.
   const [busy, setBusy] = useState(false);
   const setOllamaReady = useSettings((s) => s.setOllamaReady);
-  const setHasHfToken = useSettings((s) => s.setHasHfToken);
 
   const idx = ORDER.indexOf(step);
   const canBack = idx > 0 && step !== "done";
@@ -74,15 +72,6 @@ export function Onboarding({ onDone }: { onDone: () => void }) {
               onBusyChange={setBusy}
               onNext={() => {
                 setOllamaReady(true);
-                setStep("hf");
-              }}
-            />
-          )}
-          {step === "hf" && (
-            <HfStep
-              onBusyChange={setBusy}
-              onNext={(has) => {
-                setHasHfToken(has);
                 setStep("models");
               }}
             />
@@ -122,7 +111,7 @@ export function Onboarding({ onDone }: { onDone: () => void }) {
 }
 
 function Stepper({ step }: { step: Step }) {
-  const order: Step[] = ["intro", "ollama", "hf", "models", "done"];
+  const order: Step[] = ORDER;
   const idx = order.indexOf(step);
   return (
     <div
@@ -166,8 +155,8 @@ function Intro({ onNext }: { onNext: () => void }) {
       </h1>
       <p className="font-sans text-[13px] text-noir-subtext leading-relaxed">
         Pointer is AI-first: chat, inline edit, tab completion, and an agent all
-        run locally via open-source models from Hugging Face. Nothing leaves
-        your machine. Let&apos;s set up your local model in three quick steps.
+        run locally through Ollama models. Nothing leaves your machine.
+        Let&apos;s set up your local model in two quick steps.
       </p>
       <div className="flex justify-end">
         <button onClick={onNext} className="pn-button-accent font-sans flex items-center gap-1.5">
@@ -320,116 +309,6 @@ function OllamaStep({
           className="pn-button-accent font-sans flex items-center gap-1.5 disabled:opacity-40"
         >
           Next <ChevronRight size={12} />
-        </button>
-      </div>
-    </div>
-  );
-}
-
-function HfStep({
-  onNext,
-  onBusyChange,
-}: {
-  onNext: (has: boolean) => void;
-  onBusyChange: (b: boolean) => void;
-}) {
-  const [token, setToken] = useState("");
-  const [status, setStatus] = useState<HfTokenStatus | null>(null);
-  const [saving, setSaving] = useState(false);
-  const [err, setErr] = useState<string | null>(null);
-
-  useEffect(() => {
-    ipc
-      .hfTokenStatus()
-      .then(setStatus)
-      .catch(() =>
-        setStatus({
-          present: false,
-          location: null,
-          preview: null,
-          file_path: null,
-          in_keychain: false,
-          in_file: false,
-        }),
-      );
-  }, []);
-
-  useEffect(() => {
-    onBusyChange(saving);
-    return () => onBusyChange(false);
-  }, [saving, onBusyChange]);
-
-  const save = async () => {
-    if (!token.trim()) {
-      onNext(status?.present ?? false);
-      return;
-    }
-    setSaving(true);
-    setErr(null);
-    try {
-      await ipc.setHfToken(token.trim());
-      const verify = await ipc.hfTokenStatus();
-      setStatus(verify);
-      if (!verify.present) {
-        throw new Error(
-          "Token didn't persist. Re-enter and allow keychain access when prompted.",
-        );
-      }
-      onNext(true);
-    } catch (e) {
-      setErr(e instanceof Error ? e.message : String(e));
-    } finally {
-      setSaving(false);
-    }
-  };
-
-  return (
-    <div className="space-y-4">
-      <div className="flex items-center gap-3">
-        <Key size={20} className="text-noir-accent" />
-        <h3 className="font-sans text-[16px] text-noir-text">Hugging Face token (optional)</h3>
-      </div>
-      <p className="font-sans text-[12.5px] text-noir-subtext leading-relaxed">
-        Most coder models are public and don&apos;t need a token. Provide one if
-        you want to pull gated GGUFs straight from Hugging Face (e.g., Llama or
-        Gemma). Stored in your OS keychain when available, otherwise a 0600 file
-        in the app data dir.
-      </p>
-      {status?.present && (
-        <div className="rounded-md border border-noir-ok/30 bg-noir-ok/5 px-3 py-2 text-[12px] font-sans text-noir-ok flex items-center gap-2">
-          <Check size={12} />
-          A token is already saved
-          {status.preview && (
-            <code className="font-mono text-[11px] text-noir-subtext bg-noir-canvas/40 border border-noir-line/60 rounded px-1.5 py-[1px]">
-              {status.preview}
-            </code>
-          )}
-          <span className="text-noir-mute">· {status.location}</span>
-        </div>
-      )}
-      <input
-        type="password"
-        value={token}
-        onChange={(e) => setToken(e.target.value)}
-        placeholder={status?.present ? "Update token (leave empty to keep)" : "hf_..."}
-        className="pn-input w-full font-mono"
-        aria-label="Hugging Face access token"
-        autoComplete="off"
-        spellCheck={false}
-      />
-      {err && (
-        <div className="text-[11px] text-noir-err font-sans flex items-center gap-1">
-          <AlertCircle size={11} />
-          {err}
-        </div>
-      )}
-      <div className="flex justify-between">
-        <button onClick={() => onNext(status?.present ?? false)} className="pn-button font-sans">
-          Skip
-        </button>
-        <button onClick={save} disabled={saving} className="pn-button-accent font-sans flex items-center gap-1.5">
-          {saving && <Loader2 size={11} className="animate-spin" />}
-          Save & continue
         </button>
       </div>
     </div>

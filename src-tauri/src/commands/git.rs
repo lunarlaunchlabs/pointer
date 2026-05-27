@@ -60,7 +60,7 @@ pub struct GitFileEntry {
     pub unstaged: bool,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct GitStatus {
     /// `true` when the workspace is a git repo (or inside one).
     pub is_repo: bool,
@@ -83,21 +83,6 @@ pub struct GitStatus {
     /// The UI uses this to silently degrade instead of showing scary
     /// errors on machines without git.
     pub error: Option<String>,
-}
-
-impl Default for GitStatus {
-    fn default() -> Self {
-        Self {
-            is_repo: false,
-            branch: None,
-            ahead: None,
-            behind: None,
-            files: HashMap::new(),
-            entries: Vec::new(),
-            dirty_count: 0,
-            error: None,
-        }
-    }
 }
 
 /// Return git status for `workspace`. Always returns a value — failure
@@ -129,9 +114,10 @@ fn compute_status(workspace: &str) -> GitStatus {
             // a system condition we want to surface in logs, the latter is
             // routine.
             if e.contains("ENOENT") || e.to_lowercase().contains("not found") {
-                let mut s = GitStatus::default();
-                s.error = Some("git binary not found in PATH".into());
-                return s;
+                return GitStatus {
+                    error: Some("git binary not found in PATH".into()),
+                    ..Default::default()
+                };
             }
             return GitStatus::default();
         }
@@ -191,12 +177,7 @@ fn compute_status(workspace: &str) -> GitStatus {
 
 /// Parse one porcelain=v2 record. The format is documented at
 /// <https://git-scm.com/docs/git-status#_porcelain_format_version_2>.
-fn parse_porcelain_line(
-    line: &str,
-    status: &mut GitStatus,
-    toplevel: &str,
-    workspace: &str,
-) {
+fn parse_porcelain_line(line: &str, status: &mut GitStatus, toplevel: &str, workspace: &str) {
     let first = line.chars().next().unwrap_or(' ');
     match first {
         '#' => {
@@ -294,13 +275,7 @@ fn parse_porcelain_line(
     }
 }
 
-fn insert_status(
-    status: &mut GitStatus,
-    xy: &str,
-    path: &str,
-    toplevel: &str,
-    workspace: &str,
-) {
+fn insert_status(status: &mut GitStatus, xy: &str, path: &str, toplevel: &str, workspace: &str) {
     // XY: first char = staged, second char = worktree.
     let x = xy.chars().next().unwrap_or('.');
     let y = xy.chars().nth(1).unwrap_or('.');
@@ -401,11 +376,7 @@ pub async fn git_commit(workspace: String, message: String) -> Result<String, St
     if message.trim().is_empty() {
         return Err("commit message can't be empty".into());
     }
-    git_blocking(
-        workspace,
-        vec!["commit".into(), "-m".into(), message],
-    )
-    .await
+    git_blocking(workspace, vec!["commit".into(), "-m".into(), message]).await
 }
 
 #[tauri::command]
@@ -457,7 +428,11 @@ pub async fn git_branches(workspace: String) -> Result<Vec<GitBranch>, String> {
             current: head == "*",
             remote: false,
             last_commit,
-            upstream: if upstream.is_empty() { None } else { Some(upstream) },
+            upstream: if upstream.is_empty() {
+                None
+            } else {
+                Some(upstream)
+            },
         });
     }
     Ok(branches)
@@ -575,10 +550,7 @@ pub struct GitBlameLine {
 /// blame info (e.g. brand-new files) — callers treat that as "no
 /// blame to show" without erroring.
 #[tauri::command]
-pub async fn git_blame_file(
-    workspace: String,
-    path: String,
-) -> Result<Vec<GitBlameLine>, String> {
+pub async fn git_blame_file(workspace: String, path: String) -> Result<Vec<GitBlameLine>, String> {
     let workspace_clone = workspace.clone();
     let path_clone = path.clone();
     tokio::task::spawn_blocking(move || {
@@ -600,8 +572,7 @@ pub async fn git_blame_file(
             }
             return Err(err.trim().to_string());
         }
-        parse_blame_porcelain(&String::from_utf8_lossy(&out.stdout))
-            .map_err(|e| e.to_string())
+        parse_blame_porcelain(&String::from_utf8_lossy(&out.stdout)).map_err(|e| e.to_string())
     })
     .await
     .map_err(|e| e.to_string())?

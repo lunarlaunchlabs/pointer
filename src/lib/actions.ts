@@ -4,11 +4,11 @@
  * Everything an IDE user can trigger — from the native menu bar, the command
  * palette, a keyboard shortcut, the welcome screen, or a chrome button —
  * ultimately resolves to one of these named actions. Each handler is a small
- * window-scoped pub-sub subscription so React components can register
- * themselves without prop-drilling, and the macOS native menu can fire any
- * action without knowing which component owns it.
+ * app-scoped pub-sub subscription so React components can register themselves
+ * without prop-drilling, and the macOS native menu can fire any action without
+ * knowing which component owns it.
  *
- * Why a CustomEvent bus instead of Zustand? Some actions (open palette, focus
+ * Why a module-local bus instead of Zustand? Some actions (open palette, focus
  * inline edit, etc.) are *transient view triggers*, not state updates. A bus
  * keeps view triggers out of persisted state and avoids needless re-renders.
  */
@@ -58,6 +58,8 @@ export type ActionId =
   | "editor:insert_uuid"
   | "editor:insert_datetime"
   | "editor:goto_line"
+  | "editor:goto_definition"
+  | "editor:peek_definition"
   | "editor:goto_symbol_file"
   | "editor:goto_symbol_workspace"
   | "editor:toggle_indent"
@@ -67,6 +69,7 @@ export type ActionId =
   | "editor:rename_symbol"
   | "editor:next_problem"
   | "editor:prev_problem"
+  | "diagnostics:run_project_check"
   // tabs
   | "tabs:reopen_closed"
   | "tabs:close_others"
@@ -142,19 +145,25 @@ export type ActionId =
   | "help:about"
   | "help:notifications";
 
-const EVENT = "pointer:action";
+type ActionListener = (id: ActionId) => void;
+
+const listeners: (ActionListener | null)[] = [];
 
 /** Fire an action. Anyone subscribed via `onAction(id, fn)` will run. */
 export function dispatchAction(id: ActionId): void {
-  window.dispatchEvent(new CustomEvent(EVENT, { detail: { id } }));
+  for (let i = 0; i < listeners.length; i++) {
+    listeners[i]?.(id);
+  }
 }
 
 /** Subscribe to a specific action. Returns an unsubscribe function. */
 export function onAction(id: ActionId, fn: () => void): () => void {
-  const handler = (e: Event) => {
-    const ce = e as CustomEvent<{ id: ActionId }>;
-    if (ce.detail?.id === id) fn();
+  const handler: ActionListener = (actionId) => {
+    if (actionId === id) fn();
   };
-  window.addEventListener(EVENT, handler);
-  return () => window.removeEventListener(EVENT, handler);
+  const index = listeners.length;
+  listeners[index] = handler;
+  return () => {
+    listeners[index] = null;
+  };
 }

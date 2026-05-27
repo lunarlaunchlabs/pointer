@@ -1,8 +1,8 @@
 /**
  * Model fitness scoring.
  *
- * Local model names follow a few stable conventions (Ollama tags, HF
- * naming) that tell us a lot about what a model is *for*: `-base` vs
+ * Local model names follow a few stable Ollama tag conventions that tell us
+ * a lot about what a model is *for*: `-base` vs
  * `-instruct`, `embed` in the name, the presence of `coder`, `llava`,
  * etc. The same model can technically be loaded for any purpose, but most
  * mismatches produce wasted requests and surprising output — e.g. a
@@ -21,7 +21,7 @@
  * assign whatever they want; we just keep them informed.
  *
  * The lists below are curated by hand from the most-pulled families on
- * Ollama / Hugging Face (Q2 2026). They're matched as case-insensitive
+ * Ollama. They're matched as case-insensitive
  * substrings against the model name so a tag like `qwen2.5-coder:7b` and
  * `qwen2.5-coder:14b-instruct-q4_K_M` both resolve correctly.
  */

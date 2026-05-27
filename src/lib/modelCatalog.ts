@@ -1,20 +1,17 @@
 /**
- * Curated catalog of Ollama-pullable open-source models.
+ * Curated fallback/enrichment catalog of Ollama-pullable open-source models.
  *
- * This is the source of truth for the in-app Model Marketplace. We
- * deliberately keep it as static frontend data (not a remote fetch)
- * because:
+ * Runtime marketplace rows are fetched from Ollama's upstream library when
+ * available. This file remains useful for offline fallback and richer metadata
+ * for the hand-picked models Pointer knows are worth highlighting.
  *
- *   1. The marketplace must work offline — users will read this list
- *      while Ollama is still being installed and the network is the
- *      *thing they're trying to avoid relying on*.
+ *   1. The marketplace must still work offline while Ollama or the network is
+ *      being set up.
  *   2. We need rich, hand-tuned metadata (license, RAM heuristics, quality
- *      rank, fit hints) that's not available from any single upstream API
- *      — Ollama's registry has tag names, HF has model cards, neither has
- *      both.
- *   3. Curation is part of the product. The marketplace deliberately
- *      surfaces the ~50 models we know are worth a developer's time
- *      rather than the 700,000 random GGUFs on HuggingFace.
+ *      rank, fit hints) that's not fully represented on the public library
+ *      index.
+ *   3. Curation remains part of the product: upstream supplies breadth, this
+ *      file supplies good defaults and precise recommendations.
  *
  * Numbers come from:
  *   - Disk size: actual Q4_K_M file size when known, else `params * 0.6`
@@ -30,7 +27,7 @@
 
 import type { AiFeature } from "@/store/settings";
 
-export type ModelSource = "ollama" | "hf-gguf";
+export type ModelSource = "ollama";
 
 export type CatalogEntry = {
   /** Exact Ollama tag, e.g. "qwen2.5-coder:7b-instruct". Pull via `ollama pull <id>`. */
@@ -73,6 +70,14 @@ export type CatalogEntry = {
   source: ModelSource;
   /** Free-text tags used by the search ranker. */
   tags: string[];
+  /** Pull count shown by the upstream Ollama library, when fetched live. */
+  pulls?: string | null;
+  /** Relative update text shown by the upstream Ollama library, when fetched live. */
+  updated?: string | null;
+  /** Input modalities advertised upstream. */
+  inputTypes?: string[];
+  /** True when this row came from the live Ollama library fetch. */
+  upstream?: boolean;
 };
 
 // ---------------------------------------------------------------------------
@@ -626,6 +631,59 @@ export const CATALOG: CatalogEntry[] = ALL_FAMILIES.flat();
 /** Quick lookup by id — falls back to undefined for unknown tags. */
 export function getCatalogEntry(id: string): CatalogEntry | undefined {
   return CATALOG.find((e) => e.id === id);
+}
+
+/**
+ * Prefer the live Ollama library rows, then add curated rows that are missing
+ * from the upstream scrape (notably precise base/instruct tags). When the same
+ * id appears in both places, keep the upstream freshness but preserve our
+ * richer hand-authored category and license hints.
+ */
+export function mergeWithCuratedCatalog(upstream: CatalogEntry[]): CatalogEntry[] {
+  const byId = new Map<string, CatalogEntry>();
+  for (const entry of upstream) {
+    byId.set(entry.id, entry);
+  }
+  for (const curated of CATALOG) {
+    const live = byId.get(curated.id);
+    if (!live) {
+      byId.set(curated.id, curated);
+      continue;
+    }
+    byId.set(curated.id, {
+      ...live,
+      displayName: curated.displayName || live.displayName,
+      publisher: live.publisher || curated.publisher,
+      params: curated.params,
+      diskGb: curated.diskGb,
+      minRamGb: curated.minRamGb,
+      recommendedRamGb: curated.recommendedRamGb,
+      contextTokens: curated.contextTokens,
+      quantization: curated.quantization,
+      categories: unionAiFeatures(live.categories, curated.categories),
+      primaryCategory: curated.primaryCategory,
+      license:
+        live.license && live.license !== "Ollama library"
+          ? live.license
+          : curated.license,
+      description: curated.description || live.description,
+      strengths: curated.strengths.length > 0 ? curated.strengths : live.strengths,
+      weaknesses: curated.weaknesses.length > 0 ? curated.weaknesses : live.weaknesses,
+      qualityRank: Math.min(live.qualityRank, curated.qualityRank),
+      popularityRank: Math.min(live.popularityRank, curated.popularityRank),
+      tags: unionStrings(live.tags, curated.tags),
+      upstream: live.upstream,
+    });
+  }
+  return Array.from(byId.values());
+}
+
+function unionAiFeatures(a: AiFeature[], b: AiFeature[]): AiFeature[] {
+  return Array.from(new Set([...a, ...b]));
+}
+
+function unionStrings(a: string[], b: string[]): string[] {
+  return Array.from(new Set([...a, ...b]));
 }
 
 /** Convenience: how many entries the marketplace will show by default. */

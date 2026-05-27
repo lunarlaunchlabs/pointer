@@ -11,7 +11,9 @@
 //! the OS and don't surface as menu events.
 
 use tauri::{
-    menu::{AboutMetadataBuilder, MenuBuilder, MenuItemBuilder, PredefinedMenuItem, SubmenuBuilder},
+    menu::{
+        AboutMetadataBuilder, MenuBuilder, MenuItemBuilder, PredefinedMenuItem, SubmenuBuilder,
+    },
     AppHandle, Emitter, Runtime,
 };
 
@@ -45,10 +47,7 @@ pub fn install<R: Runtime>(app: &AppHandle<R>) -> tauri::Result<()> {
                 .accelerator("CmdOrCtrl+Shift+,")
                 .build(app)?,
         )
-        .item(
-            &MenuItemBuilder::with_id("app:onboarding", "Setup / Onboarding…")
-                .build(app)?,
-        )
+        .item(&MenuItemBuilder::with_id("app:onboarding", "Setup / Onboarding…").build(app)?)
         .separator()
         .item(&PredefinedMenuItem::services(app, Some("Services"))?)
         .separator()
@@ -114,7 +113,10 @@ pub fn install<R: Runtime>(app: &AppHandle<R>) -> tauri::Result<()> {
                 .accelerator("CmdOrCtrl+Shift+T")
                 .build(app)?,
         )
-        .item(&PredefinedMenuItem::close_window(app, Some("Close Window"))?)
+        .item(&PredefinedMenuItem::close_window(
+            app,
+            Some("Close Window"),
+        )?)
         .build()?;
 
     // ── Edit ────────────────────────────────────────────────────────────
@@ -144,6 +146,16 @@ pub fn install<R: Runtime>(app: &AppHandle<R>) -> tauri::Result<()> {
                 .build(app)?,
         )
         .item(
+            &MenuItemBuilder::with_id("editor:goto_definition", "Go to Definition")
+                .accelerator("F12")
+                .build(app)?,
+        )
+        .item(
+            &MenuItemBuilder::with_id("editor:peek_definition", "Peek Definition")
+                .accelerator("Alt+F12")
+                .build(app)?,
+        )
+        .item(
             &MenuItemBuilder::with_id("editor:goto_symbol_file", "Go to Symbol in File…")
                 .accelerator("CmdOrCtrl+Shift+O")
                 .build(app)?,
@@ -153,10 +165,7 @@ pub fn install<R: Runtime>(app: &AppHandle<R>) -> tauri::Result<()> {
                 .accelerator("CmdOrCtrl+Shift+I")
                 .build(app)?,
         )
-        .item(
-            &MenuItemBuilder::with_id("editor:rename_symbol", "Rename Symbol")
-                .build(app)?,
-        )
+        .item(&MenuItemBuilder::with_id("editor:rename_symbol", "Rename Symbol").build(app)?)
         .build()?;
 
     // ── AI ──────────────────────────────────────────────────────────────
@@ -174,36 +183,18 @@ pub fn install<R: Runtime>(app: &AppHandle<R>) -> tauri::Result<()> {
                 .accelerator("CmdOrCtrl+L")
                 .build(app)?,
         )
-        .item(
-            &MenuItemBuilder::with_id("ai:assistant_ask", "Assistant: Ask Mode")
-                .build(app)?,
-        )
-        .item(
-            &MenuItemBuilder::with_id("ai:assistant_plan", "Assistant: Plan Mode")
-                .build(app)?,
-        )
-        .item(
-            &MenuItemBuilder::with_id("ai:assistant_agent", "Assistant: Agent Mode")
-                .build(app)?,
-        )
-        .item(
-            &MenuItemBuilder::with_id("ai:show_history", "Show History")
-                .build(app)?,
-        )
-        .item(
-            &MenuItemBuilder::with_id("ai:show_ai", "AI Control Panel")
-                .build(app)?,
-        )
+        .item(&MenuItemBuilder::with_id("ai:assistant_ask", "Assistant: Ask Mode").build(app)?)
+        .item(&MenuItemBuilder::with_id("ai:assistant_plan", "Assistant: Plan Mode").build(app)?)
+        .item(&MenuItemBuilder::with_id("ai:assistant_agent", "Assistant: Agent Mode").build(app)?)
+        .item(&MenuItemBuilder::with_id("ai:show_history", "Show History").build(app)?)
+        .item(&MenuItemBuilder::with_id("ai:show_ai", "AI Control Panel").build(app)?)
         .separator()
         .item(
             &MenuItemBuilder::with_id("ai:inline_edit", "Inline Edit Selection")
                 .accelerator("CmdOrCtrl+K")
                 .build(app)?,
         )
-        .item(
-            &MenuItemBuilder::with_id("ai:index_workspace", "Index Workspace")
-                .build(app)?,
-        )
+        .item(&MenuItemBuilder::with_id("ai:index_workspace", "Index Workspace").build(app)?)
         .separator()
         .item(
             &MenuItemBuilder::with_id("ai:toggle_feature_chat", "Enable / Disable Chat")
@@ -232,10 +223,7 @@ pub fn install<R: Runtime>(app: &AppHandle<R>) -> tauri::Result<()> {
             .build(app)?,
         )
         .separator()
-        .item(
-            &MenuItemBuilder::with_id("ai:toggle_ollama", "Start / Stop Ollama")
-                .build(app)?,
-        )
+        .item(&MenuItemBuilder::with_id("ai:toggle_ollama", "Start / Stop Ollama").build(app)?)
         .build()?;
 
     // ── View ────────────────────────────────────────────────────────────
@@ -245,10 +233,7 @@ pub fn install<R: Runtime>(app: &AppHandle<R>) -> tauri::Result<()> {
                 .accelerator("CmdOrCtrl+B")
                 .build(app)?,
         )
-        .item(
-            &MenuItemBuilder::with_id("view:toggle_dock", "Toggle Right Panel")
-                .build(app)?,
-        )
+        .item(&MenuItemBuilder::with_id("view:toggle_dock", "Toggle Right Panel").build(app)?)
         .item(
             &MenuItemBuilder::with_id("view:toggle_terminal", "Toggle Terminal")
                 .accelerator("CmdOrCtrl+J")
@@ -276,10 +261,7 @@ pub fn install<R: Runtime>(app: &AppHandle<R>) -> tauri::Result<()> {
             &MenuItemBuilder::with_id("view:reveal_in_tree", "Reveal Active File in Tree")
                 .build(app)?,
         )
-        .item(
-            &MenuItemBuilder::with_id("view:toggle_minimap", "Toggle Minimap")
-                .build(app)?,
-        )
+        .item(&MenuItemBuilder::with_id("view:toggle_minimap", "Toggle Minimap").build(app)?)
         .item(
             &MenuItemBuilder::with_id("view:toggle_word_wrap", "Toggle Word Wrap")
                 .accelerator("Alt+Z")
@@ -302,7 +284,10 @@ pub fn install<R: Runtime>(app: &AppHandle<R>) -> tauri::Result<()> {
                 .build(app)?,
         )
         .separator()
-        .item(&PredefinedMenuItem::fullscreen(app, Some("Enter Full Screen"))?)
+        .item(&PredefinedMenuItem::fullscreen(
+            app,
+            Some("Enter Full Screen"),
+        )?)
         .build()?;
 
     // ── Source Control ─────────────────────────────────────────────────
@@ -323,24 +308,18 @@ pub fn install<R: Runtime>(app: &AppHandle<R>) -> tauri::Result<()> {
         .item(&PredefinedMenuItem::minimize(app, Some("Minimize"))?)
         .item(&PredefinedMenuItem::maximize(app, Some("Zoom"))?)
         .separator()
-        .item(&PredefinedMenuItem::bring_all_to_front(app, Some("Bring All to Front"))?)
+        .item(&PredefinedMenuItem::bring_all_to_front(
+            app,
+            Some("Bring All to Front"),
+        )?)
         .build()?;
 
     // ── Help ────────────────────────────────────────────────────────────
     let help_menu = SubmenuBuilder::new(app, "Help")
-        .item(
-            &MenuItemBuilder::with_id("help:shortcuts", "Keyboard Shortcuts…")
-                .build(app)?,
-        )
+        .item(&MenuItemBuilder::with_id("help:shortcuts", "Keyboard Shortcuts…").build(app)?)
         .separator()
-        .item(
-            &MenuItemBuilder::with_id("help:onboarding", "Re-run Setup")
-                .build(app)?,
-        )
-        .item(
-            &MenuItemBuilder::with_id("help:docs", "Documentation")
-                .build(app)?,
-        )
+        .item(&MenuItemBuilder::with_id("help:onboarding", "Re-run Setup").build(app)?)
+        .item(&MenuItemBuilder::with_id("help:docs", "Documentation").build(app)?)
         .build()?;
 
     let menu = MenuBuilder::new(app)
@@ -365,10 +344,7 @@ pub fn install<R: Runtime>(app: &AppHandle<R>) -> tauri::Result<()> {
     app.on_menu_event(move |_app, event| {
         let id = event.id().0.as_str().to_string();
         // Marker for menu-bar events so the frontend doesn't have to grep ids.
-        let _ = handle.emit(
-            "menu:action",
-            serde_json::json!({ "id": id }),
-        );
+        let _ = handle.emit("menu:action", serde_json::json!({ "id": id }));
     });
 
     Ok(())

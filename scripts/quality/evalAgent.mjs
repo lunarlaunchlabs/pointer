@@ -27,7 +27,7 @@ import path from "node:path";
 import { spawnSync } from "node:child_process";
 import { chat, runJsCases, checkJsSyntax, bar, emoji } from "./lib.mjs";
 
-const SYSTEM_PROMPT = fs.readFileSync(
+export const SYSTEM_PROMPT = fs.readFileSync(
   path.resolve(process.cwd(), "src-tauri/prompts/agent_system.txt"),
   "utf-8",
 );
@@ -37,6 +37,10 @@ const SYSTEM_PROMPT = fs.readFileSync(
 // ─────────────────────────────────────────────────────────────────
 
 const TOOLS = [
+  "edit_file",
+  "rename_symbol",
+  "discover",
+  "run_check",
   "read_file",
   "list_dir",
   "glob",
@@ -48,6 +52,7 @@ const TOOLS = [
   "delete_path",
   "rename_path",
   "run_shell",
+  "mcp_call",
   "task",
 ];
 
@@ -57,7 +62,7 @@ const TOOLS = [
  * unsupported (binary, too big, unknown ext). Mirrors the
  * production extract_definitions logic exactly.
  */
-function extractDefinitions(text, ext) {
+export function extractDefinitions(text, ext) {
   if (text == null || text.length > 512 * 1024) return null;
   const lang =
     ["ts", "tsx", "js", "jsx", "mjs", "cjs"].includes(ext) ? "js"
@@ -112,14 +117,19 @@ function extractDefinitions(text, ext) {
 }
 
 const READ_ONLY_TOOLS = new Set([
+  "discover",
+  "run_check",
   "read_file",
   "list_dir",
   "glob",
   "grep",
   "search_codebase",
+  "list_code_definition_names",
 ]);
 
 const MUTATING_TOOLS = new Set([
+  "edit_file",
+  "rename_symbol",
   "write_file",
   "apply_diff",
   "delete_path",
@@ -134,9 +144,14 @@ const PLAN_FORBIDDEN = new Set([
   ...MUTATING_TOOLS,
   "task",
   "run_shell",
+  "run_check",
 ]);
 
 function parseToolCall(s) {
+  return parseToolCallWithSpan(s)?.call ?? null;
+}
+
+function parseToolCallWithSpan(s) {
   let best = null;
   for (const t of TOOLS) {
     const needle = `<${t}`;
@@ -152,14 +167,34 @@ function parseToolCall(s) {
   const selfClose = header.trimEnd().endsWith("/");
   const bodyStart = best.idx + headerEnd + 1;
   let body = "";
+  let end;
   if (!selfClose) {
     const closeTag = `</${best.tag}>`;
     const closeIdx = s.indexOf(closeTag, bodyStart);
     if (closeIdx === -1) return null;
     body = s.slice(bodyStart, closeIdx).replace(/^\n+|\n+$/g, "");
+    end = closeIdx + closeTag.length;
+  } else {
+    end = best.idx + headerEnd + 1;
   }
   const attrs = parseAttrs(header.slice(1 + best.tag.length));
-  return { tool: best.tag, attrs, body };
+  return {
+    call: { tool: best.tag, attrs, body },
+    start: best.idx,
+    end,
+  };
+}
+
+function transcriptTurnForExecutedTool(s, parsed) {
+  if (!parsed) return { content: s, ignoredExtraTags: false };
+  const content = s.slice(0, parsed.end);
+  const rest = s.slice(parsed.end);
+  return { content, ignoredExtraTags: hasExecutableTag(rest) };
+}
+
+function hasExecutableTag(s) {
+  const names = [...TOOLS, "final", "clarify", "tool_result", "verifier", "budget_bump"];
+  return names.some((name) => s.includes(`<${name}`));
 }
 
 function parseAttrs(s) {
@@ -213,10 +248,116 @@ function detectClarify(s) {
   // parsed by the time we get here), accept it as an implicit
   // clarify. This handles small models that forget the tag.
   const trimmed = s.trim();
-  const hasOtherTags = /<(read_file|list_dir|glob|grep|search_codebase|write_file|apply_diff|delete_path|rename_path|run_shell|task|final|plan|think)\b/.test(trimmed);
+  const hasOtherTags = hasExecutableTag(trimmed) || /<(plan|think)\b/.test(trimmed);
   if (!hasOtherTags && trimmed.length > 0 && looksLikeQuestion(trimmed)) {
     return trimmed;
   }
+  return null;
+}
+
+function extractBlocks(s, tag) {
+  const re = new RegExp(`<${tag}\\b[^>]*>([\\s\\S]*?)<\\/${tag}>`, "g");
+  return [...s.matchAll(re)].map((m) => m[1].trim());
+}
+
+function planLooksLikeDiscoveryChecklist(plan) {
+  const lines = plan
+    .split(/\n+/)
+    .map((line) => line.trim())
+    .filter(Boolean);
+  if (lines.length === 0) return false;
+  const discoveryLines = lines.filter((line) =>
+    /\b(examine|look at|read|analyze|inspect|identify|determine|find|figure out|understand|gather|plan the verification|plan verification)\b/i.test(line),
+  ).length;
+  const firstLineIsDiscovery = /\b(examine|look at|read|analyze|inspect|identify|determine|find|figure out|understand|gather)\b/i.test(lines[0] ?? "");
+  const implementationLines = lines.filter((line) =>
+    /\b(edit|update|change|replace|add|remove|reuse|call|pass|wire|fix|verify with|run `|test with)\b/i.test(line),
+  ).length;
+  const hasConcreteVerification =
+    /\b(npm|pnpm|yarn|bun|cargo|pytest|mocha|vitest|jest|go test|mvn|gradle)\b/i.test(plan) ||
+    /\bverify with\b/i.test(plan);
+  return firstLineIsDiscovery || (discoveryLines >= 2 && (implementationLines <= discoveryLines || !hasConcreteVerification));
+}
+
+function planUsesNpmTestForwarding(plan) {
+  return /\bnpm\s+(?:run\s+)?test\s+--\s+\S/i.test(plan);
+}
+
+function planUsesNpmRunScriptWithoutDashDash(plan) {
+  return /\bnpm\s+run\s+test:[\w-]+\s+(?!--\s)\S/i.test(plan);
+}
+
+function planUsesBareJsTestRunner(plan) {
+  const lower = plan.toLowerCase();
+  const usesBareRunner =
+    /(^|[`;\n\s])(vitest|jest|mocha)\s+(run\s+)?[\w./-]+/i.test(plan);
+  const hasRunnerLauncher =
+    lower.includes("npx vitest") ||
+    lower.includes("npx jest") ||
+    lower.includes("npx mocha") ||
+    lower.includes("npm exec") ||
+    lower.includes("npm run");
+  return usesBareRunner && !hasRunnerLauncher;
+}
+
+function planUsesGenericNpmTestDespiteNamedTest(plan) {
+  const mentionsTestFile =
+    /\btest\/[\w./-]+\.(?:cjs|mjs|js|jsx|ts|tsx)\b/i.test(plan) ||
+    /\b[\w./-]+\.test\.(?:cjs|mjs|js|jsx|ts|tsx)\b/i.test(plan);
+  const usesGenericNpmTest = /\bnpm\s+(?:run\s+)?test\b/i.test(plan) && !planUsesNpmTestForwarding(plan);
+  return mentionsTestFile && usesGenericNpmTest;
+}
+
+function planUsesBroadNpmTest(plan) {
+  const usesNpmTest =
+    /\bnpm\s+test(?:\s|$|`|\.)/i.test(plan) ||
+    /\bnpm\s+run\s+test(?:\s|$|`|\.)/i.test(plan);
+  const usesSpecificNpmScript =
+    /\bnpm\s+run\s+test:[\w-]+/i.test(plan) ||
+    /\bnpm\s+run\s+test\s+--\s+[\w./-]+/i.test(plan);
+  return usesNpmTest && !usesSpecificNpmScript;
+}
+
+function planMentionsUiStateWithoutRenderSite(plan) {
+  const lower = plan.toLowerCase();
+  const mentionsUiState =
+    lower.includes("ui") ||
+    lower.includes("overlay") ||
+    lower.includes("showdropoverlay") ||
+    lower.includes("visible") ||
+    lower.includes("render");
+  const namesRenderSite =
+    lower.includes(".vue") ||
+    lower.includes(".tsx") ||
+    lower.includes(".jsx") ||
+    lower.includes(".css") ||
+    lower.includes("drop-overlay");
+  return mentionsUiState && !namesRenderSite;
+}
+
+function planEditsExistingTest(plan) {
+  return /\b(update|edit|change|modify|add)\b[^\n]*\btest\/[\w./-]+\.(?:cjs|mjs|js|jsx|ts|tsx)\b/i.test(plan);
+}
+
+function extractSpecificTestFile(text) {
+  const matches = String(text).match(/\b[\w./-]+\.(?:test|spec)\.(?:cjs|mjs|js|jsx|ts|tsx)\b|\btest\/[\w./-]+\.(?:cjs|mjs|js|jsx|ts|tsx)\b/gi);
+  return matches?.[0]?.replace(/^[`'"]|[`'",.)]+$/g, "") ?? null;
+}
+
+function narrowVerificationCommandHint(fs_, plan) {
+  const file = extractSpecificTestFile(plan);
+  if (!file || !fs_?.has?.("package.json")) return null;
+  let pkgText = "";
+  try {
+    pkgText = fs_.read("package.json").toLowerCase();
+  } catch {
+    return null;
+  }
+
+  if (pkgText.includes("vitest")) return `npx vitest run ${file}`;
+  if (pkgText.includes("mocha")) return `npx mocha ${file}`;
+  if (pkgText.includes("jest")) return `npx jest ${file}`;
+  if (pkgText.includes("node --test")) return `node --test ${file}`;
   return null;
 }
 
@@ -227,11 +368,67 @@ function looksLikeQuestion(s) {
   );
 }
 
+const SOURCE_HYGIENE_MUTATORS = new Set(["apply_diff", "edit_file", "write_file"]);
+
+function hasStaleMarkerWord(s) {
+  return s
+    .split(/[^A-Za-z0-9_]+/)
+    .some((word) => /^(BUG|TODO|FIXME)$/i.test(word));
+}
+
+function normalizeMarkerLine(s) {
+  return s.trim().replace(/\s+/g, " ");
+}
+
+function goalLooksLikeBugFix(goal) {
+  return /\b(bug|fix|regression|broken|failing|failure|incorrect|wrong|stale)\b/i.test(goal);
+}
+
+function sourceHygieneIssue(fs_, call, goal) {
+  const p = call.attrs.path;
+  if (!p || !SOURCE_HYGIENE_MUTATORS.has(call.tool) || !goalLooksLikeBugFix(goal)) return null;
+
+  const copiedMarkerLines = call.body
+    .split(/\r?\n/)
+    .map(normalizeMarkerLine)
+    .filter((line) => line && hasStaleMarkerWord(line));
+  if (copiedMarkerLines.length === 0) return null;
+
+  let text;
+  try {
+    text = fs_.read(p);
+  } catch {
+    return null;
+  }
+
+  const retained = [];
+  const sourceMarkers = new Set(copiedMarkerLines);
+  text.split(/\r?\n/).forEach((line, index) => {
+    const normalized = normalizeMarkerLine(line);
+    if (hasStaleMarkerWord(normalized) && sourceMarkers.has(normalized)) {
+      retained.push({ line: index + 1, text: line.trim() });
+    }
+  });
+  if (retained.length === 0) return null;
+
+  const preview = retained
+    .slice(0, 5)
+    .map((item) => `${p}:${item.line}: ${item.text}`)
+    .join("\n");
+  return {
+    path: p,
+    text:
+      `source hygiene issue: \`${p}\` still contains stale BUG/TODO/FIXME marker(s) copied from the edited code:\n` +
+      `${preview}\n` +
+      "Remove or replace these stale markers before finalizing; tests passing is not enough while the edited source still describes the old bug.",
+  };
+}
+
 // ─────────────────────────────────────────────────────────────────
 // Tool runtime against an in-memory file map.
 // ─────────────────────────────────────────────────────────────────
 
-class VirtualFs {
+export class VirtualFs {
   constructor(initial) {
     this.files = new Map(Object.entries(initial));
     this.deleted = new Set();
@@ -394,7 +591,7 @@ function whitespaceMatch(fileContent, search) {
   return { idx: startRaw, end: endRaw };
 }
 
-function applyDiffBody(body, fileContent) {
+export function applyDiffBody(body, fileContent) {
   const re =
     /<<<<<<<\s*SEARCH\s*\n([\s\S]*?)\n?=======\n([\s\S]*?)\n>>>>>>>\s*REPLACE/g;
   let m;
@@ -447,7 +644,7 @@ function applyDiffBody(body, fileContent) {
  * by exposing wait_for= to scenarios. Keep this in sync with
  * src-tauri/src/commands/agent.rs.
  */
-function blockingCommandRefusal(cmd) {
+export function blockingCommandRefusal(cmd) {
   let s = String(cmd).trim();
   while (true) {
     const before = s;
@@ -500,7 +697,7 @@ function blockingCommandRefusal(cmd) {
  * reload any files that changed. This lets `run_shell` actually
  * execute commands like `node --test` against the agent's edits.
  */
-function runShell(fs_, cmd, timeoutMs = 15000) {
+export function runShell(fs_, cmd, timeoutMs = 15000) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "pointer-agent-"));
   try {
     for (const [p, content] of fs_.files) {
@@ -543,7 +740,82 @@ function walk(dir, cb) {
   }
 }
 
-async function runTool(fs_, call, mode) {
+export function globToRegExp(pat) {
+  return new RegExp(
+    "^" +
+      pat
+        .replace(/[.+^${}()|[\]\\]/g, "\\$&")
+        .replace(/\*\*/g, "@@DOUBLESTAR@@")
+        .replace(/\*/g, "[^/]*")
+        .replace(/@@DOUBLESTAR@@/g, ".*") +
+      "$",
+  );
+}
+
+export function pathMatchesGlob(p, pat) {
+  const re = globToRegExp(pat);
+  if (re.test(p)) return true;
+  if (!pat.includes("/")) return re.test(path.basename(p));
+  return false;
+}
+
+function escapeRegExp(s) {
+  return s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+function extractKeywords(query) {
+  const STOP = new Set([
+    "the", "a", "an", "is", "are", "of", "to", "for", "in", "on",
+    "and", "or", "with", "by", "from", "this", "that", "where", "what",
+    "when", "which", "how", "does", "about", "into", "code", "file",
+    "files", "function", "class", "use", "uses", "using",
+  ]);
+  return [...new Set(
+    query
+      .toLowerCase()
+      .split(/[^a-z0-9_]+/)
+      .filter((t) => t.length > 2 && !STOP.has(t)),
+  )].slice(0, 6);
+}
+
+function detectCheckCommand(fs_) {
+  if (fs_.has("Cargo.toml")) {
+    return { kind: "rust", command: "cargo check --message-format=short" };
+  }
+  if (fs_.has("package.json")) {
+    try {
+      const pkg = JSON.parse(fs_.read("package.json"));
+      const scripts = pkg.scripts ?? {};
+      for (const name of ["check", "typecheck", "type-check", "tsc"]) {
+        if (Object.prototype.hasOwnProperty.call(scripts, name)) {
+          return { kind: "node", command: `npm run ${name}` };
+        }
+      }
+    } catch {}
+    if ([...fs_.files.keys()].some((p) => /^tsconfig.*\.json$/.test(path.basename(p)))) {
+      return { kind: "ts", command: "npx --yes tsc --noEmit" };
+    }
+  }
+  if (fs_.has("pyproject.toml")) {
+    const pyproject = fs_.read("pyproject.toml");
+    if (pyproject.includes("mypy")) {
+      return { kind: "python-mypy", command: "python -m mypy ." };
+    }
+    if (pyproject.includes("ruff")) {
+      return { kind: "python-ruff", command: "python -m ruff check ." };
+    }
+    return {
+      kind: "python-syntax",
+      command: "python -m py_compile $(find . -name '*.py' -not -path './.venv/*')",
+    };
+  }
+  if (fs_.has("go.mod")) {
+    return { kind: "go", command: "go vet ./..." };
+  }
+  return null;
+}
+
+export async function runTool(fs_, call, mode) {
   const { tool, attrs, body } = call;
   // In plan mode, refuse anything that could mutate state — that
   // includes the meta tools (`task`, `run_shell`) since they can
@@ -628,15 +900,7 @@ async function runTool(fs_, call, mode) {
     }
     if (tool === "glob") {
       const pat = body.trim();
-      const re = new RegExp(
-        "^" +
-          pat
-            .replace(/[.+^${}()|[\]\\]/g, "\\$&")
-            .replace(/\*\*/g, "@@DOUBLESTAR@@")
-            .replace(/\*/g, "[^/]*")
-            .replace(/@@DOUBLESTAR@@/g, ".*") +
-          "$",
-      );
+      const re = globToRegExp(pat);
       const matches = [...fs_.files.keys()]
         .filter((k) => !fs_.deleted.has(k))
         .filter((k) => re.test(k));
@@ -658,6 +922,7 @@ async function runTool(fs_, call, mode) {
       const hits = [];
       for (const [p, c] of fs_.files) {
         if (fs_.deleted.has(p)) continue;
+        if (attrs.glob && !pathMatchesGlob(p, attrs.glob)) continue;
         const lines = c.split("\n");
         for (let i = 0; i < lines.length; i++) {
           if (test(lines[i])) {
@@ -703,11 +968,124 @@ async function runTool(fs_, call, mode) {
           : "(no matches)",
       };
     }
+    if (tool === "discover") {
+      const terms = extractKeywords(body);
+      if (terms.length === 0) {
+        return { status: "error", text: "discover: no usable search terms" };
+      }
+      const scored = [];
+      for (const [p, c] of fs_.files) {
+        if (fs_.deleted.has(p)) continue;
+        const lower = c.toLowerCase();
+        const snippets = [];
+        let score = 0;
+        for (const term of terms) {
+          const idx = lower.indexOf(term);
+          if (idx === -1) continue;
+          score += 10;
+          const line = c.slice(0, idx).split("\n").length;
+          const text = c.split("\n")[line - 1]?.trim().slice(0, 180) ?? "";
+          snippets.push(`${p}:${line}: ${text}`);
+        }
+        if (score > 0) scored.push({ p, score, snippets });
+      }
+      scored.sort((a, b) => b.score - a.score || a.p.localeCompare(b.p));
+      const top = scored.slice(0, 15);
+      if (top.length === 0) {
+        return {
+          status: "ok",
+          text: `discover: no files mention any of: ${terms.join(", ")}`,
+        };
+      }
+      const lines = [
+        `discover: topic=\`${body.trim()}\`, keywords=[${terms.join(", ")}]`,
+        "",
+        `Top files (${top.length}):`,
+      ];
+      for (const hit of top) {
+        lines.push(`  ${hit.p}  (score ${hit.score})`);
+        for (const s of hit.snippets.slice(0, 2)) lines.push(`    > ${s}`);
+      }
+      const dirs = [...new Set(top.slice(0, 5).map((h) => path.dirname(h.p)).filter((d) => d !== "."))];
+      for (const dir of dirs) {
+        const outline = await runTool(fs_, {
+          tool: "list_code_definition_names",
+          attrs: { path: `${dir}/` },
+          body: "",
+        }, mode);
+        if (outline.status === "ok" && !outline.text.startsWith("(no recognised")) {
+          lines.push("", `Definitions under ${dir}/:`, outline.text.slice(0, 1200));
+        }
+      }
+      return { status: "ok", text: lines.join("\n").slice(0, 8000) };
+    }
+    if (tool === "run_check") {
+      const detected = detectCheckCommand(fs_);
+      if (!detected) {
+        return {
+          status: "error",
+          text:
+            "run_check: could not detect a check command. Looked for Cargo.toml, package.json (scripts.check / scripts.typecheck), pyproject.toml, go.mod. If the user asked for a specific build or test verification, call <run_shell> with that exact one-shot command (for example npm run build or npm test).",
+        };
+      }
+      const r = runShell(fs_, detected.command, 180000);
+      const status = r.code === 0 ? "ok" : "error";
+      const out =
+        `run_check (${detected.kind}): \`${detected.command}\` exited ${r.code}${r.timedOut ? " (timed out)" : ""}\n` +
+        (r.stdout ? `stdout:\n${r.stdout.slice(0, 2000)}\n` : "") +
+        (r.stderr ? `stderr:\n${r.stderr.slice(0, 2000)}\n` : "");
+      return { status, text: out.trim() };
+    }
     if (tool === "write_file") {
       const p = attrs.path;
       if (!p) return { status: "error", text: "missing path attribute" };
       fs_.write(p, body);
       return { status: "ok", text: `wrote ${p} (${body.length}B)` };
+    }
+    if (tool === "edit_file") {
+      const result = await runTool(fs_, { tool: "apply_diff", attrs, body }, mode);
+      return {
+        ...result,
+        text: `edit_file: ${result.text}`,
+      };
+    }
+    if (tool === "rename_symbol") {
+      const oldName = attrs.old?.trim();
+      const newName = attrs.new?.trim();
+      const scope = attrs.scope?.trim() || ".";
+      if (!oldName || !newName) {
+        return { status: "error", text: "rename_symbol: missing old/new attribute" };
+      }
+      if (!/^\w+$/.test(oldName) || !/^\w+$/.test(newName)) {
+        return { status: "error", text: "rename_symbol: only word identifiers are supported" };
+      }
+      const re = new RegExp(`\\b${escapeRegExp(oldName)}\\b`, "g");
+      const prefix = scope === "." ? "" : scope.endsWith("/") ? scope : `${scope}/`;
+      let filesTouched = 0;
+      let referencesReplaced = 0;
+      for (const [p, c] of [...fs_.files.entries()]) {
+        if (fs_.deleted.has(p)) continue;
+        if (prefix && !p.startsWith(prefix)) continue;
+        if (attrs.glob && !pathMatchesGlob(p, attrs.glob)) continue;
+        const matches = c.match(re);
+        if (!matches) continue;
+        fs_.write(p, c.replace(re, newName));
+        filesTouched += 1;
+        referencesReplaced += matches.length;
+      }
+      let leftover = 0;
+      for (const [p, c] of fs_.files) {
+        if (fs_.deleted.has(p)) continue;
+        if (prefix && !p.startsWith(prefix)) continue;
+        if (attrs.glob && !pathMatchesGlob(p, attrs.glob)) continue;
+        leftover += c.match(re)?.length ?? 0;
+      }
+      return {
+        status: "ok",
+        text:
+          `rename_symbol: replaced ${referencesReplaced} reference(s) to \`${oldName}\` -> \`${newName}\` ` +
+          `across ${filesTouched} file(s). Verifier leftovers: ${leftover}.`,
+      };
     }
     if (tool === "apply_diff") {
       const p = attrs.path;
@@ -823,6 +1201,13 @@ function envDetailsBlock({ workspace = ".", mode, openTabs, activeFile, step, el
   lines.push("# Mode");
   lines.push(mode);
   lines.push("");
+  if (mode === "plan") {
+    lines.push("# Plan mode allowed actions");
+    lines.push("Allowed: read_file, list_dir, glob, grep, search_codebase, list_code_definition_names, discover, <plan>, <final>, <clarify>.");
+    lines.push("Forbidden: run_shell, run_check, task, write_file, apply_diff, edit_file, rename_symbol, delete_path, rename_path, mcp_call.");
+    lines.push("Mention verification commands in the plan; do not execute them.");
+    lines.push("");
+  }
   lines.push("# OS");
   lines.push(process.platform);
   lines.push("");
@@ -859,7 +1244,16 @@ function attachEnvironmentDetails(messages, env) {
   }
 }
 
-async function driveAgent({ goal, fs_, maxTurns = 10, mode = "auto", openTabs = [], activeFile = null }) {
+export async function driveAgent({
+  goal,
+  fs_,
+  maxTurns = 10,
+  mode = "auto",
+  openTabs = [],
+  activeFile = null,
+  workspace = ".",
+  toolRunner = runTool,
+}) {
   const messages = [
     { role: "user", content: `Mode: ${mode}\n\nGoal:\n${goal}` },
   ];
@@ -869,13 +1263,22 @@ async function driveAgent({ goal, fs_, maxTurns = 10, mode = "auto", openTabs = 
   // Repeated identical calls almost always mean the agent is stuck
   // in a fail loop; we end the run rather than burning turns.
   const callFingerprints = [];
+  let proseRedirectCount = 0;
+  let malformedToolRedirectCount = 0;
+  let planRewriteRedirectUsed = false;
+  let planCommandRedirectUsed = false;
+  let planGenericTestRedirectUsed = false;
+  let planBroadTestRedirectUsed = false;
+  let planQualityRedirectCount = 0;
+  let manifestRead = false;
+  let pendingSourceHygieneIssue = null;
   const runStart = Date.now();
   for (let turn = 0; turn < maxTurns; turn++) {
     // Refresh env block on every turn (Cline pattern, ported to
     // production agent.rs). This is what gives the agent fresh
     // ground truth about what the user is looking at.
     attachEnvironmentDetails(messages, envDetailsBlock({
-      workspace: ".",
+      workspace,
       mode,
       openTabs,
       activeFile,
@@ -901,13 +1304,85 @@ async function driveAgent({ goal, fs_, maxTurns = 10, mode = "auto", openTabs = 
     // final — the model will emit a fresh one next turn with real
     // information. So tool-call takes priority over final/clarify
     // when both appear in one response.
-    const call = parseToolCall(response);
+    const parsedCall = parseToolCallWithSpan(response);
+    const call = parsedCall?.call ?? null;
     const final = detectFinal(response);
     const clarify = detectClarify(response);
+    const latestPlan = extractBlocks(response, "plan").at(-1) ?? "";
+    const needsPlanRewrite =
+      latestPlan && planLooksLikeDiscoveryChecklist(latestPlan);
+    const needsCommandRewrite =
+      latestPlan &&
+      (planUsesNpmTestForwarding(latestPlan) ||
+        planUsesNpmRunScriptWithoutDashDash(latestPlan) ||
+        planUsesBareJsTestRunner(latestPlan));
+    const needsGenericTestRewrite =
+      latestPlan && planUsesGenericNpmTestDespiteNamedTest(latestPlan);
+    const needsBroadTestRewrite =
+      latestPlan && planUsesBroadNpmTest(latestPlan);
+    const needsUiRenderContextRewrite =
+      latestPlan && planMentionsUiStateWithoutRenderSite(latestPlan);
+    const needsTestEditRewrite = latestPlan && planEditsExistingTest(latestPlan);
+    if (
+      !call &&
+      mode === "plan" &&
+      planQualityRedirectCount < 8 &&
+      (needsPlanRewrite || needsCommandRewrite || needsGenericTestRewrite || needsBroadTestRewrite || needsUiRenderContextRewrite || needsTestEditRewrite)
+    ) {
+      planQualityRedirectCount += 1;
+      if (needsPlanRewrite) planRewriteRedirectUsed = true;
+      if (needsCommandRewrite) planCommandRedirectUsed = true;
+      if (needsGenericTestRewrite) planGenericTestRedirectUsed = true;
+      if (needsBroadTestRewrite) planBroadTestRedirectUsed = true;
+      trace[trace.length - 1].planRewriteRedirected = needsPlanRewrite;
+      trace[trace.length - 1].planCommandRedirected = needsCommandRewrite;
+      trace[trace.length - 1].planGenericTestRedirected = needsGenericTestRewrite;
+      trace[trace.length - 1].planBroadTestRedirected = needsBroadTestRewrite;
+      trace[trace.length - 1].planUiRenderContextRedirected = needsUiRenderContextRewrite;
+      trace[trace.length - 1].planTestEditRedirected = needsTestEditRewrite;
+      messages.push({ role: "assistant", content: response });
+      const violations = [
+        needsPlanRewrite ? "it still contains discovery steps instead of implementation steps" : null,
+        needsCommandRewrite ? "it uses an npm script argument form that will not reliably pass the target test file to the runner" : null,
+        needsGenericTestRewrite ? "it names a specific test file but verifies with broad `npm test`" : null,
+        needsBroadTestRewrite ? "it falls back to broad `npm test` instead of naming the narrowest relevant one-shot verification" : null,
+        needsUiRenderContextRewrite ? "it plans a UI state fix without naming the component/style that renders the affected UI" : null,
+        needsTestEditRewrite ? "it proposes editing a test file even though the existing test should be used as the specification" : null,
+      ].filter(Boolean);
+      const content =
+        "Your <plan> is not ready to execute. Fix these violations: " +
+        violations.join("; ") +
+        ". The corrected plan must name exact source file(s), the exact source change, the existing test/spec context, and the narrowest one-shot verification command. " +
+        "For UI work, preserve all gathered evidence categories in the final plan: source file/change, render site, test/spec file, and command. Do not trade one category away when adding another. " +
+        "Do not include discovery steps. Do not edit tests when an existing test already covers the behavior. " +
+        (narrowVerificationCommandHint(fs_, latestPlan)
+          ? `Use this exact verification command in the plan: \`${narrowVerificationCommandHint(fs_, latestPlan)}\`. `
+          : "") +
+        (manifestRead
+          ? "Use the underlying test runner from package.json, preserving required flags and replacing broad test globs with the target test file. If no relevant test/spec file is in context yet, emit exactly one read-only tool call now to find it (for example <glob>src/**/__tests__/*drag*.test.js</glob> or <grep glob=\"src/**/__tests__/*.js\">symbolName</grep>). If a UI state/render site is not in context yet, emit exactly one read-only tool call now to find it (for example <grep>showDropOverlay|drop-overlay</grep>). Otherwise emit only <plan>...</plan> followed by <final>...</final>."
+          : "If package.json is not in context, emit exactly one read-only tool call now: <read_file path=\"package.json\" />. Otherwise emit only <plan>...</plan> followed by <final>...</final>.");
+      messages.push({
+        role: "user",
+        content,
+      });
+      continue;
+    }
     if (call) {
       if (final !== null) trace[trace.length - 1].discardedFinal = final;
       if (clarify !== null) trace[trace.length - 1].discardedClarify = clarify;
     } else if (final !== null) {
+      if (pendingSourceHygieneIssue) {
+        trace[trace.length - 1].blockedFinal = final;
+        trace[trace.length - 1].sourceHygieneBlocked = pendingSourceHygieneIssue;
+        messages.push({ role: "assistant", content: response });
+        messages.push({
+          role: "user",
+          content:
+            `${pendingSourceHygieneIssue.text}\n\n` +
+            "Your final answer is blocked until this is fixed. Emit exactly one mutating tool call to clean the stale source marker or contradictory old code, then run any requested verification if needed.",
+        });
+        continue;
+      }
       trace[trace.length - 1].final = final;
       return { trace, fs: fs_, terminated: "final" };
     } else if (clarify !== null) {
@@ -920,6 +1395,11 @@ async function driveAgent({ goal, fs_, maxTurns = 10, mode = "auto", openTabs = 
       // mode. Send ONE redirect asking for <final>, then loop.
       const hadPlan = /<plan>[\s\S]*?<\/plan>/.test(response);
       const alreadyRedirected = trace.some((t) => t.planRedirected);
+      if (mode === "plan" && hadPlan && latestPlan.trim().length > 0) {
+        trace[trace.length - 1].final = latestPlan;
+        trace[trace.length - 1].planImpliedFinal = true;
+        return { trace, fs: fs_, terminated: "final" };
+      }
       if (hadPlan && !alreadyRedirected) {
         trace[trace.length - 1].planRedirected = true;
         messages.push({ role: "assistant", content: response });
@@ -928,6 +1408,38 @@ async function driveAgent({ goal, fs_, maxTurns = 10, mode = "auto", openTabs = 
           content:
             "Your <plan> looks good. Now emit a <final>…</final> block summarizing the plan in 1–3 sentences so the run can terminate. Use exactly that tag — no other tags, no tool calls.",
         });
+        continue;
+      }
+      const malformedTool = TOOLS.find((name) => response.includes(`<${name}`));
+      if (malformedTool && malformedToolRedirectCount < 2) {
+        malformedToolRedirectCount += 1;
+        trace[trace.length - 1].malformedToolRedirected = malformedTool;
+        messages.push({ role: "assistant", content: response });
+        messages.push({
+          role: "user",
+          content:
+            `Your previous turn looked like a malformed <${malformedTool}> tool call, so nothing was executed. ` +
+            "Emit exactly one complete XML tool block now, with all required attributes and the closing tag when the tool has a body. " +
+            "For apply_diff/edit_file, include complete <<<<<<< SEARCH / ======= / >>>>>>> REPLACE hunks copied from the current file. " +
+            "Do not explain in prose.",
+        });
+        continue;
+      }
+      // Mirror production: forgive one prose-only turn. Local
+      // models sometimes narrate "I'll inspect the files" or paste a
+      // plain markdown plan instead of emitting an executable tag. A
+      // single redirect usually gets them back onto the protocol; a
+      // second prose-only turn is treated by the existing fallbacks
+      // below.
+      if (proseRedirectCount < 2 && response.trim().length > 0) {
+        proseRedirectCount += 1;
+        trace[trace.length - 1].proseRedirected = true;
+        messages.push({ role: "assistant", content: response });
+        const redirect =
+          mode === "plan"
+            ? "Your previous turn was prose only — no tool call, no <plan>, no <final>, no <clarify>. In PLAN MODE, either gather context with exactly one read-only tool call (discover, read_file, list_dir, glob, grep, search_codebase, list_code_definition_names), or if you are ready, emit a <plan> block with exact files/steps/verification followed by a <final> block. The <plan> block is what enables Execute. Do NOT explain further in prose; the harness only acts on tags."
+            : "Your previous turn was prose only — no tool call, no <final>, no <clarify>. If the goal isn't complete yet, emit the NEXT tool call now. If the goal IS complete, emit exactly <final>one-paragraph summary</final> — nothing else. If you're blocked and need user input, emit <clarify>your question</clarify>. Do NOT explain further in prose; the harness only acts on tags.";
+        messages.push({ role: "user", content: redirect });
         continue;
       }
       // Fallback: the model produced pure prose with no XML tags
@@ -940,10 +1452,7 @@ async function driveAgent({ goal, fs_, maxTurns = 10, mode = "auto", openTabs = 
       // mutation.
       const lastTrace = trace.length >= 2 ? trace[trace.length - 2] : null;
       const lastTool = lastTrace?.call?.tool;
-      const wasRead = lastTool && [
-        "read_file", "list_dir", "glob", "grep", "search_codebase",
-        "list_code_definition_names",
-      ].includes(lastTool);
+      const wasRead = lastTool && READ_ONLY_TOOLS.has(lastTool);
       const hasAnyXmlTag = /<[a-z_]+[\s/>]/.test(response);
       const prose = response.trim();
       if (wasRead && !hasAnyXmlTag && prose.length >= 40) {
@@ -994,21 +1503,53 @@ async function driveAgent({ goal, fs_, maxTurns = 10, mode = "auto", openTabs = 
       trace[trace.length - 1].issue = "stuck in tool-call cycle (rule 11)";
       return { trace, fs: fs_, terminated: "stuck" };
     }
-    const result = await runTool(fs_, call, mode);
+    const result = await toolRunner(fs_, call, mode);
     trace[trace.length - 1].result = result;
+    if (
+      result.status === "ok" &&
+      call.tool === "read_file" &&
+      /(^|\/)package\.json$/i.test(call.attrs.path ?? "")
+    ) {
+      manifestRead = true;
+    }
     // Push the SANITIZED version of the model's turn into the
     // transcript so the model doesn't see its own hallucinated
     // tool_result blocks on the next iteration — that loop is
     // the most common way for a confused model to never recover.
-    messages.push({ role: "assistant", content: response });
+    const executedTurn = transcriptTurnForExecutedTool(response, parsedCall);
+    trace[trace.length - 1].ignoredExtraTags = executedTurn.ignoredExtraTags;
+    messages.push({ role: "assistant", content: executedTurn.content });
     const isMutator = MUTATING_TOOLS.has(call.tool);
+    const sourceHygiene =
+      result.status === "ok" && isMutator ? sourceHygieneIssue(fs_, call, goal) : null;
+    if (sourceHygiene) {
+      pendingSourceHygieneIssue = sourceHygiene;
+      trace[trace.length - 1].sourceHygieneIssue = sourceHygiene;
+    } else if (
+      result.status === "ok" &&
+      isMutator &&
+      pendingSourceHygieneIssue?.path &&
+      pendingSourceHygieneIssue.path === call.attrs.path
+    ) {
+      pendingSourceHygieneIssue = null;
+    }
     let toolMessage =
       `<tool_result tool="${call.tool}" status="${result.status}">\n` +
       (result.text ?? "") +
       `\n</tool_result>`;
-    if (result.status === "ok" && isMutator) {
+    if (executedTurn.ignoredExtraTags) {
       toolMessage +=
-        `\n\nThe file change has been APPLIED on disk. If the goal is met, your NEXT turn must be exactly a <final>…</final> block — nothing else, no other tags, no extra tool calls. If more work remains, emit the next tool call instead.`;
+        `\n\n<protocol_note>Only the first tool call from your previous turn was executed. Any later tool calls, invented tool results, or final text in the same turn were ignored. Wait for real tool results and emit exactly one next action.</protocol_note>`;
+    }
+    if (result.status === "ok" && isMutator) {
+      if (sourceHygiene) {
+        toolMessage +=
+          `\n\n<verifier>\n${sourceHygiene.text}\n</verifier>` +
+          `\n\nThe file change has been APPLIED on disk, but the verifier found a source hygiene issue. The goal is NOT met yet. Your NEXT turn must be exactly one mutating tool call that removes the stale marker or contradictory old code — do not emit <final> yet.`;
+      } else {
+        toolMessage +=
+          `\n\nThe file change has been APPLIED on disk. If the user explicitly requested tests/build/checks, the goal is NOT met until that verification command has run successfully; run that one-shot command next instead of finalizing. If the goal is met, your NEXT turn must be exactly a <final>…</final> block — nothing else, no other tags, no extra tool calls. If more work remains, emit the next tool call instead.`;
+      }
     }
     if (result.status === "error" && call.tool === "apply_diff") {
       // Mirror production: differentiate "file doesn't exist" from
@@ -1027,9 +1568,9 @@ async function driveAgent({ goal, fs_, maxTurns = 10, mode = "auto", openTabs = 
           `\n\nThe SEARCH block didn't match the file byte-for-byte. Before retrying, call <read_file path="${call.attrs.path ?? ""}" /> so you have the exact bytes to anchor against.`;
       }
     }
-    if (result.status === "rejected" && mode === "plan") {
+    if (mode === "plan" && PLAN_FORBIDDEN.has(call.tool) && result.status !== "ok") {
       toolMessage +=
-        `\n\nThis is PLAN MODE — mutating tools are forbidden. Emit a <plan> block describing what you'd change, then a <final> block summarizing. Do NOT call mutating tools again on this run.`;
+        `\n\nThis is PLAN MODE — <${call.tool}> is forbidden and was not executed. Do NOT call run_shell, run_check, task, or mutating tools in Plan mode. If you already have the source file, test/spec file, and package.json context, emit a <plan> block with the exact source change and narrow verification command, followed by <final>.`;
     }
     messages.push({ role: "user", content: toolMessage });
   }
@@ -1130,9 +1671,15 @@ async function assess(scenario, runResult, fsBefore) {
         failures.push(`fileContains: ${p} not present`);
         continue;
       }
-      const ok = needle instanceof RegExp ? needle.test(content) : content.includes(needle);
-      if (!ok) {
-        failures.push(`fileContains: ${p} doesn't contain ${String(needle).slice(0, 60)}`);
+      const needles = Array.isArray(needle) ? needle : [needle];
+      for (const n of needles) {
+        const ok = n instanceof RegExp ? n.test(content) : content.includes(n);
+        if (!ok) {
+          const preview = content.slice(0, 240).replace(/\n/g, "⏎");
+          failures.push(
+            `fileContains: ${p} doesn't contain ${String(n).slice(0, 60)}; actual begins: ${preview}`,
+          );
+        }
       }
     }
   }
@@ -1147,6 +1694,24 @@ async function assess(scenario, runResult, fsBefore) {
       }
       if (content !== expected) {
         failures.push(`fileEquals: ${p} differs`);
+      }
+    }
+  }
+  if (x.fileNotContains) {
+    for (const [p, needle] of Object.entries(x.fileNotContains)) {
+      let content;
+      try {
+        content = runResult.fs.read(p);
+      } catch {
+        failures.push(`fileNotContains: ${p} not present`);
+        continue;
+      }
+      const needles = Array.isArray(needle) ? needle : [needle];
+      for (const n of needles) {
+        const hit = n instanceof RegExp ? n.test(content) : content.includes(n);
+        if (hit) {
+          failures.push(`fileNotContains: ${p} unexpectedly contains ${String(n).slice(0, 60)}`);
+        }
       }
     }
   }
@@ -1190,6 +1755,13 @@ async function assess(scenario, runResult, fsBefore) {
       if (!toolsUsed.includes(t)) failures.push(`mustUseTools: ${t} never called`);
     }
   }
+  if (x.mustUseOneOf?.length) {
+    for (const group of x.mustUseOneOf) {
+      if (!group.some((t) => toolsUsed.includes(t))) {
+        failures.push(`mustUseOneOf: none of [${group.join(", ")}] were called`);
+      }
+    }
+  }
   if (x.mustNotUseTools?.length) {
     for (const t of x.mustNotUseTools) {
       if (toolsUsed.includes(t)) failures.push(`mustNotUseTools: ${t} was called`);
@@ -1229,6 +1801,21 @@ async function assess(scenario, runResult, fsBefore) {
       const ok = needle instanceof RegExp ? needle.test(finalText) : finalText.includes(needle);
       if (!ok) {
         failures.push(`finalContains: ${String(needle).slice(0, 60)} missing`);
+      }
+    }
+  }
+  if (x.planContains?.length) {
+    const planText = runResult.trace
+      .flatMap((t) => extractBlocks(t.sanitized ?? t.response ?? "", "plan"))
+      .join("\n");
+    if (!planText.trim()) {
+      failures.push("planContains: no <plan> block emitted");
+    } else {
+      for (const needle of x.planContains) {
+        const ok = needle instanceof RegExp ? needle.test(planText) : planText.includes(needle);
+        if (!ok) {
+          failures.push(`planContains: ${String(needle).slice(0, 60)} missing`);
+        }
       }
     }
   }
@@ -1371,6 +1958,118 @@ export function renderSize(bytes) {
       fileUnchanged: ["src/util/format.js"],
       mustUseTools: ["apply_diff"],
       turnsBudget: 5,
+    },
+  },
+
+  // ───── category: feature work using an existing helper ─────
+  {
+    id: "feature-uses-existing-helper",
+    category: "feature",
+    files: {
+      "src/money.js": `export function formatCents(cents) {
+  return "$" + (cents / 100).toFixed(2);
+}
+`,
+      "src/cart.js": `import { formatCents } from "./money.js";
+
+export function subtotal(items) {
+  const cents = items.reduce((sum, item) => sum + item.priceCents * item.qty, 0);
+  return formatCents(cents);
+}
+`,
+    },
+    goal:
+      "Add a new export to src/cart.js named `discountedSubtotal(items, percent)` that uses the same cents calculation and existing formatting helper, applies the percentage discount, rounds to the nearest cent, and returns the formatted string. Read the helper before editing. Use apply_diff.",
+    expect: {
+      successPath: "src/cart.js",
+      fnName: "discountedSubtotal",
+      cases: [
+        { args: [[{ priceCents: 1000, qty: 2 }], 10], expected: "$18.00" },
+        { args: [[{ priceCents: 999, qty: 1 }], 15], expected: "$8.49" },
+        { args: [[], 50], expected: "$0.00" },
+      ],
+      bundleWith: ["src/money.js"],
+      fileUnchanged: ["src/money.js"],
+      mustUseTools: ["read_file"],
+      mustUseOneOf: [["apply_diff", "edit_file"]],
+      turnsBudget: 6,
+      mutationsAllowed: 1,
+    },
+  },
+
+  // ───── category: existing-codebase context gathering ─────
+  {
+    id: "repo-context-fix-service-layer",
+    category: "repo-context",
+    files: {
+      "package.json": JSON.stringify(
+        { name: "auth-app", type: "module", scripts: { test: "node test/auth.test.js" } },
+        null,
+        2,
+      ),
+      "src/routes/login.js": `import { authenticate } from "../services/auth.js";
+
+export function postLogin(req) {
+  const result = authenticate(req.body.email, req.body.password);
+  if (!result.ok) return { status: 401, body: result };
+  return { status: 200, body: result };
+}
+`,
+      "src/services/auth.js": `import { findUserByEmail } from "../data/users.js";
+import { verifyPassword } from "../crypto/passwords.js";
+
+export function authenticate(email, password) {
+  const user = findUserByEmail(email);
+  if (!user) return { ok: false, reason: "invalid" };
+  if (!verifyPassword(user, password)) return { ok: false, reason: "invalid" };
+  return { ok: true, userId: user.id };
+}
+`,
+      "src/data/users.js": `const users = [
+  { id: "u1", email: "active@example.com", password: "secret", disabled: false },
+  { id: "u2", email: "disabled@example.com", password: "secret", disabled: true },
+];
+
+export function findUserByEmail(email) {
+  return users.find((user) => user.email === email) ?? null;
+}
+`,
+      "src/crypto/passwords.js": `export function verifyPassword(user, password) {
+  return user.password === password;
+}
+`,
+      "test/auth.test.js": `import assert from "node:assert";
+import { authenticate } from "../src/services/auth.js";
+
+assert.deepStrictEqual(authenticate("active@example.com", "secret"), { ok: true, userId: "u1" });
+assert.deepStrictEqual(authenticate("disabled@example.com", "secret"), { ok: false, reason: "disabled" });
+assert.deepStrictEqual(authenticate("missing@example.com", "secret"), { ok: false, reason: "invalid" });
+`,
+      "README.md": "# Auth app\n\nRoutes are thin; business rules live under src/services/.\n",
+    },
+    goal:
+      "A bug report says disabled users can still log in. This is an existing codebase: search/read enough to find the right layer, fix the business rule in the source under src/services, do not edit routes, data fixtures, crypto helpers, or tests. The expected disabled response is `{ ok: false, reason: \"disabled\" }`. Run the test script to verify.",
+    expect: {
+      successPath: "src/services/auth.js",
+      fnName: "authenticate",
+      cases: [
+        { args: ["active@example.com", "secret"], expected: { ok: true, userId: "u1" } },
+        { args: ["disabled@example.com", "secret"], expected: { ok: false, reason: "disabled" } },
+        { args: ["missing@example.com", "secret"], expected: { ok: false, reason: "invalid" } },
+      ],
+      bundleWith: ["src/data/users.js", "src/crypto/passwords.js"],
+      fileUnchanged: [
+        "src/routes/login.js",
+        "src/data/users.js",
+        "src/crypto/passwords.js",
+        "test/auth.test.js",
+      ],
+      fileContains: { "src/services/auth.js": /user\.disabled|disabled/ },
+      mustUseOneOf: [["discover", "search_codebase", "grep", "list_code_definition_names"], ["apply_diff", "edit_file"]],
+      mustUseTools: ["run_shell"],
+      shellMustInclude: ["test"],
+      turnsBudget: 9,
+      mutationsAllowed: 1,
     },
   },
 
@@ -1580,6 +2279,107 @@ server.listen(PORT);
     },
   },
 
+  {
+    id: "plan-multi-file-rename-with-tests",
+    category: "plan",
+    mode: "plan",
+    files: {
+      "src/auth/session.js": `export function makeSession(user) {
+  return { id: "sess_" + user.id, userId: user.id };
+}
+`,
+      "src/auth/login.js": `import { makeSession } from "./session.js";
+
+export function login(user, password) {
+  if (!password) throw new Error("missing password");
+  return makeSession(user);
+}
+`,
+      "test/auth.test.js": `import assert from "node:assert";
+import { login } from "../src/auth/login.js";
+
+assert.deepStrictEqual(login({ id: "u1" }, "pw"), { id: "sess_u1", userId: "u1" });
+`,
+      "package.json": JSON.stringify(
+        { name: "auth", type: "module", scripts: { test: "node test/auth.test.js" } },
+        null,
+        2,
+      ),
+    },
+    goal:
+      "Plan renaming the auth helper `makeSession` to `createSession` everywhere and verifying the project afterwards. This is PLAN MODE: explore enough to make the plan concrete, but do not edit.",
+    expect: {
+      finalRequired: true,
+      mutationsAllowed: 0,
+      mustNotUseTools: ["apply_diff", "edit_file", "write_file", "rename_symbol", "delete_path", "rename_path", "run_shell", "run_check"],
+      mustUseOneOf: [["grep", "search_codebase", "discover", "list_code_definition_names"]],
+      planContains: [/makeSession/, /createSession/, /src\/auth\/session\.js/, /src\/auth\/login\.js/, /npm test|node test\/auth\.test\.js|test/i],
+      finalContains: [/makeSession|createSession/, /test|verify/i],
+      turnsBudget: 6,
+    },
+  },
+
+  {
+    id: "plan-existing-codebase-route-middleware",
+    category: "plan",
+    mode: "plan",
+    files: {
+      "src/http/server.js": `import { passwordResetRouter } from "../routes/passwordReset.js";
+import { profileRouter } from "../routes/profile.js";
+
+export function registerRoutes(app) {
+  app.use("/password-reset", passwordResetRouter);
+  app.use("/profile", profileRouter);
+}
+`,
+      "src/routes/passwordReset.js": `import { sendResetEmail } from "../services/passwords.js";
+
+export function passwordResetRouter(req) {
+  if (req.method !== "POST") return { status: 405 };
+  sendResetEmail(req.body.email);
+  return { status: 202 };
+}
+`,
+      "src/routes/profile.js": `export function profileRouter(req) {
+  return { status: 200, body: { id: req.user.id } };
+}
+`,
+      "src/middleware/rateLimit.js": `export function rateLimit({ key, limit, windowMs }) {
+  return function applyRateLimit(req, next) {
+    const bucket = key(req);
+    req.rateLimit = { bucket, limit, windowMs };
+    return next(req);
+  };
+}
+`,
+      "src/services/passwords.js": `export function sendResetEmail(email) {
+  return { queued: true, email };
+}
+`,
+      "test/passwordReset.test.js": `import assert from "node:assert";
+import { passwordResetRouter } from "../src/routes/passwordReset.js";
+
+assert.deepStrictEqual(passwordResetRouter({ method: "POST", body: { email: "a@example.com" } }), { status: 202 });
+`,
+    },
+    goal:
+      "Plan adding IP-based rate limiting to the password reset endpoint using whatever existing middleware already exists. This is a preexisting codebase; gather your own context, identify the exact files to touch, and include how to verify. PLAN MODE ONLY: do not edit.",
+    expect: {
+      finalRequired: true,
+      mutationsAllowed: 0,
+      mustNotUseTools: ["apply_diff", "edit_file", "write_file", "delete_path", "rename_path", "run_shell"],
+      mustUseOneOf: [["discover", "search_codebase", "grep", "list_code_definition_names"]],
+      planContains: [
+        /src\/routes\/passwordReset\.js|src\/http\/server\.js/,
+        /src\/middleware\/rateLimit\.js|rateLimit/,
+        /IP|ip/i,
+        /test\/passwordReset\.test\.js|test/i,
+      ],
+      finalContains: [/password\s*reset|passwordReset/i, /rateLimit|rate limit/i, /verify|test/i],
+      turnsBudget: 7,
+    },
+  },
+
   // ───── category: large file with offset/limit ─────
   {
     id: "large-file-targeted-edit",
@@ -1663,7 +2463,8 @@ export function divide(a, b) {
 }
 `,
       },
-      mustUseTools: ["read_file", "apply_diff"],
+      mustUseTools: ["read_file"],
+      mustUseOneOf: [["apply_diff", "edit_file"]],
       turnsBudget: 8,
     },
   },
@@ -1987,6 +2788,83 @@ test("single", () => assert.strictEqual(sum([42]), 42));
     },
   },
 
+  // ───── category: build-error-driven fix ─────
+  {
+    id: "build-error-fix-export",
+    category: "build-fix",
+    files: {
+      "src/handler.js": `export function handle(req) {
+  return { ok: true, path: req.path };
+}
+`,
+      "scripts/build-check.mjs": `import { handler } from "../src/handler.js";
+
+const result = handler({ path: "/health" });
+if (!result.ok || result.path !== "/health") {
+  throw new Error("handler returned wrong shape");
+}
+console.log("build ok");
+`,
+      "package.json": JSON.stringify(
+        { name: "handler", type: "module", scripts: { build: "node scripts/build-check.mjs" } },
+        null,
+        2,
+      ),
+    },
+    goal:
+      "The build is failing after a handler refactor. The public source API is supposed to export `handler`; do not change the build-check script. Run the build, diagnose the failure, fix the source with apply_diff, then rerun the build and only finalize when it passes.",
+    expect: {
+      successPath: "src/handler.js",
+      fnName: "handler",
+      cases: [{ args: [{ path: "/x" }], expected: { ok: true, path: "/x" } }],
+      fileUnchanged: ["scripts/build-check.mjs"],
+      fileContains: { "src/handler.js": /export function handler/ },
+      mustUseTools: ["run_shell"],
+      mustUseOneOf: [["apply_diff", "edit_file"]],
+      shellMustInclude: ["build"],
+      turnsBudget: 8,
+      mutationsAllowed: 1,
+    },
+    extraVerification: {
+      cmd: "npm run build",
+      expectStdoutContains: "build ok",
+    },
+  },
+
+  // ───── category: generated-file discipline ─────
+  {
+    id: "avoid-generated-file",
+    category: "scope",
+    files: {
+      "src/schema.generated.js": `// @generated from user schema. Do not edit by hand.
+export const userFields = ["id", "email"];
+`,
+      "src/validators.js": `import { userFields } from "./schema.generated.js";
+
+export function hasRequiredUserFields(user) {
+  return userFields.some((field) => user[field] != null);
+}
+`,
+    },
+    goal:
+      "A test says hasRequiredUserFields({ id: 'u1' }) incorrectly returns true. The generated schema file looks related, but it says not to edit it. Fix the validator logic only.",
+    expect: {
+      successPath: "src/validators.js",
+      fnName: "hasRequiredUserFields",
+      cases: [
+        { args: [{ id: "u1", email: "a@example.com" }], expected: true },
+        { args: [{ id: "u1" }], expected: false },
+        { args: [{ email: "a@example.com" }], expected: false },
+      ],
+      bundleWith: ["src/schema.generated.js"],
+      fileUnchanged: ["src/schema.generated.js"],
+      fileContains: { "src/validators.js": /every\(\(field\)/ },
+      mustUseOneOf: [["apply_diff", "edit_file"]],
+      turnsBudget: 5,
+      mutationsAllowed: 1,
+    },
+  },
+
   // ───── category: prefer one-shot over dev server ─────
   //
   // When asked to verify a build works, the agent should reach
@@ -2053,7 +2931,14 @@ test("single", () => assert.strictEqual(sum([42]), 42));
 export async function runAgent() {
   console.log(bar("Agent evaluator"));
   const results = [];
-  for (const s of scenarios) {
+  const selected = process.env.POINTER_EVAL_SCENARIO || argValue("--scenario");
+  const activeScenarios = selected
+    ? scenarios.filter((s) => s.id === selected || s.category === selected)
+    : scenarios;
+  if (selected && activeScenarios.length === 0) {
+    throw new Error(`No agent scenario matched ${selected}`);
+  }
+  for (const s of activeScenarios) {
     const t0 = Date.now();
     const fs_ = new VirtualFs(s.files);
     const fsBefore = fs_.snapshot();
@@ -2115,6 +3000,12 @@ export async function runAgent() {
     }
   }
   return results;
+}
+
+function argValue(name) {
+  const prefix = `${name}=`;
+  const hit = process.argv.find((a) => a.startsWith(prefix));
+  return hit ? hit.slice(prefix.length) : null;
 }
 
 if (import.meta.url === `file://${process.argv[1]}`) {

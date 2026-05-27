@@ -1,7 +1,6 @@
 use crate::error::{AppError, AppResult};
-use crate::services::indexer::{
-    blob_to_vec, chunk_text, cosine, vec_to_blob, Chunk, ScoredChunk,
-};
+use crate::services::indexer::{blob_to_vec, chunk_text, cosine, vec_to_blob, Chunk, ScoredChunk};
+use crate::services::inference::{acquire_inference, InferenceClaim, InferencePolicy};
 use crate::services::merkle::MerkleSnapshot;
 use crate::state::AppState;
 use ignore::WalkBuilder;
@@ -61,6 +60,20 @@ pub async fn index_workspace(
         return Err(AppError::Msg("workspace root is not a directory".into()));
     }
     state.indexer.open_db_for(&root)?;
+    let request_id = format!("index_{}", uuid::Uuid::new_v4().simple());
+    let _permit = acquire_inference(
+        &app,
+        &state,
+        InferenceClaim::new(
+            request_id.clone(),
+            model.clone(),
+            "indexing",
+            format!("Index {}", root.display()),
+        ),
+        InferencePolicy::RejectBusy,
+    )
+    .await?;
+    let mut cancel = state.cancels.lock().issue(&request_id);
     {
         let mut st = state.indexer.state.lock();
         st.root = Some(root.clone());
@@ -92,7 +105,10 @@ pub async fn index_workspace(
                 "DELETE FROM chunks WHERE path = ?1",
                 params![p.display().to_string()],
             );
-            let _ = conn.execute("DELETE FROM files WHERE path = ?1", params![p.display().to_string()]);
+            let _ = conn.execute(
+                "DELETE FROM files WHERE path = ?1",
+                params![p.display().to_string()],
+            );
         }
     }
 
@@ -114,7 +130,12 @@ pub async fn index_workspace(
 
     let mut file_count = 0usize;
     let mut chunk_count = 0usize;
+    let mut cancelled = false;
     for path in to_process {
+        if inference_cancelled(&mut cancel) {
+            cancelled = true;
+            break;
+        }
         let bytes = match std::fs::read(&path) {
             Ok(b) => b,
             Err(_) => continue,
@@ -142,6 +163,10 @@ pub async fn index_workspace(
         }
 
         for batch in chunks.chunks(MAX_EMBED_BATCH) {
+            if inference_cancelled(&mut cancel) {
+                cancelled = true;
+                break;
+            }
             let texts: Vec<String> = batch.iter().map(|c| c.text.clone()).collect();
             let embeddings = match embed_batch(&model, texts.clone()).await {
                 Ok(e) => e,
@@ -169,6 +194,9 @@ pub async fn index_workspace(
                 tx.commit()?;
             }
         }
+        if cancelled {
+            break;
+        }
 
         file_count += 1;
         let _ = app.emit(
@@ -193,8 +221,13 @@ pub async fn index_workspace(
         st.last_snapshot = Some(snapshot);
         st.in_progress = false;
     }
+    state.cancels.lock().clear(&request_id);
     let _ = app.emit(
-        "index:done",
+        if cancelled {
+            "index:cancelled"
+        } else {
+            "index:done"
+        },
         json!({ "files": file_count, "chunks": chunk_count }),
     );
     Ok(())
@@ -236,6 +269,7 @@ pub struct SearchRequest {
 
 #[tauri::command]
 pub async fn search_codebase(
+    app: AppHandle,
     state: State<'_, AppState>,
     request: SearchRequest,
 ) -> AppResult<Vec<ScoredChunk>> {
@@ -243,6 +277,15 @@ pub async fn search_codebase(
         .embed_model
         .unwrap_or_else(|| EMBED_MODEL_DEFAULT.to_string());
     let limit = request.limit.unwrap_or(8);
+    let request_id = format!("search_embed_{}", uuid::Uuid::new_v4().simple());
+    let _permit = acquire_inference(
+        &app,
+        &state,
+        InferenceClaim::new(request_id, model.clone(), "embedding", "Semantic search")
+            .non_cancellable(),
+        InferencePolicy::RejectBusy,
+    )
+    .await?;
 
     let q_embed = embed_batch(&model, vec![request.query]).await?;
     let q = q_embed.into_iter().next().unwrap_or_default();
@@ -279,7 +322,18 @@ pub async fn search_codebase(
             score,
         });
     }
-    scored.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
+    scored.sort_by(|a, b| {
+        b.score
+            .partial_cmp(&a.score)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
     scored.truncate(limit);
     Ok(scored)
+}
+
+fn inference_cancelled(cancel: &mut tokio::sync::broadcast::Receiver<()>) -> bool {
+    matches!(
+        cancel.try_recv(),
+        Ok(_) | Err(tokio::sync::broadcast::error::TryRecvError::Closed)
+    )
 }

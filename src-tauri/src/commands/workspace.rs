@@ -220,10 +220,7 @@ fn top_level_entries(workspace: &Path) -> Vec<(String, bool)> {
         if NOISE_DIRS.contains(&name.as_str()) {
             continue;
         }
-        let is_dir = dent
-            .file_type()
-            .map(|ft| ft.is_dir())
-            .unwrap_or(false);
+        let is_dir = dent.file_type().map(|ft| ft.is_dir()).unwrap_or(false);
         out.push((name, is_dir));
     }
     out.sort_by(|a, b| match (a.1, b.1) {
@@ -251,10 +248,10 @@ fn find_and_read_readme(workspace: &Path) -> Option<String> {
                 .unwrap_or_else(|| lower.clone());
             let ext = lower.rsplit_once('.').map(|(_, e)| e.to_string());
             let is_readme = stem == "readme"
-                && match ext.as_deref() {
-                    Some("md") | Some("rst") | Some("txt") | None => true,
-                    _ => false,
-                };
+                && matches!(
+                    ext.as_deref(),
+                    Some("md") | Some("rst") | Some("txt") | None
+                );
             if is_readme {
                 Some(e.path())
             } else {
@@ -262,9 +259,11 @@ fn find_and_read_readme(workspace: &Path) -> Option<String> {
             }
         })
         .collect();
-    let pick = candidates
-        .into_iter()
-        .min_by_key(|p| p.extension().map(|e| e.to_string_lossy().len()).unwrap_or(0))?;
+    let pick = candidates.into_iter().min_by_key(|p| {
+        p.extension()
+            .map(|e| e.to_string_lossy().len())
+            .unwrap_or(0)
+    })?;
     let raw = std::fs::read_to_string(&pick).ok()?;
     let mut acc = String::new();
     for line in raw.lines().take(README_MAX_LINES) {

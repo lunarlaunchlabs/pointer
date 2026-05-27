@@ -23,10 +23,11 @@
 
 use std::collections::HashMap;
 use std::io::{Read, Write};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::Duration;
 
 use once_cell::sync::Lazy;
+use parking_lot::Mutex;
 use portable_pty::{Child, CommandBuilder, MasterPty, PtySize};
 use serde::Serialize;
 use tauri::{AppHandle, Emitter};
@@ -59,8 +60,7 @@ struct Session {
 
 /// Map of `id -> Session`. The id is a short opaque string the frontend
 /// generates so it can mux events back to the right xterm instance.
-static SESSIONS: Lazy<Mutex<HashMap<String, Session>>> =
-    Lazy::new(|| Mutex::new(HashMap::new()));
+static SESSIONS: Lazy<Mutex<HashMap<String, Session>>> = Lazy::new(|| Mutex::new(HashMap::new()));
 
 #[derive(Debug, Serialize)]
 pub struct OpenResult {
@@ -82,7 +82,7 @@ pub async fn terminal_open(
         return Err("terminal id required".into());
     }
     {
-        let map = SESSIONS.lock().unwrap();
+        let map = SESSIONS.lock();
         if map.contains_key(&id) {
             return Err(format!("terminal '{id}' already open"));
         }
@@ -144,7 +144,7 @@ pub async fn terminal_open(
     // can't observe a momentary "session missing" race when the very
     // first bytes arrive.
     {
-        let mut map = SESSIONS.lock().unwrap();
+        let mut map = SESSIONS.lock();
         map.insert(
             id.clone(),
             Session {
@@ -185,7 +185,7 @@ pub async fn terminal_open(
         // Reap the child. If it's already gone we'll get Ok(None); poll
         // briefly to grab the exit code before signalling the frontend.
         let exit_code: Option<i32> = {
-            let mut map = SESSIONS.lock().unwrap();
+            let mut map = SESSIONS.lock();
             if let Some(sess) = map.get_mut(&id_for_thread) {
                 // Up to 100ms for the child to publish its exit code.
                 let mut code = None;
@@ -208,7 +208,7 @@ pub async fn terminal_open(
             &format!("terminal:exit:{}", id_for_thread),
             ExitPayload { code: exit_code },
         );
-        SESSIONS.lock().unwrap().remove(&id_for_thread);
+        SESSIONS.lock().remove(&id_for_thread);
     });
 
     Ok(OpenResult {
@@ -227,13 +227,13 @@ pub async fn terminal_write(id: String, data: String) -> Result<(), String> {
     // Grab the shared writer handle, then drop the SESSIONS lock before
     // doing any I/O so a slow flush can't block resize/close calls.
     let writer = {
-        let map = SESSIONS.lock().unwrap();
+        let map = SESSIONS.lock();
         let sess = map
             .get(&id)
             .ok_or_else(|| format!("terminal '{id}' not found"))?;
         Arc::clone(&sess.writer)
     };
-    let mut w = writer.lock().unwrap();
+    let mut w = writer.lock();
     w.write_all(data.as_bytes())
         .map_err(|e| format!("write: {e}"))?;
     w.flush().map_err(|e| format!("flush: {e}"))?;
@@ -242,7 +242,7 @@ pub async fn terminal_write(id: String, data: String) -> Result<(), String> {
 
 #[tauri::command]
 pub async fn terminal_resize(id: String, cols: u16, rows: u16) -> Result<(), String> {
-    let map = SESSIONS.lock().unwrap();
+    let map = SESSIONS.lock();
     let sess = map
         .get(&id)
         .ok_or_else(|| format!("terminal '{id}' not found"))?;
@@ -259,13 +259,26 @@ pub async fn terminal_resize(id: String, cols: u16, rows: u16) -> Result<(), Str
 
 #[tauri::command]
 pub async fn terminal_close(id: String) -> Result<(), String> {
-    let mut map = SESSIONS.lock().unwrap();
+    let mut map = SESSIONS.lock();
     if let Some(mut sess) = map.remove(&id) {
         // `kill` returns Err if the child has already exited, which is
         // fine — we already removed it from the map.
         let _ = sess.child.kill();
     }
     Ok(())
+}
+
+/// Kill every integrated-terminal child. Called by the app shutdown hook so
+/// shells and long-running terminal commands do not outlive Pointer.
+pub fn shutdown_all() {
+    let sessions: Vec<Session> = SESSIONS
+        .lock()
+        .drain()
+        .map(|(_, session)| session)
+        .collect();
+    for mut session in sessions {
+        let _ = session.child.kill();
+    }
 }
 
 /// Best-effort shell detection. The result is also surfaced to the UI so
@@ -298,9 +311,6 @@ fn resolve_shell() -> (String, String) {
                 return (s, label);
             }
         }
-        (
-            "powershell.exe".to_string(),
-            "powershell".to_string(),
-        )
+        ("powershell.exe".to_string(), "powershell".to_string())
     }
 }

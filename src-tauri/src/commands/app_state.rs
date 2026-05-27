@@ -1,7 +1,7 @@
 //! Factory-reset support. Lets the user return Pointer to its first-launch
-//! state without uninstalling the app — clears the persistent settings store,
-//! the HF token (both keychain and file fallback), and optionally the OS
-//! caches we own. Used by the AI panel's "Reset Pointer" button.
+//! state without uninstalling the app — clears the persistent settings store
+//! and optionally the OS caches we own. Used by the AI panel's "Reset Pointer"
+//! button.
 
 use crate::error::{AppError, AppResult};
 use crate::state::AppState;
@@ -14,10 +14,6 @@ pub struct ResetOptions {
     /// debounce, recents, session, onboarded flag, ...
     #[serde(default = "true_default")]
     pub clear_settings: bool,
-    /// Clear the Hugging Face token from both the keychain and the file
-    /// fallback.
-    #[serde(default = "true_default")]
-    pub clear_hf_token: bool,
     /// Remove the local indexer SQLite DBs.
     #[serde(default)]
     pub clear_index: bool,
@@ -90,21 +86,6 @@ pub async fn reset_app_state(
                 ok: true,
                 message: Some("nothing to remove".into()),
             });
-        }
-    }
-
-    if opts.clear_hf_token {
-        match crate::commands::models::clear_hf_token(app.clone()).await {
-            Ok(()) => steps.push(ResetStep {
-                label: "clear HF token".into(),
-                ok: true,
-                message: None,
-            }),
-            Err(e) => steps.push(ResetStep {
-                label: "clear HF token".into(),
-                ok: false,
-                message: Some(e.to_string()),
-            }),
         }
     }
 

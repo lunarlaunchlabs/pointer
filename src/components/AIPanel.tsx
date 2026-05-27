@@ -7,7 +7,6 @@ import {
   ChevronDown,
   Download,
   Flame,
-  Key,
   Loader2,
   Power,
   RefreshCw,
@@ -22,7 +21,6 @@ import {
   ipc,
   listenEvent,
   newRequestId,
-  type HfTokenStatus,
   type HardwareProfile,
   type OllamaModel,
   type ResetReport,
@@ -36,6 +34,11 @@ import {
 } from "@/store/settings";
 import { modelFitness } from "@/lib/modelFitness";
 import { Marketplace } from "@/components/Marketplace";
+import {
+  CATALOG,
+  mergeWithCuratedCatalog,
+  type CatalogEntry,
+} from "@/lib/modelCatalog";
 import { MCPPanel } from "@/components/MCP/MCPPanel";
 import { usePulls } from "@/store/pulls";
 import { confirm } from "@/components/Confirm";
@@ -118,16 +121,10 @@ export function AIPanelView() {
   const cancelPull = usePulls((s) => s.cancel);
   const clearPullError = usePulls((s) => s.clearError);
   const [pullInput, setPullInput] = useState("");
-  const [hfToken, setHfToken] = useState("");
-  const [hfStatus, setHfStatus] = useState<HfTokenStatus>({
-    present: false,
-    location: null,
-    preview: null,
-    file_path: null,
-    in_keychain: false,
-    in_file: false,
-  });
-  const [hfSaving, setHfSaving] = useState(false);
+  const [marketplaceCatalog, setMarketplaceCatalog] =
+    useState<CatalogEntry[]>(CATALOG);
+  const [marketplaceLoading, setMarketplaceLoading] = useState(false);
+  const [marketplaceError, setMarketplaceError] = useState<string | null>(null);
   const [busy, setBusy] = useState<"start" | "stop" | "install" | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [deletingModel, setDeletingModel] = useState<string | null>(null);
@@ -141,7 +138,6 @@ export function AIPanelView() {
   >(null);
 
   const setOllamaReady = useSettings((s) => s.setOllamaReady);
-  const setHasHfToken = useSettings((s) => s.setHasHfToken);
   const chatModel = useSettings((s) => s.chatModel);
   const fimModel = useSettings((s) => s.fimModel);
   const agentModel = useSettings((s) => s.agentModel);
@@ -232,12 +228,28 @@ export function AIPanelView() {
   useEffect(() => {
     refresh();
     const id = setInterval(refresh, 4000);
-    ipc.hfTokenStatus().then((s) => {
-      setHfStatus(s);
-      setHasHfToken(s.present);
-    });
     return () => clearInterval(id);
   // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  const refreshMarketplaceCatalog = async () => {
+    setMarketplaceLoading(true);
+    setMarketplaceError(null);
+    try {
+      const upstream = await ipc.ollamaLibraryCatalog();
+      setMarketplaceCatalog(mergeWithCuratedCatalog(upstream));
+    } catch (e) {
+      setMarketplaceCatalog(CATALOG);
+      setMarketplaceError(
+        `${extractErrorMessage(e)} Using the bundled Ollama catalog.`,
+      );
+    } finally {
+      setMarketplaceLoading(false);
+    }
+  };
+
+  useEffect(() => {
+    refreshMarketplaceCatalog();
   }, []);
 
   // NOTE: we intentionally do NOT auto-heal assignments when the install
@@ -328,42 +340,6 @@ export function AIPanelView() {
         refresh();
       }
     });
-  };
-
-  const saveToken = async () => {
-    const trimmed = hfToken.trim();
-    if (!trimmed) return;
-    setHfSaving(true);
-    setError(null);
-    try {
-      const status = await ipc.setHfToken(trimmed);
-      // Confirm with a second read so we never claim success on a phantom save.
-      const verify = await ipc.hfTokenStatus();
-      if (!verify.present) {
-        throw new Error(
-          "Token didn't persist. The OS likely blocked keychain access — try again and choose 'Always allow' on the prompt.",
-        );
-      }
-      setHfStatus(status.present ? status : verify);
-      setHasHfToken(true);
-      setHfToken("");
-    } catch (e) {
-      setError(extractErrorMessage(e));
-    } finally {
-      setHfSaving(false);
-    }
-  };
-
-  const clearToken = async () => {
-    setError(null);
-    try {
-      await ipc.clearHfToken();
-      const s = await ipc.hfTokenStatus();
-      setHfStatus(s);
-      setHasHfToken(s.present);
-    } catch (e) {
-      setError(extractErrorMessage(e));
-    }
   };
 
   const deleteModel = async (name: string) => {
@@ -472,8 +448,8 @@ export function AIPanelView() {
       body: (
         <div className="space-y-2">
           <p>
-            Clears saved settings, recents, open tabs, and the Hugging Face
-            token. The app reloads to the welcome screen.
+            Clears saved settings, recents, and open tabs. The app reloads to
+            the welcome screen.
           </p>
           <p className="text-noir-mute">
             This does <strong>not</strong> uninstall Ollama or remove your
@@ -503,11 +479,10 @@ export function AIPanelView() {
       }
 
       // Step 2: run the Rust-side reset for everything that lives outside
-      // the plugin store (HF token, indexer cache, owned Ollama child) and
-      // also delete the now-empty store file as a belt-and-suspenders.
+      // the plugin store (indexer cache, owned Ollama child) and also delete
+      // the now-empty store file as a belt-and-suspenders.
       const report = await ipc.resetAppState({
         clear_settings: true,
-        clear_hf_token: true,
         clear_index: true,
         stop_ollama: true,
       });
@@ -691,6 +666,10 @@ export function AIPanelView() {
               ollamaRunning={!!status?.running}
               activePulls={activePulls}
               onPull={pull}
+              catalog={marketplaceCatalog}
+              loading={marketplaceLoading}
+              error={marketplaceError}
+              onRefresh={refreshMarketplaceCatalog}
             />
           </Section>
 
@@ -975,86 +954,6 @@ export function AIPanelView() {
             </div>
           </Section>
 
-          <Section title="Hugging Face token" hint="For gated GGUF imports">
-            <div className="rounded-lg border border-noir-line bg-noir-canvas/40 p-3 flex items-start justify-between gap-3">
-              <div className="flex items-start gap-3 min-w-0">
-                <Key size={14} className="text-noir-accent shrink-0 mt-0.5" />
-                <div className="min-w-0 space-y-1">
-                  <div className="text-noir-text flex items-center gap-2">
-                    {hfStatus.present
-                      ? "Token configured"
-                      : "No token configured"}
-                    {hfStatus.present && hfStatus.preview && (
-                      <code className="font-mono text-[11px] text-noir-subtext bg-noir-panel border border-noir-line/60 rounded px-1.5 py-[1px]">
-                        {hfStatus.preview}
-                      </code>
-                    )}
-                  </div>
-                  {hfStatus.present ? (
-                    <div className="text-[11px] text-noir-mute space-y-0.5">
-                      <div className="flex items-center gap-2">
-                        <StoreBadge label="file" on={hfStatus.in_file} />
-                        <StoreBadge label="keychain" on={hfStatus.in_keychain} />
-                        <span className="text-[10px]">
-                          · reads from <strong>{hfStatus.location}</strong>
-                        </span>
-                      </div>
-                      {hfStatus.file_path && (
-                        <div
-                          className="font-mono text-[10px] text-noir-mute truncate max-w-[420px]"
-                          title={hfStatus.file_path}
-                        >
-                          {hfStatus.file_path}
-                        </div>
-                      )}
-                    </div>
-                  ) : (
-                    <div className="text-[11px] text-noir-mute">
-                      Only needed to pull gated repos (e.g. Llama, Gemma).
-                      {hfStatus.file_path && (
-                        <span className="block font-mono text-[10px] mt-0.5 truncate max-w-[420px]">
-                          Would save to: {hfStatus.file_path}
-                        </span>
-                      )}
-                    </div>
-                  )}
-                </div>
-              </div>
-              {hfStatus.present && (
-                <button
-                  onClick={clearToken}
-                  className="pn-button font-sans flex items-center gap-1.5 shrink-0"
-                >
-                  <Trash2 size={11} />
-                  Clear
-                </button>
-              )}
-            </div>
-            <div className="mt-2 flex items-center gap-2">
-              <input
-                type="password"
-                value={hfToken}
-                onChange={(e) => setHfToken(e.target.value)}
-                placeholder={hfStatus.present ? "Replace token (hf_…)" : "hf_…"}
-                onKeyDown={(e) => {
-                  if (e.key === "Enter") saveToken();
-                }}
-                className="pn-input flex-1 font-mono"
-                aria-label="Hugging Face access token"
-                autoComplete="off"
-                spellCheck={false}
-              />
-              <button
-                onClick={saveToken}
-                disabled={!hfToken.trim() || hfSaving}
-                className="pn-button-accent font-sans inline-flex items-center gap-1.5"
-              >
-                {hfSaving && <Loader2 size={11} className="animate-spin" />}
-                {hfSaving ? "Saving…" : "Save"}
-              </button>
-            </div>
-          </Section>
-
           <Section title="Danger zone" hint="Destructive actions">
             <div className="rounded-lg border border-noir-err/30 bg-noir-err/[0.04] divide-y divide-noir-err/20">
               <DangerRow
@@ -1078,7 +977,7 @@ export function AIPanelView() {
               <DangerRow
                 icon={<RotateCcw size={13} className="text-noir-err" />}
                 title="Reset Pointer to first launch"
-                body="Wipes saved settings, recents, open tabs, HF token, and index. Pointer reloads to the welcome wizard. Does not uninstall Ollama or your models."
+                body="Wipes saved settings, recents, open tabs, and index. Pointer reloads to the welcome wizard. Does not uninstall Ollama or your models."
                 action="Reset"
                 onClick={factoryReset}
                 disabled={dangerBusy !== null}
@@ -1521,26 +1420,6 @@ function Assignment({
   );
 }
 
-function StoreBadge({ label, on }: { label: string; on: boolean }) {
-  return (
-    <span
-      className={`inline-flex items-center gap-1 px-1.5 py-[1px] rounded border text-[9.5px] font-sans uppercase tracking-wider ${
-        on
-          ? "border-noir-ok/40 bg-noir-ok/10 text-noir-ok"
-          : "border-noir-line bg-noir-canvas/40 text-noir-mute"
-      }`}
-      title={on ? `Token is present in ${label}` : `Token is NOT in ${label}`}
-    >
-      <span
-        className={`h-1.5 w-1.5 rounded-full ${
-          on ? "bg-noir-ok" : "bg-noir-mute"
-        }`}
-      />
-      {label}
-    </span>
-  );
-}
-
 function StatusDot({ ok, pending }: { ok: boolean; pending?: boolean }) {
   return (
     <div
@@ -1637,7 +1516,7 @@ function DangerReport({
 function extractErrorMessage(e: unknown): string {
   if (typeof e === "string") return e;
   if (e instanceof Error) return e.message;
-  // Tauri command errors come through as { Msg: "..." } / { Keyring: "..." } /
+  // Tauri command errors come through as { Msg: "..." } /
   // raw strings — surface the first usable string.
   try {
     const s = JSON.stringify(e);

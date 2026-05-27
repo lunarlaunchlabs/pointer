@@ -1,6 +1,9 @@
 pub mod history;
 pub mod indexer;
+pub mod inference;
+pub mod lsp;
 pub mod mcp;
 pub mod merkle;
+pub mod opencode;
 pub mod prompt;
 pub mod skills;

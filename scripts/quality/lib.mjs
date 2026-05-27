@@ -10,7 +10,58 @@ import os from "node:os";
 import path from "node:path";
 
 export const OLLAMA = process.env.OLLAMA_URL || "http://127.0.0.1:11434";
-export const MODEL = process.env.POINTER_MODEL || "qwen2.5-coder:7b-instruct";
+export const DEFAULT_MODEL = "qwen2.5-coder:7b-instruct";
+export const QUALITY_NUM_CTX = Number(process.env.POINTER_NUM_CTX || 32768);
+export const QUALITY_CHAT_TIMEOUT_MS = Number(process.env.POINTER_CHAT_TIMEOUT_MS || 300000);
+export const MODEL = await resolveModel();
+
+async function resolveModel() {
+  if (process.env.POINTER_MODEL) return process.env.POINTER_MODEL;
+
+  try {
+    const r = await fetch(`${OLLAMA}/api/tags`);
+    if (!r.ok) return DEFAULT_MODEL;
+    const tags = await r.json();
+    const installed = (tags.models ?? [])
+      .map((m) => m.model ?? m.name)
+      .filter(Boolean);
+    if (installed.length === 0) return DEFAULT_MODEL;
+    if (installed.includes(DEFAULT_MODEL)) return DEFAULT_MODEL;
+
+    const picked = installed
+      .map((name) => ({ name, score: modelScore(name) }))
+      .sort((a, b) => b.score - a.score || a.name.localeCompare(b.name))[0]
+      ?.name;
+    if (picked) {
+      console.error(`Using installed Ollama model: ${picked} (set POINTER_MODEL to override)`);
+      return picked;
+    }
+  } catch {
+    // Keep the old explicit default if Ollama is not reachable; the
+    // caller will surface the transport error from the generation API.
+  }
+  return DEFAULT_MODEL;
+}
+
+function modelScore(name) {
+  const n = name.toLowerCase();
+  if (/(embed|nomic|bge|minilm|clip)/.test(n)) return -1000;
+  let score = 0;
+  if (n.includes("qwen3-coder")) score += 120;
+  else if (n.includes("qwen2.5-coder")) score += 110;
+  else if (n.includes("qwen") && n.includes("coder")) score += 100;
+  else if (n.includes("deepseek-coder")) score += 95;
+  else if (n.includes("codestral") || n.includes("devstral")) score += 90;
+  else if (n.includes("codellama")) score += 80;
+  else if (n.includes("qwen")) score += 70;
+  else if (n.includes("llama")) score += 60;
+  else score += 10;
+
+  const size = /(\d+(?:\.\d+)?)\s*b\b/.exec(n)?.[1];
+  if (size) score += Math.min(Number(size), 40);
+  if (n.includes(":latest")) score -= 1;
+  return score;
+}
 
 /** POST a JSON body to a JSON endpoint, return parsed response. */
 async function postJson(url, body, { timeoutMs = 180_000 } = {}) {
@@ -44,7 +95,7 @@ export async function generateRaw({ prompt, options = {}, raw = true, timeoutMs 
     prompt,
     raw,
     stream: true,
-    options: { temperature: 0.2, num_predict: 256, ...options },
+    options: { temperature: 0.2, num_ctx: QUALITY_NUM_CTX, num_predict: 256, ...options },
   };
   const ctrl = new AbortController();
   if (timeoutMs) setTimeout(() => ctrl.abort(), timeoutMs);
@@ -84,7 +135,7 @@ export async function generateRaw({ prompt, options = {}, raw = true, timeoutMs 
 }
 
 /** Hit the chat endpoint. Returns the assistant text. */
-export async function chat({ system, messages, options = {} }) {
+export async function chat({ system, messages, options = {}, timeoutMs = QUALITY_CHAT_TIMEOUT_MS }) {
   const url = `${OLLAMA}/api/chat`;
   const body = {
     model: MODEL,
@@ -93,39 +144,51 @@ export async function chat({ system, messages, options = {} }) {
       ...messages,
     ],
     stream: true,
-    options: { temperature: 0.2, num_predict: 1500, ...options },
+    options: { temperature: 0.2, num_ctx: QUALITY_NUM_CTX, num_predict: 1500, ...options },
   };
-  const r = await fetch(url, {
-    method: "POST",
-    headers: { "content-type": "application/json" },
-    body: JSON.stringify(body),
-  });
-  if (!r.ok) {
-    const t = await r.text();
-    throw new Error(`chat HTTP ${r.status}: ${t.slice(0, 300)}`);
-  }
-  const reader = r.body.getReader();
-  const dec = new TextDecoder();
-  let buf = "";
-  let out = "";
-  while (true) {
-    const { value, done } = await reader.read();
-    if (done) break;
-    buf += dec.decode(value, { stream: true });
-    let nl;
-    while ((nl = buf.indexOf("\n")) !== -1) {
-      const line = buf.slice(0, nl);
-      buf = buf.slice(nl + 1);
-      if (!line) continue;
-      try {
-        const j = JSON.parse(line);
-        const tok = j?.message?.content;
-        if (tok) out += tok;
-        if (j.done) return out;
-      } catch {}
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), timeoutMs);
+  try {
+    const r = await fetch(url, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(body),
+      signal: ctrl.signal,
+    });
+    if (!r.ok) {
+      const t = await r.text();
+      throw new Error(`chat HTTP ${r.status}: ${t.slice(0, 300)}`);
     }
+    const reader = r.body.getReader();
+    const dec = new TextDecoder();
+    let buf = "";
+    let out = "";
+    while (true) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      buf += dec.decode(value, { stream: true });
+      let nl;
+      while ((nl = buf.indexOf("\n")) !== -1) {
+        const line = buf.slice(0, nl);
+        buf = buf.slice(nl + 1);
+        if (!line) continue;
+        try {
+          const j = JSON.parse(line);
+          const tok = j?.message?.content;
+          if (tok) out += tok;
+          if (j.done) return out;
+        } catch {}
+      }
+    }
+    return out;
+  } catch (error) {
+    if (error?.name === "AbortError") {
+      throw new Error(`chat timed out after ${timeoutMs}ms`);
+    }
+    throw error;
+  } finally {
+    clearTimeout(timer);
   }
-  return out;
 }
 
 // ─────────────────────────────────────────────────────────────────
@@ -145,7 +208,7 @@ export async function chat({ system, messages, options = {} }) {
  *   5. ` \`\`\`lang path/to/file\n…\n\`\`\` ` (model drift fallback)    (create)
  */
 const HUNK_RE =
-  /(?:```[\w-]*\n)?(?:<<<<<<<\s*SEARCH(?:\s+([^\n]+))?\n)([\s\S]*?)\n?=======\n([\s\S]*?)\n>>>>>>>\s*REPLACE(?:\n```)?/g;
+  /(?:```[\w-]*\n)?(?:<<<<<<<[ \t]*SEARCH(?:[ \t]+([^\n]+))?[ \t]*\n)([\s\S]*?)\n?=======\n([\s\S]*?)\n>>>>>>>\s*REPLACE(?:\n```)?/g;
 const NEW_FILE_RE =
   /<file\s+(?:action="?(?:create|new|overwrite)"?\s+)?path="([^"]+)"\s*>\n?([\s\S]*?)\n?<\/file>/gi;
 const FENCED_NEW_FILE_RE =
@@ -163,8 +226,17 @@ export function parseSearchReplace(text) {
   let m;
   HUNK_RE.lastIndex = 0;
   while ((m = HUNK_RE.exec(text)) !== null) {
-    const p = (m[1] ?? "").trim();
-    hunks.push({ path: p || null, search: m[2] ?? "", replace: m[3] ?? "" });
+    let p = (m[1] ?? "").trim();
+    let search = m[2] ?? "";
+    if (!p) {
+      const nl = search.indexOf("\n");
+      const first = nl === -1 ? search.trim() : search.slice(0, nl).trim();
+      if (nl !== -1 && looksLikePath(first)) {
+        p = first;
+        search = search.slice(nl + 1);
+      }
+    }
+    hunks.push({ path: p || null, search, replace: m[3] ?? "" });
   }
   NEW_FILE_RE.lastIndex = 0;
   while ((m = NEW_FILE_RE.exec(text)) !== null) {

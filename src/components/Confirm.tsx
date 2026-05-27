@@ -15,6 +15,7 @@ export type ConfirmOptions = {
   title: string;
   body?: React.ReactNode;
   confirmLabel?: string;
+  secondaryLabel?: string;
   cancelLabel?: string;
   /** When true, the confirm button is styled as destructive (red). */
   danger?: boolean;
@@ -22,8 +23,10 @@ export type ConfirmOptions = {
   confirmKeyword?: string;
 };
 
+export type ConfirmResult = "confirm" | "secondary" | "cancel";
+
 type Pending = ConfirmOptions & {
-  resolve: (v: boolean) => void;
+  resolve: (v: ConfirmResult) => void;
 };
 
 // Module-level subscribers — we treat the modal host as a singleton mount in
@@ -37,14 +40,19 @@ function setCurrent(p: Pending | null) {
   for (const l of listeners) l(p);
 }
 
-/** Imperative confirm. Resolves to true (confirmed) or false (cancelled). */
-export function confirm(opts: ConfirmOptions): Promise<boolean> {
-  return new Promise<boolean>((resolve) => {
+/** Imperative choice modal. Resolves to the exact button / close intent. */
+export function choose(opts: ConfirmOptions): Promise<ConfirmResult> {
+  return new Promise<ConfirmResult>((resolve) => {
     // If an earlier prompt is still on screen, queue: resolve the older one
     // as cancel to avoid stuck UI, then take over.
-    if (current) current.resolve(false);
+    if (current) current.resolve("cancel");
     setCurrent({ ...opts, resolve });
   });
+}
+
+/** Imperative confirm. Resolves to true (confirmed) or false (cancelled). */
+export async function confirm(opts: ConfirmOptions): Promise<boolean> {
+  return (await choose(opts)) === "confirm";
 }
 
 /** Convenience hook so components can call `confirm` without importing twice. */
@@ -70,16 +78,22 @@ export function ConfirmModalHost() {
 
   const cancel = useCallback(() => {
     if (!p) return;
-    p.resolve(false);
+    p.resolve("cancel");
     setCurrent(null);
   }, [p]);
 
   const confirmIt = useCallback(() => {
     if (!p) return;
     if (p.confirmKeyword && typed !== p.confirmKeyword) return;
-    p.resolve(true);
+    p.resolve("confirm");
     setCurrent(null);
   }, [p, typed]);
+
+  const secondaryIt = useCallback(() => {
+    if (!p) return;
+    p.resolve("secondary");
+    setCurrent(null);
+  }, [p]);
 
   useEffect(() => {
     if (!p) return;
@@ -181,6 +195,11 @@ export function ConfirmModalHost() {
           <button onClick={cancel} className="pn-button font-sans">
             {p.cancelLabel ?? "Cancel"}
           </button>
+          {p.secondaryLabel && (
+            <button onClick={secondaryIt} className="pn-button font-sans">
+              {p.secondaryLabel}
+            </button>
+          )}
           <button
             onClick={confirmIt}
             disabled={!keywordOk}

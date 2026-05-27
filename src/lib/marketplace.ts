@@ -171,6 +171,8 @@ export type MarketplaceFilters = {
   query: string;
   /** Restrict to entries usable for this AiFeature. `null` = no restriction. */
   category: AiFeature | null;
+  /** Restrict to one Ollama model family. `null` / omitted = no restriction. */
+  family?: string | null;
   /** Hide entries that wouldn't run on the user's hardware. */
   hideBlocked: boolean;
   /** Hide entries already in `installedModelIds`. */
@@ -215,6 +217,8 @@ export function filterAndRank(args: {
   // *support* it; we don't require it to be the primary.
   const inCategory = (e: CatalogEntry) =>
     filters.category == null || e.categories.includes(filters.category);
+  const inFamily = (e: CatalogEntry) =>
+    filters.family == null || filters.family === "" || e.family === filters.family;
 
   // Tokenize the search query. Empty = always match. We split on
   // whitespace + punctuation that's not part of a model id (":", "."
@@ -228,6 +232,7 @@ export function filterAndRank(args: {
   const rows: MarketplaceRow[] = [];
   for (const e of catalog) {
     if (!inCategory(e)) continue;
+    if (!inFamily(e)) continue;
 
     const runnability = classifyRunnability(e, hardware);
     const installed = installedSet.has(e.id);

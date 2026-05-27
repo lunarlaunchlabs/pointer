@@ -32,8 +32,41 @@ export default defineConfig(async () => ({
     sourcemap: true,
     rollupOptions: {
       output: {
-        manualChunks: {
-          monaco: ["monaco-editor", "@monaco-editor/react"],
+        manualChunks(id: string) {
+          const normalizedId = id.split(path.sep).join("/");
+          if (id.includes("node_modules")) {
+            if (normalizedId.includes("node_modules/monaco-editor/")) {
+              if (
+                normalizedId.includes("/esm/vs/basic-languages/") ||
+                normalizedId.includes("/esm/vs/language/")
+              ) {
+                return undefined;
+              }
+              return "monaco";
+            }
+            if (id.includes("@monaco-editor/react")) {
+              return "monaco";
+            }
+            if (id.includes("@xterm/")) return "terminal-vendor";
+            if (id.includes("@tauri-apps/")) return "tauri-vendor";
+            if (
+              id.includes("react/") ||
+              id.includes("react-dom") ||
+              id.includes("scheduler")
+            ) {
+              return "react-vendor";
+            }
+            if (
+              id.includes("lucide-react") ||
+              id.includes("cmdk") ||
+              id.includes("zustand") ||
+              id.includes("clsx") ||
+              id.includes("nanoid")
+            ) {
+              return "ui-vendor";
+            }
+            return "vendor";
+          }
         },
       },
     },

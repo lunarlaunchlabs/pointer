@@ -7,7 +7,8 @@
  * pin the migration so a future refactor can't silently drop
  * conversations on upgrade.
  */
-import { beforeEach, describe, expect, it } from "vitest";
+import { beforeEach, describe, expect, it, vi } from "vitest";
+import { invoke } from "@tauri-apps/api/core";
 import { migrateLegacy, useAssistant } from "./assistant";
 import type { ChatSession } from "./chat";
 import type { AgentSession } from "./agentSessions";
@@ -268,6 +269,7 @@ describe("useAssistant mode switching + plan promotion", () => {
     return useAssistant.getState();
   }
   beforeEach(() => {
+    vi.mocked(invoke).mockReset();
     initial = getStore();
     useAssistant.setState(
       {
@@ -335,6 +337,20 @@ describe("useAssistant mode switching + plan promotion", () => {
     expect(getStore().sessions.find((s) => s.id === id)!.mode).toBe("ask");
   });
 
+  it("updates the session model unless the turn is running", () => {
+    const id = getStore().newSession({ mode: "ask", model: "chat-model" });
+    getStore().setSessionModel(id, "agent-model");
+    expect(getStore().sessions.find((s) => s.id === id)!.model).toBe("agent-model");
+
+    useAssistant.setState((s) => ({
+      sessions: s.sessions.map((sess) =>
+        sess.id === id ? { ...sess, status: "running" as const } : sess,
+      ),
+    }));
+    getStore().setSessionModel(id, "should-not-apply");
+    expect(getStore().sessions.find((s) => s.id === id)!.model).toBe("agent-model");
+  });
+
   it("flipping a session to plan mode does not reset the ledger", () => {
     const id = getStore().newSession({ mode: "ask", model: "qwen" });
     useAssistant.setState((s) => ({
@@ -374,6 +390,39 @@ describe("useAssistant mode switching + plan promotion", () => {
     expect(s.status).toBe("idle");
   });
 
+  it("marks ask-mode turns as running while the stream is active", async () => {
+    vi.mocked(invoke).mockResolvedValue(undefined);
+    const id = getStore().newSession({ mode: "ask", model: "qwen" });
+
+    await getStore().send("Tell me about App.jsx", { defaultModel: "qwen" });
+
+    const s = getStore().sessions.find((x) => x.id === id)!;
+    expect(s.status).toBe("running");
+    expect(s.messages.map((m) => m.role)).toEqual(["user", "assistant"]);
+    expect(s.messages.at(-1)?.streaming).toBe(true);
+    expect(getStore().phase.kind).toBe("streaming");
+    expect(getStore().currentRequestId).toMatch(/^ask_/);
+  });
+
+  it("answers direct Ask-mode edit requests with the deterministic mode redirect", async () => {
+    const id = getStore().newSession({ mode: "ask", model: "qwen" });
+
+    await getStore().send("Fix src/App.jsx so the nav works", { defaultModel: "qwen" });
+
+    const s = getStore().sessions.find((x) => x.id === id)!;
+    expect(invoke).not.toHaveBeenCalled();
+    expect(s.status).toBe("done");
+    expect(s.messages.map((m) => m.role)).toEqual(["user", "assistant"]);
+    expect(s.messages.at(-1)?.content).toBe(
+      "Switch to Agent mode and I can apply that edit, or Plan mode if you want to review the plan first.",
+    );
+    expect(s.ledger.at(-1)?.kind).toEqual({
+      type: "answered_only",
+      summary:
+        "Switch to Agent mode and I can apply that edit, or Plan mode if you want to review the plan first.",
+    });
+  });
+
   it("deleting the active session clears activeSessionId or falls back", () => {
     const a = getStore().newSession({ mode: "ask", model: "qwen" });
     const b = getStore().newSession({ mode: "plan", model: "qwen" });
@@ -385,5 +434,48 @@ describe("useAssistant mode switching + plan promotion", () => {
     expect(getStore().activeSessionId).toBe(a);
     getStore().deleteSession(a);
     expect(getStore().activeSessionId).toBeNull();
+  });
+
+  it("promotes only the latest plan block into the agent execution request", async () => {
+    vi.mocked(invoke).mockResolvedValue(undefined);
+    const id = getStore().newSession({ mode: "plan", model: "qwen" });
+    useAssistant.setState((s) => ({
+      sessions: s.sessions.map((sess) =>
+        sess.id !== id
+          ? sess
+          : {
+              ...sess,
+              status: "done",
+              transcript: [{ role: "assistant", content: "<plan>draft</plan>" }],
+              events: [
+                { kind: "plan", step: 1, text: "1. Read files to make a plan." },
+                {
+                  kind: "plan",
+                  step: 4,
+                  text: "1. Edit src/App.jsx to add the route.\n2. Verify with npm test.",
+                },
+              ],
+            },
+      ),
+    }));
+
+    await getStore().executePlan(id);
+
+    expect(vi.mocked(invoke)).toHaveBeenCalledWith(
+      "agent_execute_plan",
+      expect.objectContaining({
+        request: expect.objectContaining({
+          plan_text: "1. Edit src/App.jsx to add the route.\n2. Verify with npm test.",
+          model: "qwen",
+        }),
+      }),
+    );
+    expect(getStore().sessions.find((s) => s.id === id)?.mode).toBe("agent");
+  });
+
+  it("does not start agent execution without a plan block", async () => {
+    const id = getStore().newSession({ mode: "plan", model: "qwen" });
+    await getStore().executePlan(id);
+    expect(vi.mocked(invoke)).not.toHaveBeenCalled();
   });
 });

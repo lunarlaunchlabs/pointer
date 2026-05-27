@@ -30,6 +30,7 @@ type State = {
   openFile: (path: string) => Promise<void>;
   closeTab: (path: string) => void;
   setActive: (path: string) => void;
+  setLanguage: (path: string, language: string) => void;
   updateContent: (path: string, content: string) => void;
   saveActive: () => Promise<void>;
   /** Save the active buffer to disk *without* invoking the
@@ -65,6 +66,10 @@ type State = {
   pendingReveal: { path: string; line: number; column: number; nonce: number } | null;
   revealAt: (path: string, line: number, column: number) => Promise<void>;
   clearPendingReveal: () => void;
+  /** Rewrite every editor-owned reference after a file/folder rename.
+   *  Keeps dirty buffers in memory instead of closing/reopening tabs
+   *  from disk. */
+  rewritePathPrefix: (oldPath: string, newPath: string) => void;
   /** Create a new untitled (in-memory) scratch buffer. Returns the
    *  synthetic path used to identify the tab. Untitled buffers are
    *  saved with the OS file dialog on first save. */
@@ -143,6 +148,30 @@ export const useEditorStore = create<State>((set, get) => ({
     });
   },
   clearPendingReveal: () => set({ pendingReveal: null }),
+  rewritePathPrefix: (oldPath, newPath) => {
+    const rewrite = (path: string): string => rewriteEditorPathPrefix(path, oldPath, newPath);
+    set((s) => ({
+      tabs: s.tabs.map((t) => {
+        const nextPath = rewrite(t.path);
+        if (nextPath === t.path) return t;
+        return {
+          ...t,
+          path: nextPath,
+          name: nextPath.split(/[\\/]/).pop() ?? t.name,
+          language: t.preview ? t.language : languageFromPath(nextPath),
+        };
+      }),
+      activePath: s.activePath ? rewrite(s.activePath) : s.activePath,
+      pinned: s.pinned.map(rewrite),
+      closedTabs: s.closedTabs.map(rewrite),
+      pendingReveal: s.pendingReveal
+        ? { ...s.pendingReveal, path: rewrite(s.pendingReveal.path) }
+        : s.pendingReveal,
+    }));
+    useSession.getState().rewritePathPrefix(oldPath, newPath);
+    notifySession();
+    useSession.getState().notePinnedTabs(get().pinned);
+  },
   openUntitled: async (initial = "", language = "plaintext") => {
     // Find an unused "Untitled-N" name. We scan existing tabs (not
     // disk) because untitled files don't live on disk yet.
@@ -248,6 +277,11 @@ export const useEditorStore = create<State>((set, get) => ({
       useNavHistory.getState().push({ path, line: 1, column: 1 });
     });
   },
+  setLanguage: (path, language) => {
+    set((s) => ({
+      tabs: s.tabs.map((t) => (t.path === path ? { ...t, language } : t)),
+    }));
+  },
   updateContent: (path, content) => {
     set((s) => ({
       tabs: s.tabs.map((t) =>
@@ -339,6 +373,11 @@ function notifySession() {
     s.tabs.map((t) => t.path),
     s.activePath,
   );
+}
+
+function rewriteEditorPathPrefix(path: string, oldPath: string, newPath: string): string {
+  if (path === oldPath) return newPath;
+  return path.startsWith(`${oldPath}/`) ? `${newPath}${path.slice(oldPath.length)}` : path;
 }
 
 /**
@@ -487,6 +526,12 @@ export function detectPreviewKind(path: string): "image" | "binary" | null {
     "avi",
     "webm",
     "pdf",
+    "woff",
+    "woff2",
+    "ttf",
+    "otf",
+    "eot",
+    "icns",
   ]);
   if (BINARY_EXTS.has(ext)) return "binary";
   return null;

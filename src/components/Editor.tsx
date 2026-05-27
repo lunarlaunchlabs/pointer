@@ -11,7 +11,14 @@ import { useBookmarkDecorations } from "@/lib/bookmarkDecorations";
 import { registerColorProviders } from "@/lib/colorProvider";
 import { useSession } from "@/store/session";
 import { useSettings, isFeatureUsable } from "@/store/settings";
-import { ipc, listenEvent, newRequestId } from "@/lib/ipc";
+import {
+  ipc,
+  listenEvent,
+  newRequestId,
+  type LspCompletionItem,
+  type LspDiagnosticEvent,
+  type LspRange,
+} from "@/lib/ipc";
 import { onAction } from "@/lib/actions";
 import { toast } from "@/components/Toast";
 import { InlineEdit } from "@/components/InlineEdit";
@@ -22,13 +29,35 @@ import {
   sendSelectionToAI,
   type AiTarget,
 } from "@/lib/sendToAI";
-import { useChat } from "@/store/chat";
-import { useAgent } from "@/store/agentSessions";
+import { useAssistant } from "@/store/assistant";
 import { useRecentEdits } from "@/store/recentEdits";
 import { aiStageDecorationsFor } from "@/lib/aiStageDecorations";
 import { buildFimContext } from "@/lib/fimContext";
+import {
+  extractPathTarget,
+  resolvePathTarget,
+  type PathTarget,
+} from "@/lib/fileNavigation";
+import {
+  definitionSearchPatterns,
+  findLocalDefinitions,
+  symbolAtPosition,
+} from "@/lib/symbolNavigation";
+import {
+  vueCompletionSymbolsForPosition,
+  type VueSymbolKind,
+} from "@/lib/vueIntelligence";
+import { pathFromMonacoUri } from "@/lib/monacoUri";
 
 type FimPending = { id: string; cancel: () => void };
+type PointerLspCompletion = languages.CompletionItem & {
+  __pointerLsp?: {
+    path: string;
+    language: string;
+    content: string;
+    item: LspCompletionItem;
+  };
+};
 
 export function Editor() {
   const monacoRef = useRef<Monaco | null>(null);
@@ -134,30 +163,20 @@ export function Editor() {
   }, [triggerInlineEdit]);
 
   // ────────────────────────────────────────────────────────────────────
-  // AI-staged ref decorations. Watches both the chat composer's pending
-  // refs and the active agent draft's references; redraws whenever
-  // either list changes, the editor's active path changes, or the
-  // editor instance itself is replaced. Decoration IDs are tracked in
-  // a ref so we can call `deltaDecorations(prev, next)` cleanly.
+  // AI-staged ref decorations. Watches the unified Assistant's pending
+  // refs and redraws whenever the active Assistant mode changes, the
+  // editor's active path changes, or the editor instance itself is
+  // replaced. Decoration IDs are tracked in a ref so we can call
+  // `deltaDecorations(prev, next)` cleanly.
   // ────────────────────────────────────────────────────────────────────
-  const chatRefs = useChat((s) => s.pendingRefs);
-  const agentDraft = useAgent((s) => s.getActive());
-  // The agent draft only contributes refs while it's still editable
-  // (status === 'idle'). Running drafts already sealed their context
-  // into the live request, so painting the lines a second time would
-  // mislead the user. Memoised so the `[]` fallback keeps the same
-  // reference between renders — otherwise the `useEffect` below
-  // would re-run on every render and call `deltaDecorations` for
-  // no reason.
-  const agentRefs = useMemo(
-    () => (agentDraft?.status === "idle" ? agentDraft.references : []),
-    [agentDraft],
+  const assistantPendingRefs = useAssistant((s) => s.pendingRefs);
+  const assistantMode = useAssistant(
+    (s) => s.sessions.find((x) => x.id === s.activeSessionId)?.mode ?? "ask",
   );
   const stagedDecos = useMemo(() => {
-    const a = aiStageDecorationsFor(chatRefs, "chat", activePath);
-    const b = aiStageDecorationsFor(agentRefs, "agent", activePath);
-    return [...a, ...b];
-  }, [chatRefs, agentRefs, activePath]);
+    const surface = assistantMode === "ask" ? "chat" : "agent";
+    return aiStageDecorationsFor(assistantPendingRefs, surface, activePath);
+  }, [assistantPendingRefs, assistantMode, activePath]);
   const decoIdsRef = useRef<string[]>([]);
   useEffect(() => {
     const ed = editorRef.current;
@@ -226,6 +245,7 @@ export function Editor() {
     // Subscribe the diagnostics store to Monaco's global marker stream.
     // Also idempotent — guarded by an internal flag in the store.
     useDiagnostics.getState().installFromMonaco(monaco);
+    registerLspDiagnostics(monaco);
 
     // Cmd+K inside Monaco. Re-reads the gate via triggerInlineEdit so
     // toggling the feature in the AI panel takes effect immediately.
@@ -249,9 +269,9 @@ export function Editor() {
     }[] = [
       {
         id: "pointer.sendSelectionToChat",
-        label: "Pointer: Send selection to chat",
-        target: "chat",
-        run: () => sendSelectionFromEditor(ed, "chat"),
+        label: "Pointer: Send selection to Ask",
+        target: "ask",
+        run: () => sendSelectionFromEditor(ed, "ask"),
       },
       {
         id: "pointer.sendSelectionToAgent",
@@ -272,11 +292,11 @@ export function Editor() {
         run: a.run,
       });
     }
-    // Cmd+L sends the selection straight to chat (Cursor-parity
+    // Cmd+L sends the selection straight to Ask (Cursor-parity
     // shortcut). Cmd+Shift+L sends it to the agent.
     ed.addCommand(
       monaco.KeyMod.CtrlCmd | monaco.KeyCode.KeyL,
-      () => sendSelectionFromEditor(ed, "chat"),
+      () => sendSelectionFromEditor(ed, "ask"),
     );
     ed.addCommand(
       monaco.KeyMod.CtrlCmd | monaco.KeyMod.Shift | monaco.KeyCode.KeyL,
@@ -322,6 +342,15 @@ export function Editor() {
     });
     ed.onDidChangeCursorPosition((e) => {
       setCursor({ line: e.position.lineNumber, column: e.position.column });
+    });
+
+    // Pointer-grade file navigation: Monaco can handle rich definitions
+    // for TS/JS open models, but developers also expect Cmd/Ctrl-click
+    // on import strings, markdown links, and stack-trace paths to open
+    // files in the workbench. This small language-agnostic layer fills
+    // that gap across frameworks without needing a full LSP for each one.
+    ed.onMouseDown((mouseEvent) => {
+      void openFileTargetUnderPointer(ed, mouseEvent);
     });
 
     // Bridge: outside-the-editor surfaces (palette, status bar, menu)
@@ -378,6 +407,9 @@ export function Editor() {
       if (!id || !model) return;
       try {
         monaco.editor.setModelLanguage(model, id);
+        useEditorStore
+          .getState()
+          .setLanguage(pathFromMonacoUri(model.uri.toString()), id);
       } catch {
         /* unknown language id — ignore */
       }
@@ -408,6 +440,24 @@ export function Editor() {
       loadSnippets(workspaceRoot, m);
     });
   }, [workspaceRoot]);
+
+  // Keep external language servers in sync with the active buffer. The
+  // backend is lazy: when no server exists for the language this is a
+  // cheap no-op; when one does exist (e.g. rust-analyzer), this is what
+  // unlocks hover, completion, definitions, symbols, and diagnostics.
+  useEffect(() => {
+    if (!activeTab || activeTab.preview || activeTab.path.startsWith("untitled:")) return;
+    const handle = window.setTimeout(() => {
+      ipc
+        .lspDidOpen({
+          path: activeTab.path,
+          language: activeTab.language,
+          content: activeTab.content,
+        })
+        .catch(() => {});
+    }, 250);
+    return () => window.clearTimeout(handle);
+  }, [activeTab?.path, activeTab?.language, activeTab?.content, activeTab?.preview]);
 
   // Inline blame on the current cursor line. Skipped for dirty
   // files (line numbers drift) and when no workspace is open.
@@ -757,6 +807,45 @@ function ExternalChangeBanner({
  * Zustand `getState()` calls so they don't go stale on remount.
  */
 let aiProvidersRegistered = false;
+let lspDiagnosticsRegistered = false;
+
+function registerLspDiagnostics(monaco: Monaco) {
+  if (lspDiagnosticsRegistered) return;
+  lspDiagnosticsRegistered = true;
+  listenEvent<LspDiagnosticEvent>("lsp:diagnostics", (event) => {
+    const model = monaco.editor
+      .getModels()
+      .find((m) => pathFromMonacoUri(m.uri.toString()) === event.path);
+    if (!model) return;
+    if (!usesExternalLspDiagnostics(model.getLanguageId())) {
+      monaco.editor.setModelMarkers(model, "lsp", []);
+      return;
+    }
+    monaco.editor.setModelMarkers(
+      model,
+      "lsp",
+      event.diagnostics.map((d) => ({
+        startLineNumber: d.range.startLine,
+        startColumn: d.range.startColumn,
+        endLineNumber: d.range.endLine,
+        endColumn: d.range.endColumn,
+        severity: lspSeverity(monaco, d.severity),
+        message: d.message,
+        source: d.source ?? "lsp",
+        code: d.code ?? undefined,
+      })),
+    );
+  }).catch(() => {});
+}
+
+function usesExternalLspDiagnostics(language: string): boolean {
+  // Monaco's TS/JS worker is the source of truth for plain .ts/.js buffers.
+  // The external language server still powers completion/hover/definition, but
+  // letting both publish diagnostics can create contradictory squiggles while
+  // tsserver is warming up or has inferred-project settings out of date.
+  return language !== "typescript" && language !== "javascript";
+}
+
 function registerGlobalAiProviders(monaco: Monaco) {
   if (aiProvidersRegistered) return;
   aiProvidersRegistered = true;
@@ -771,13 +860,13 @@ function registerGlobalAiProviders(monaco: Monaco) {
         for (const m of ctx.markers) {
           const label = m.message.split("\n")[0].slice(0, 80);
           actions.push({
-            title: `Pointer · Send to chat: ${label}`,
+            title: `Pointer · Send to Ask: ${label}`,
             kind: "quickfix",
             diagnostics: [m],
             command: {
               id: "pointer.sendMarkerToChat",
-              title: "Send to chat",
-              arguments: [m, "chat"],
+              title: "Send to Ask",
+              arguments: [m, "ask"],
             },
           });
           actions.push({
@@ -835,7 +924,7 @@ function registerGlobalAiProviders(monaco: Monaco) {
   };
   monaco.editor.registerCommand(
     "pointer.sendMarkerToChat",
-    dispatchMarker("chat"),
+    dispatchMarker("ask"),
   );
   monaco.editor.registerCommand(
     "pointer.sendMarkerToAgent",
@@ -872,8 +961,8 @@ function registerGlobalAiProviders(monaco: Monaco) {
           },
           command: {
             id: "pointer.sendMarkerToChat",
-            title: `$(comment-discussion) Pointer · Chat: ${summary}`,
-            arguments: [headMarker, "chat"],
+            title: `$(comment-discussion) Pointer · Ask: ${summary}`,
+            arguments: [headMarker, "ask"],
           },
         });
         lenses.push({
@@ -895,6 +984,262 @@ function registerGlobalAiProviders(monaco: Monaco) {
   };
   monaco.languages.registerCodeLensProvider({ pattern: "**" }, lensProvider);
   monaco.editor.onDidChangeMarkers(() => lensEmitter.fire(lensProvider));
+
+  // Cross-language definition fallback. Monaco's TS/JS worker already
+  // gives rich definitions, but many local repos also have Rust,
+  // Python, Go, config-adjacent scripts, etc. Without a full LSP
+  // transport, F12 / Cmd-click should still land somewhere useful
+  // instead of feeling broken, so we search for declaration-shaped
+  // lines in the workspace and return them as definition locations.
+  monaco.languages.registerDefinitionProvider(
+    { pattern: "**" },
+    {
+      provideDefinition: async (model, position) => {
+        const word = symbolAtPosition(
+          model.getLineContent(position.lineNumber),
+          position.column,
+        );
+        if (!word) return null;
+        const language = model.getLanguageId();
+        const patterns = definitionSearchPatterns(word.symbol, language);
+        const sourcePath = pathFromMonacoUri(model.uri.toString());
+
+        const lspLocations = await ipc
+          .lspDefinition({
+            path: sourcePath,
+            language,
+            content: model.getValue(),
+            line: position.lineNumber,
+            column: position.column,
+            limit: 30,
+          })
+          .catch(() => []);
+        if (lspLocations.length > 0) {
+          return lspLocations.map((loc) => ({
+            uri: monaco.Uri.file(loc.path),
+            range: new monaco.Range(
+              loc.line,
+              loc.column,
+              loc.endLine,
+              loc.endColumn,
+            ),
+          }));
+        }
+
+        if (patterns.length === 0) return null;
+
+        const batches = await Promise.all(
+          patterns.map((pattern) =>
+            ipc
+              .searchText(pattern, 25, {
+                regex: true,
+                case_sensitive: true,
+              })
+              .catch(() => []),
+          ),
+        );
+        const seen = new Set<string>();
+        const hits = batches
+          .flat()
+          .filter((hit) => {
+            const key = `${hit.path}:${hit.line}`;
+            if (seen.has(key)) return false;
+            seen.add(key);
+            return true;
+          })
+          .sort((a, b) => {
+            const sameA = a.path === sourcePath ? 0 : 1;
+            const sameB = b.path === sourcePath ? 0 : 1;
+            if (sameA !== sameB) return sameA - sameB;
+            return a.path.localeCompare(b.path) || a.line - b.line;
+          })
+          .slice(0, 30);
+        if (hits.length === 0) return null;
+        return hits.map((hit) => {
+          const start = Math.max(1, hit.text.indexOf(word.symbol) + 1);
+          return {
+            uri: monaco.Uri.file(hit.path),
+            range: new monaco.Range(
+              hit.line,
+              start,
+              hit.line,
+              start + word.symbol.length,
+            ),
+          };
+        });
+      },
+    },
+  );
+
+  // Hover affordance for the file-navigation layer above. This is
+  // intentionally advisory only; the actual open happens from the
+  // editor mouse handler so the file lands in Pointer's tab model.
+  monaco.languages.registerHoverProvider(
+    { pattern: "**" },
+    {
+      provideHover: async (model, position) => {
+        const target = extractPathTarget(
+          model.getLineContent(position.lineNumber),
+          position.column,
+        );
+        if (!target) {
+          const word = symbolAtPosition(
+            model.getLineContent(position.lineNumber),
+            position.column,
+          );
+          if (!word) return null;
+          const sourcePath = pathFromMonacoUri(model.uri.toString());
+          const lspHover = await ipc
+            .lspHover({
+              path: sourcePath,
+              language: model.getLanguageId(),
+              content: model.getValue(),
+              line: position.lineNumber,
+              column: position.column,
+            })
+            .catch(() => null);
+          if (lspHover?.contents) {
+            return {
+              range: modelRangeFromLsp(
+                monaco,
+                position.lineNumber,
+                word.startColumn,
+                word.endColumn,
+                lspHover.range,
+              ),
+              contents: [{ value: lspHover.contents }],
+            };
+          }
+          const defs = findLocalDefinitions(
+            model.getValue(),
+            word.symbol,
+            model.getLanguageId(),
+          );
+          const best = defs[0];
+          if (!best) return null;
+          return {
+            range: new monaco.Range(
+              position.lineNumber,
+              word.startColumn,
+              position.lineNumber,
+              word.endColumn,
+            ),
+            contents: [
+              {
+                value: `Pointer definition: line ${best.line}\n\n\`${best.text}\``,
+              },
+            ],
+          };
+        }
+        const sourcePath = pathFromMonacoUri(model.uri.toString());
+        const resolved = await resolvePathTarget({
+          target,
+          sourcePath,
+          workspaceRoot: useWorkspace.getState().root,
+        });
+        const range = new monaco.Range(
+          position.lineNumber,
+          target.startColumn,
+          position.lineNumber,
+          target.endColumn,
+        );
+        if (!resolved) {
+          return {
+            range,
+            contents: [{ value: `File target not found: \`${target.raw}\`` }],
+          };
+        }
+        return {
+          range,
+          contents: [
+            {
+              value: `${primaryModifierLabel()}-click to open \`${shortPath(resolved.path)}\``,
+            },
+          ],
+        };
+      },
+    },
+  );
+
+  monaco.languages.registerCompletionItemProvider(
+    { pattern: "**" },
+    {
+      triggerCharacters: [".", ":", "<", '"', "'", "/", "@"],
+      provideCompletionItems: async (model, position) => {
+        const sourcePath = pathFromMonacoUri(model.uri.toString());
+        const language = model.getLanguageId();
+        const content = model.getValue();
+        const items = await ipc
+          .lspCompletion({
+            path: sourcePath,
+            language,
+            content,
+            line: position.lineNumber,
+            column: position.column,
+            limit: 80,
+          })
+          .catch(() => []);
+        const word = model.getWordUntilPosition(position);
+        const range = new monaco.Range(
+          position.lineNumber,
+          word.startColumn,
+          position.lineNumber,
+          word.endColumn,
+        );
+        if (items.length === 0 && language === "vue") {
+          const fallback = vueCompletionSymbolsForPosition(
+            content,
+            position.lineNumber,
+            position.column,
+          );
+          return {
+            suggestions: fallback.map((item) => ({
+              label: item.name,
+              kind: vueCompletionKind(monaco, item.kind),
+              insertText: item.name,
+              detail: `Vue ${item.kind}`,
+              range,
+            })),
+          };
+        }
+        if (items.length === 0) return { suggestions: [] };
+        return {
+          suggestions: items.map((item) =>
+            completionItemFromLsp(monaco, item, range, {
+              path: sourcePath,
+              language,
+              content,
+            }),
+          ),
+        };
+      },
+      resolveCompletionItem: async (completion) => {
+        const meta = (completion as PointerLspCompletion).__pointerLsp;
+        if (!meta) return completion;
+        const resolved = await ipc
+          .lspCompletionResolve({
+            path: meta.path,
+            language: meta.language,
+            content: meta.content,
+            item: meta.item,
+          })
+          .catch(() => null);
+        if (!resolved) return completion;
+        const next = completionItemFromLsp(
+          monaco,
+          resolved,
+          completion.range,
+          {
+            path: meta.path,
+            language: meta.language,
+            content: meta.content,
+          },
+        );
+        Object.assign(completion, next);
+        return completion;
+      },
+    },
+  );
 
   // FIM inline completion provider. Pulls all of its config via
   // `useSettings.getState()` at call time so the FIM model / debounce
@@ -1015,8 +1360,214 @@ function registerGlobalAiProviders(monaco: Monaco) {
   );
 }
 
+async function openFileTargetUnderPointer(
+  ed: editor.IStandaloneCodeEditor,
+  mouseEvent: Parameters<editor.IStandaloneCodeEditor["onMouseDown"]>[0] extends (
+    listener: (event: infer E) => unknown,
+  ) => unknown
+    ? E
+    : any,
+) {
+  const event = mouseEvent.event as unknown as {
+    metaKey?: boolean;
+    ctrlKey?: boolean;
+    preventDefault?: () => void;
+    stopPropagation?: () => void;
+  };
+  if (!event.metaKey && !event.ctrlKey) return;
+  const position = mouseEvent.target.position;
+  if (!position) return;
+  const model = ed.getModel();
+  if (!model) return;
+  const target = extractPathTarget(
+    model.getLineContent(position.lineNumber),
+    position.column,
+  );
+  if (!target) return;
+
+  event.preventDefault?.();
+  event.stopPropagation?.();
+  const resolved = await resolveTargetFromModel(model, target);
+  if (!resolved) {
+    toast.info("No file found for link", { body: target.raw });
+    return;
+  }
+  useEditorStore.getState().revealAt(resolved.path, 1, 1).catch(() => {});
+}
+
+async function resolveTargetFromModel(
+  model: editor.ITextModel,
+  target: PathTarget,
+) {
+  return resolvePathTarget({
+    target,
+    sourcePath: pathFromMonacoUri(model.uri.toString()),
+    workspaceRoot: useWorkspace.getState().root,
+  });
+}
+
+function primaryModifierLabel(): string {
+  if (typeof navigator !== "undefined" && /Mac|iPhone|iPad/.test(navigator.platform)) {
+    return "Cmd";
+  }
+  return "Ctrl";
+}
+
+function lspSeverity(monaco: Monaco, severity: number | null | undefined) {
+  switch (severity) {
+    case 1:
+      return monaco.MarkerSeverity.Error;
+    case 2:
+      return monaco.MarkerSeverity.Warning;
+    case 3:
+      return monaco.MarkerSeverity.Info;
+    case 4:
+      return monaco.MarkerSeverity.Hint;
+    default:
+      return monaco.MarkerSeverity.Info;
+  }
+}
+
+function lspCompletionKind(monaco: Monaco, kind: number | null | undefined) {
+  const k = monaco.languages.CompletionItemKind;
+  switch (kind) {
+    case 2:
+      return k.Method;
+    case 3:
+      return k.Function;
+    case 4:
+      return k.Constructor;
+    case 5:
+      return k.Field;
+    case 6:
+      return k.Variable;
+    case 7:
+      return k.Class;
+    case 8:
+      return k.Interface;
+    case 9:
+      return k.Module;
+    case 10:
+      return k.Property;
+    case 12:
+      return k.Value;
+    case 13:
+      return k.Enum;
+    case 14:
+      return k.Keyword;
+    case 15:
+      return k.Snippet;
+    case 16:
+      return k.Color;
+    case 17:
+      return k.File;
+    case 18:
+      return k.Reference;
+    case 20:
+      return k.EnumMember;
+    case 21:
+      return k.Constant;
+    case 22:
+      return k.Struct;
+    case 23:
+      return k.Event;
+    case 24:
+      return k.Operator;
+    case 25:
+      return k.TypeParameter;
+    default:
+      return k.Text;
+  }
+}
+
+function vueCompletionKind(monaco: Monaco, kind: VueSymbolKind) {
+  const k = monaco.languages.CompletionItemKind;
+  switch (kind) {
+    case "component":
+      return k.Class;
+    case "computed":
+    case "data":
+    case "prop":
+    case "ref":
+    case "setup":
+      return k.Property;
+    case "method":
+      return k.Method;
+    default:
+      return k.Text;
+  }
+}
+
+function completionItemFromLsp(
+  monaco: Monaco,
+  item: LspCompletionItem,
+  fallbackRange: languages.CompletionItem["range"],
+  meta: { path: string; language: string; content: string },
+): PointerLspCompletion {
+  const insertText = item.insertText || item.label;
+  const completion: PointerLspCompletion = {
+    label: item.label,
+    kind: lspCompletionKind(monaco, item.kind),
+    insertText,
+    insertTextRules:
+      item.insertTextFormat === 2 || /\$\d|\$\{/.test(insertText)
+        ? monaco.languages.CompletionItemInsertTextRule.InsertAsSnippet
+        : undefined,
+    detail: item.detail ?? undefined,
+    documentation: item.documentation ? { value: item.documentation } : undefined,
+    range: item.range ? lspRangeToMonaco(monaco, item.range) : fallbackRange,
+    sortText: item.sortText ?? undefined,
+    filterText: item.filterText ?? undefined,
+    preselect: item.preselect ?? undefined,
+    additionalTextEdits: item.additionalTextEdits.map((edit) => ({
+      range: lspRangeToMonaco(monaco, edit.range),
+      text: edit.newText,
+    })),
+    __pointerLsp: {
+      ...meta,
+      item,
+    },
+  };
+  return completion;
+}
+
+function lspRangeToMonaco(monaco: Monaco, range: LspRange) {
+  return new monaco.Range(
+    range.startLine,
+    range.startColumn,
+    range.endLine,
+    range.endColumn,
+  );
+}
+
+function modelRangeFromLsp(
+  monaco: Monaco,
+  fallbackLine: number,
+  fallbackStart: number,
+  fallbackEnd: number,
+  range?: { startLine: number; startColumn: number; endLine: number; endColumn: number } | null,
+) {
+  if (range) {
+    return new monaco.Range(
+      range.startLine,
+      range.startColumn,
+      range.endLine,
+      range.endColumn,
+    );
+  }
+  return new monaco.Range(fallbackLine, fallbackStart, fallbackLine, fallbackEnd);
+}
+
+function shortPath(path: string): string {
+  const root = useWorkspace.getState().root;
+  if (root && path.startsWith(root)) {
+    return path.slice(root.length).replace(/^[\\/]+/, "");
+  }
+  return path;
+}
+
 /**
- * Lift the editor's current selection into the chat / agent picker.
+ * Lift the editor's current selection into the Ask / Agent picker.
  * Centralised so the Cmd+L shortcut, the right-click action and the
  * command palette all go through one code path — which means each
  * trigger surfaces the same toasts (and the same "select something
@@ -1038,10 +1589,7 @@ function sendSelectionFromEditor(
   // Monaco model URIs are `file:///abs/path`. The send-to-AI helper
   // expects a workspace-relative *path*; we strip the scheme + the
   // Windows leading slash that follows it.
-  const path = model.uri
-    .toString()
-    .replace(/^file:\/\//, "")
-    .replace(/^\/([A-Za-z]):/, "$1:");
+  const path = pathFromMonacoUri(model.uri.toString());
   sendSelectionToAI(target, {
     path,
     startLine: sel.startLineNumber,

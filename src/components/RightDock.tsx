@@ -1,5 +1,6 @@
-import { useEffect } from "react";
+import { lazy, Suspense, useEffect, useState } from "react";
 import {
+  Activity,
   Bot,
   ChevronLeft,
   ChevronRight,
@@ -9,12 +10,31 @@ import {
 } from "lucide-react";
 import { useSession, type DockView } from "@/store/session";
 import { useSettings, isFeatureUsable } from "@/store/settings";
-import { AssistantView } from "@/components/Assistant/AssistantView";
-import { AIPanelView } from "@/components/AIPanel";
-import { HistoryView } from "@/components/Chat/HistoryView";
-import { SourceControlPanel } from "@/components/Git/SourceControlPanel";
 import { useGit } from "@/store/git";
 import { useAssistant } from "@/store/assistant";
+import { ipc, listenEvent, type InferenceSnapshot } from "@/lib/ipc";
+
+const AssistantView = lazy(() =>
+  import("@/components/Assistant/AssistantView").then((m) => ({
+    default: m.AssistantView,
+  })),
+);
+const AIPanelView = lazy(() =>
+  import("@/components/AIPanel").then((m) => ({ default: m.AIPanelView })),
+);
+const ModelActivityPanel = lazy(() =>
+  import("@/components/ModelActivityPanel").then((m) => ({
+    default: m.ModelActivityPanel,
+  })),
+);
+const HistoryView = lazy(() =>
+  import("@/components/Chat/HistoryView").then((m) => ({ default: m.HistoryView })),
+);
+const SourceControlPanel = lazy(() =>
+  import("@/components/Git/SourceControlPanel").then((m) => ({
+    default: m.SourceControlPanel,
+  })),
+);
 
 /** The right-hand dock. A persistent rail with view buttons + an optionally-
  *  collapsible panel area. The rail is always visible so the user can never
@@ -51,12 +71,15 @@ export function RightDock() {
     <div className="h-full flex shrink-0 border-l border-noir-line bg-noir-panel/80 backdrop-blur-xs">
       {panelOpen && (
         <PanelContainer width={chatWidth ?? 420} onResize={noteChatWidth}>
-          {dockView === "assistant" && <AssistantView />}
-          {dockView === "history" && (
-            <HistoryView onNavigate={(v) => setDockView(v)} />
-          )}
-          {dockView === "ai" && <AIPanelView />}
-          {dockView === "scm" && <SourceControlPanel />}
+          <Suspense fallback={<DockLoading />}>
+            {dockView === "assistant" && <AssistantView />}
+            {dockView === "history" && (
+              <HistoryView onNavigate={(v) => setDockView(v)} />
+            )}
+            {dockView === "ai" && <AIPanelView />}
+            {dockView === "activity" && <ModelActivityPanel />}
+            {dockView === "scm" && <SourceControlPanel />}
+          </Suspense>
         </PanelContainer>
       )}
       <nav
@@ -77,6 +100,13 @@ export function RightDock() {
         />
         {/* Visual separator — secondary tools (history, scm, settings). */}
         <div className="w-5 h-px bg-noir-line/60 my-1.5" aria-hidden="true" />
+        <RailButton
+          icon={<Activity size={14} aria-hidden="true" />}
+          label="Model Activity"
+          active={dockView === "activity"}
+          onClick={() => select("activity")}
+          badge={<InferenceBadge />}
+        />
         <RailButton
           icon={<GitBranch size={14} aria-hidden="true" />}
           label="Source Control"
@@ -107,6 +137,14 @@ export function RightDock() {
           {panelOpen ? <ChevronRight size={12} aria-hidden="true" /> : <ChevronLeft size={12} aria-hidden="true" />}
         </button>
       </nav>
+    </div>
+  );
+}
+
+function DockLoading() {
+  return (
+    <div className="h-full flex items-center justify-center bg-noir-bg text-[11px] font-sans text-noir-mute">
+      Loading…
     </div>
   );
 }
@@ -203,6 +241,44 @@ function RunningBadge() {
       aria-label="Assistant is running"
       role="status"
     />
+  );
+}
+
+function InferenceBadge() {
+  const [count, setCount] = useState(0);
+  useEffect(() => {
+    let alive = true;
+    let off: (() => void) | undefined;
+    listenEvent<InferenceSnapshot>("inference:changed", (snapshot) => {
+      if (alive) setCount(snapshot.active_count);
+    }).then((u) => (off = u));
+    const refresh = () => {
+      ipc
+        .inferenceStatus()
+        .then((snapshot) => {
+          if (alive) setCount(snapshot.active_count);
+        })
+        .catch(() => {
+          if (alive) setCount(0);
+        });
+    };
+    refresh();
+    const id = window.setInterval(refresh, 1500);
+    return () => {
+      alive = false;
+      off?.();
+      window.clearInterval(id);
+    };
+  }, []);
+  if (count === 0) return null;
+  return (
+    <span
+      className="absolute -top-1 -right-1 min-w-[14px] h-[14px] px-1 rounded-full bg-noir-accent text-[9px] font-medium text-white flex items-center justify-center"
+      aria-label={`${count} model job${count === 1 ? "" : "s"} running`}
+      role="status"
+    >
+      {count > 9 ? "9+" : count}
+    </span>
   );
 }
 

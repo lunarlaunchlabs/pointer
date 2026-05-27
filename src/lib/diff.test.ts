@@ -32,6 +32,24 @@ describe("parseSearchReplace", () => {
     expect(hunks[0].replace).toBe("export const a = 1;");
   });
 
+  it("parses the common drift shape with the path on the next line", () => {
+    const text = [
+      "<<<<<<< SEARCH",
+      "src/foo.ts",
+      "const x = 1;",
+      "=======",
+      "const x = 2;",
+      ">>>>>>> REPLACE",
+    ].join("\n");
+    const hunks = parseSearchReplace(text);
+    expect(hunks).toHaveLength(1);
+    expect(hunks[0]).toEqual({
+      path: "src/foo.ts",
+      search: "const x = 1;",
+      replace: "const x = 2;",
+    });
+  });
+
   it("parses a <file> create block", () => {
     const text = `<file path="src/new.ts">\nexport const x = 1;\n</file>`;
     const hunks = parseSearchReplace(text);

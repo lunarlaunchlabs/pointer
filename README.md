@@ -3,8 +3,8 @@
 An AI-first code editor powered by open-source models running locally.
 
 Pointer abstracts away running models on your computer. You pick the model you
-want — typically a GGUF from Hugging Face — and Pointer handles loading,
-inference, and integration with the editor. Everything stays on your machine.
+want from Ollama's model library, and Pointer handles loading, inference, and
+integration with the editor. Everything stays on your machine.
 
 ## Features
 
@@ -25,8 +25,9 @@ Three layers mirror Cursor:
 - **Context engine** — chunker + Merkle hashes + embeddings + SQLite (`src-tauri/src/services/`, `src-tauri/src/commands/context.rs`).
 
 All inference is delegated to a managed [Ollama](https://ollama.com) daemon, which
-exposes an OpenAI-compatible API on `localhost:11434`. Hugging Face GGUFs are
-imported via `hf-hub` + `ollama create` from a synthesized Modelfile.
+exposes an OpenAI-compatible API on `localhost:11434`. The marketplace fetches
+Ollama's upstream library list, overlays your locally installed models, and
+pulls through Ollama.
 
 ```
 ┌─ Renderer ────────────────────────────┐
@@ -36,11 +37,11 @@ imported via `hf-hub` + `ollama create` from a synthesized Modelfile.
 ┌─ Rust backend ────────────────────────┐
 │  FS · watcher · Tree-sitter-ish       │
 │  chunker · Merkle · embeddings        │
-│  Ollama client · HF Hub client        │
+│  Ollama client · library catalog      │
 └────── HTTP localhost:11434 ───────────┘
 ┌─ Ollama daemon (managed) ─────────────┐
 │  Qwen2.5-Coder · DeepSeek-Coder-V2    │
-│  nomic-embed-text · your HF imports   │
+│  nomic-embed-text · your pulls        │
 └───────────────────────────────────────┘
 ```
 
@@ -61,8 +62,7 @@ npm run tauri:dev
 The first run walks you through:
 
 1. Installing/starting Ollama.
-2. (Optional) Saving a Hugging Face token to your OS keychain.
-3. Picking models tuned to your RAM (tab completion + chat + embeddings).
+2. Picking models tuned to your RAM (tab completion + chat + embeddings).
 
 ## Recommended models
 
@@ -90,7 +90,7 @@ The first run walks you through:
 
 Pointer never sends your code over the network. The only outbound calls are:
 
-- Model downloads from Hugging Face / ollama.com (when you click Pull).
-- The Hugging Face search API for the model browser (when you use it).
+- Ollama library metadata for the model browser.
+- Model downloads from Ollama (when you click Pull).
 
 All prompts and embeddings stay between Pointer and your local Ollama on `127.0.0.1`.

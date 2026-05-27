@@ -21,11 +21,14 @@
 //!   than mis-extract.
 
 use crate::error::{AppError, AppResult};
+use crate::services::inference::{acquire_inference, InferenceClaim, InferencePolicy};
+use crate::state::AppState;
 use base64::Engine;
 use calamine::Reader;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::path::{Path, PathBuf};
+use tauri::{AppHandle, State};
 
 const OLLAMA_BASE: &str = "http://127.0.0.1:11434";
 
@@ -165,7 +168,11 @@ pub struct ProcessFileResult {
 }
 
 #[tauri::command]
-pub async fn process_file(args: ProcessFileArgs) -> AppResult<ProcessFileResult> {
+pub async fn process_file(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    args: ProcessFileArgs,
+) -> AppResult<ProcessFileResult> {
     let path = PathBuf::from(&args.path);
     if !path.exists() {
         return Err(AppError::Msg(format!("file does not exist: {}", args.path)));
@@ -194,7 +201,30 @@ pub async fn process_file(args: ProcessFileArgs) -> AppResult<ProcessFileResult>
             // model the user gets a summarised version that fits in context.
             match args.model.as_deref().filter(|s| !s.is_empty()) {
                 Some(m) => {
-                    let summary = summarise_text(m, &info.label, &extracted, args.instruction.as_deref()).await?;
+                    let request_id = format!("file_{}", uuid::Uuid::new_v4().simple());
+                    let _permit = acquire_inference(
+                        &app,
+                        &state,
+                        InferenceClaim::new(
+                            request_id.clone(),
+                            m.to_string(),
+                            "document",
+                            format!("Process {}", path.display()),
+                        ),
+                        InferencePolicy::RejectBusy,
+                    )
+                    .await?;
+                    let mut cancel = state.cancels.lock().issue(&request_id);
+                    let summary = summarise_text(
+                        m,
+                        &info.label,
+                        &extracted,
+                        args.instruction.as_deref(),
+                        &mut cancel,
+                    )
+                    .await;
+                    state.cancels.lock().clear(&request_id);
+                    let summary = summary?;
                     Ok(ProcessFileResult {
                         kind: info.kind,
                         label: info.label,
@@ -227,8 +257,37 @@ pub async fn process_file(args: ProcessFileArgs) -> AppResult<ProcessFileResult>
                 .model
                 .as_deref()
                 .filter(|s| !s.is_empty())
-                .ok_or_else(|| AppError::Msg("No document model set — pick one in AI Control Panel → Models.".into()))?;
-            let summary = summarise_text(model, "PDF", &extracted, args.instruction.as_deref()).await?;
+                .ok_or_else(|| {
+                    AppError::Msg(
+                        "No document model set — pick one in AI Control Panel → Models.".into(),
+                    )
+                })?;
+            let summary = {
+                let request_id = format!("file_{}", uuid::Uuid::new_v4().simple());
+                let _permit = acquire_inference(
+                    &app,
+                    &state,
+                    InferenceClaim::new(
+                        request_id.clone(),
+                        model.to_string(),
+                        "document",
+                        format!("Process {}", path.display()),
+                    ),
+                    InferencePolicy::RejectBusy,
+                )
+                .await?;
+                let mut cancel = state.cancels.lock().issue(&request_id);
+                let summary = summarise_text(
+                    model,
+                    "PDF",
+                    &extracted,
+                    args.instruction.as_deref(),
+                    &mut cancel,
+                )
+                .await;
+                state.cancels.lock().clear(&request_id);
+                summary?
+            };
             Ok(ProcessFileResult {
                 kind: info.kind,
                 label: info.label,
@@ -248,7 +307,24 @@ pub async fn process_file(args: ProcessFileArgs) -> AppResult<ProcessFileResult>
                         "No vision model set — pick one in AI Control Panel → Models.".into(),
                     )
                 })?;
-            let summary = describe_image(model, &path, args.instruction.as_deref()).await?;
+            let request_id = format!("file_{}", uuid::Uuid::new_v4().simple());
+            let _permit = acquire_inference(
+                &app,
+                &state,
+                InferenceClaim::new(
+                    request_id.clone(),
+                    model.to_string(),
+                    "vision",
+                    format!("Process {}", path.display()),
+                ),
+                InferencePolicy::RejectBusy,
+            )
+            .await?;
+            let mut cancel = state.cancels.lock().issue(&request_id);
+            let summary =
+                describe_image(model, &path, args.instruction.as_deref(), &mut cancel).await;
+            state.cancels.lock().clear(&request_id);
+            let summary = summary?;
             Ok(ProcessFileResult {
                 kind: info.kind,
                 label: info.label,
@@ -258,9 +334,10 @@ pub async fn process_file(args: ProcessFileArgs) -> AppResult<ProcessFileResult>
                 model_name: Some(model.to_string()),
             })
         }
-        FileKind::Unsupported => Err(AppError::Msg(info.reason.unwrap_or_else(
-            || "Unsupported file type.".into(),
-        ))),
+        FileKind::Unsupported => Err(AppError::Msg(
+            info.reason
+                .unwrap_or_else(|| "Unsupported file type.".into()),
+        )),
     }
 }
 
@@ -329,7 +406,7 @@ fn extract_spreadsheet(path: &Path) -> AppResult<String> {
             out.push_str(" |\n");
             if row_idx == 0 {
                 // markdown header separator
-                out.push_str("|");
+                out.push('|');
                 for _ in 0..cells.len() {
                     out.push_str("---|");
                 }
@@ -372,7 +449,7 @@ fn extract_csv(path: &Path, delim: u8) -> AppResult<String> {
         out.push_str(&cells.join(" | "));
         out.push_str(" |\n");
         if !headers_written {
-            out.push_str("|");
+            out.push('|');
             for _ in 0..cells.len() {
                 out.push_str("---|");
             }
@@ -381,9 +458,7 @@ fn extract_csv(path: &Path, delim: u8) -> AppResult<String> {
         }
         printed += 1;
         if printed >= MAX_ROWS {
-            out.push_str(&format!(
-                "\n…[truncated to first {MAX_ROWS} rows]…\n"
-            ));
+            out.push_str(&format!("\n…[truncated to first {MAX_ROWS} rows]…\n"));
             break;
         }
     }
@@ -400,8 +475,10 @@ async fn summarise_text(
     label: &str,
     body: &str,
     instruction: Option<&str>,
+    cancel: &mut tokio::sync::broadcast::Receiver<()>,
 ) -> AppResult<String> {
-    let system = "You are an extractor. Read the attached document content and produce a faithful, \
+    let system =
+        "You are an extractor. Read the attached document content and produce a faithful, \
                   structured summary in markdown. Preserve numbers, headers and key tables. \
                   Never invent facts — if a section is missing, omit it.";
     let user = format!(
@@ -413,7 +490,7 @@ async fn summarise_text(
             _ => String::new(),
         }
     );
-    chat_once_unload(model, system, &user, None).await
+    chat_once_unload(model, system, &user, None, cancel).await
 }
 
 /// Run a vision model on a single image. We send the base64 inside the
@@ -423,9 +500,9 @@ async fn describe_image(
     model: &str,
     path: &Path,
     instruction: Option<&str>,
+    cancel: &mut tokio::sync::broadcast::Receiver<()>,
 ) -> AppResult<String> {
-    let bytes = std::fs::read(path)
-        .map_err(|e| AppError::Msg(format!("read image: {e}")))?;
+    let bytes = std::fs::read(path).map_err(|e| AppError::Msg(format!("read image: {e}")))?;
     // Re-encode large images down to a reasonable size. Vision models choke
     // on huge inputs and Ollama will just OOM. 1600px on the long edge is a
     // good ceiling for most.
@@ -438,8 +515,10 @@ async fn describe_image(
     let user = instruction
         .filter(|s| !s.is_empty())
         .map(|s| s.to_string())
-        .unwrap_or_else(|| "Describe this image with everything that would be useful to a developer.".to_string());
-    chat_once_unload(model, system, &user, Some(vec![b64])).await
+        .unwrap_or_else(|| {
+            "Describe this image with everything that would be useful to a developer.".to_string()
+        });
+    chat_once_unload(model, system, &user, Some(vec![b64]), cancel).await
 }
 
 /// Downscale an image only when it exceeds the long-edge threshold. We keep
@@ -471,6 +550,7 @@ async fn chat_once_unload(
     system: &str,
     user: &str,
     images_b64: Option<Vec<String>>,
+    cancel: &mut tokio::sync::broadcast::Receiver<()>,
 ) -> AppResult<String> {
     let mut user_msg = json!({
         "role": "user",
@@ -499,12 +579,16 @@ async fn chat_once_unload(
         }
     });
 
-    let resp = HTTP
+    let send = HTTP
         .post(format!("{OLLAMA_BASE}/api/chat"))
         .json(&body)
-        .send()
-        .await
-        .map_err(|e| AppError::Msg(format!("model call: {e}")))?;
+        .send();
+    let resp = tokio::select! {
+        _ = cancel.recv() => {
+            return Err(AppError::Msg("model call cancelled".into()));
+        }
+        resp = send => resp.map_err(|e| AppError::Msg(format!("model call: {e}")))?,
+    };
     if !resp.status().is_success() {
         let status = resp.status();
         let txt = resp.text().await.unwrap_or_default();
@@ -512,10 +596,14 @@ async fn chat_once_unload(
             "model call {model}: HTTP {status} — {txt}"
         )));
     }
-    let v: Value = resp
-        .json()
-        .await
-        .map_err(|e| AppError::Msg(format!("parse model response: {e}")))?;
+    let parse = resp.json();
+    let v: Value = tokio::select! {
+        _ = cancel.recv() => {
+            return Err(AppError::Msg("model call cancelled".into()));
+        }
+        parsed = parse => parsed
+            .map_err(|e| AppError::Msg(format!("parse model response: {e}")))?,
+    };
     let content = v
         .get("message")
         .and_then(|m| m.get("content"))

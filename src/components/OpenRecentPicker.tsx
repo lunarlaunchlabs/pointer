@@ -2,7 +2,6 @@ import { Command } from "cmdk";
 import { useEffect } from "react";
 import { Folder, FolderOpen, X } from "lucide-react";
 import { useSession } from "@/store/session";
-import { useWorkspace } from "@/store/workspace";
 
 /**
  * "Open Recent…" picker. A focused alternative to the full File Finder
@@ -15,10 +14,15 @@ import { useWorkspace } from "@/store/workspace";
  * driven by the same `file:open_recent` action the menu fires. This
  * keeps the experience identical on macOS, Windows, and Linux.
  */
-export function OpenRecentPicker({ onClose }: { onClose: () => void }) {
+export function OpenRecentPicker({
+  onClose,
+  onOpenRecent,
+}: {
+  onClose: () => void;
+  onOpenRecent: (path: string) => Promise<boolean> | boolean;
+}) {
   const recents = useSession((s) => s.recents);
   const removeRecent = useSession((s) => s.removeRecent);
-  const setRoot = useWorkspace((s) => s.setRoot);
 
   // Close on Esc — overlay etiquette.
   useEffect(() => {
@@ -32,9 +36,9 @@ export function OpenRecentPicker({ onClose }: { onClose: () => void }) {
     return () => window.removeEventListener("keydown", onKey);
   }, [onClose]);
 
-  const pick = (p: string) => {
-    setRoot(p).catch(() => {});
-    onClose();
+  const pick = async (p: string) => {
+    const opened = await onOpenRecent(p);
+    if (opened) onClose();
   };
 
   return (
@@ -70,7 +74,9 @@ export function OpenRecentPicker({ onClose }: { onClose: () => void }) {
                 <Command.Item
                   key={p}
                   value={p}
-                  onSelect={() => pick(p)}
+                  onSelect={() => {
+                    void pick(p);
+                  }}
                   className="group flex items-center justify-between gap-3 px-4 py-2 text-[13px] font-mono text-noir-text aria-selected:bg-noir-ridge cursor-pointer"
                 >
                   <div className="flex items-center gap-2 min-w-0">

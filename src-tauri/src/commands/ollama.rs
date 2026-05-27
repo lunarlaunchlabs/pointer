@@ -1,4 +1,5 @@
 use crate::error::{AppError, AppResult};
+use crate::services::inference::{acquire_inference, InferenceClaim, InferencePolicy};
 use crate::state::AppState;
 use futures_util::StreamExt;
 use once_cell::sync::Lazy;
@@ -355,6 +356,22 @@ pub async fn ollama_unload_model(model: String) -> AppResult<()> {
     if model.is_empty() {
         return Err(AppError::Msg("model name is empty".into()));
     }
+    unload_model_name(model).await
+}
+
+pub async fn unload_models_by_name(models: Vec<String>) {
+    for model in models {
+        let model = normalize_ollama_model_name(&model);
+        if model.is_empty() {
+            continue;
+        }
+        if let Err(e) = unload_model_name(&model).await {
+            log::warn!("failed to unload Ollama model `{model}` during shutdown: {e}");
+        }
+    }
+}
+
+async fn unload_model_name(model: &str) -> AppResult<()> {
     let resp = HTTP
         .post(format!("{OLLAMA_BASE}/api/generate"))
         .json(&json!({
@@ -368,9 +385,19 @@ pub async fn ollama_unload_model(model: String) -> AppResult<()> {
     if !resp.status().is_success() {
         let status = resp.status();
         let body = resp.text().await.unwrap_or_default();
-        return Err(AppError::Msg(format!("unload {model}: HTTP {status} — {body}")));
+        return Err(AppError::Msg(format!(
+            "unload {model}: HTTP {status} — {body}"
+        )));
     }
     Ok(())
+}
+
+fn normalize_ollama_model_name(model: &str) -> String {
+    model
+        .trim()
+        .strip_prefix("ollama/")
+        .unwrap_or(model.trim())
+        .to_string()
 }
 
 #[derive(Debug, Serialize)]
@@ -401,7 +428,11 @@ pub async fn ollama_ps() -> AppResult<Vec<LoadedModel>> {
         Ok(v) => v,
         Err(_) => return Ok(vec![]),
     };
-    let arr = v.get("models").and_then(|m| m.as_array()).cloned().unwrap_or_default();
+    let arr = v
+        .get("models")
+        .and_then(|m| m.as_array())
+        .cloned()
+        .unwrap_or_default();
     let mut out = Vec::new();
     for m in arr {
         let name = m
@@ -534,7 +565,10 @@ pub async fn ollama_uninstall(
 
     // 4. Remove the binary if we can find it on PATH.
     if let Some(binary) = which_like("ollama") {
-        steps.push(remove_path(std::path::Path::new(&binary), "remove ollama binary"));
+        steps.push(remove_path(
+            std::path::Path::new(&binary),
+            "remove ollama binary",
+        ));
     }
 
     // 5. macOS app bundle, if present.
@@ -608,7 +642,11 @@ pub async fn ollama_list_models() -> AppResult<Vec<OllamaModel>> {
     if let Some(arr) = v.get("models").and_then(|x| x.as_array()) {
         for m in arr {
             models.push(OllamaModel {
-                name: m.get("name").and_then(|x| x.as_str()).unwrap_or("").to_string(),
+                name: m
+                    .get("name")
+                    .and_then(|x| x.as_str())
+                    .unwrap_or("")
+                    .to_string(),
                 size: m.get("size").and_then(|x| x.as_u64()),
                 modified_at: m
                     .get("modified_at")
@@ -660,6 +698,10 @@ pub struct ChatRequest {
     pub temperature: Option<f32>,
     #[serde(default)]
     pub num_ctx: Option<u32>,
+    #[serde(default)]
+    pub purpose: Option<String>,
+    #[serde(default)]
+    pub title: Option<String>,
 }
 
 #[tauri::command]
@@ -669,6 +711,21 @@ pub async fn ollama_chat(
     request_id: String,
     request: ChatRequest,
 ) -> AppResult<()> {
+    let permit = acquire_inference(
+        &app,
+        &state,
+        InferenceClaim::new(
+            request_id.clone(),
+            request.model.clone(),
+            request.purpose.clone().unwrap_or_else(|| "chat".into()),
+            request
+                .title
+                .clone()
+                .unwrap_or_else(|| "Assistant chat".into()),
+        ),
+        InferencePolicy::RejectBusy,
+    )
+    .await?;
     let mut cancel = state.cancels.lock().issue(&request_id);
     let mut messages: Vec<Value> = vec![];
     if let Some(sys) = &request.system {
@@ -738,6 +795,7 @@ pub async fn ollama_chat(
                                     .unwrap_or("");
                                 let done = v.get("done").and_then(|d| d.as_bool()).unwrap_or(false);
                                 if !token.is_empty() {
+                                    permit.note_tokens(1);
                                     let _ = app.emit(&evt, json!({"token": token}));
                                 }
                                 if done {
@@ -768,6 +826,10 @@ pub struct GenerateRequest {
     pub num_predict: Option<u32>,
     #[serde(default)]
     pub raw: Option<bool>,
+    #[serde(default)]
+    pub purpose: Option<String>,
+    #[serde(default)]
+    pub title: Option<String>,
 }
 
 #[tauri::command]
@@ -777,6 +839,24 @@ pub async fn ollama_generate(
     request_id: String,
     request: GenerateRequest,
 ) -> AppResult<()> {
+    let permit = acquire_inference(
+        &app,
+        &state,
+        InferenceClaim::new(
+            request_id.clone(),
+            request.model.clone(),
+            request
+                .purpose
+                .clone()
+                .unwrap_or_else(|| "generation".into()),
+            request
+                .title
+                .clone()
+                .unwrap_or_else(|| "Text generation".into()),
+        ),
+        InferencePolicy::RejectBusy,
+    )
+    .await?;
     let mut cancel = state.cancels.lock().issue(&request_id);
     let mut options = serde_json::Map::new();
     if let Some(t) = request.temperature {
@@ -804,7 +884,10 @@ pub async fn ollama_generate(
     let evt = format!("ollama:gen:{}", request_id);
     if !resp.status().is_success() {
         let status = resp.status();
-        let _ = app.emit(&evt, json!({ "error": format!("HTTP {}", status), "done": true }));
+        let _ = app.emit(
+            &evt,
+            json!({ "error": format!("HTTP {}", status), "done": true }),
+        );
         state.cancels.lock().clear(&request_id);
         return Err(AppError::Msg(format!("ollama generate error {status}")));
     }
@@ -825,7 +908,10 @@ pub async fn ollama_generate(
                             if let Ok(v) = serde_json::from_slice::<Value>(line) {
                                 let token = v.get("response").and_then(|c| c.as_str()).unwrap_or("");
                                 let done = v.get("done").and_then(|d| d.as_bool()).unwrap_or(false);
-                                if !token.is_empty() { let _ = app.emit(&evt, json!({"token": token})); }
+                                if !token.is_empty() {
+                                    permit.note_tokens(1);
+                                    let _ = app.emit(&evt, json!({"token": token}));
+                                }
                                 if done { let _ = app.emit(&evt, json!({"done": true, "stats": v})); }
                             }
                         }
@@ -851,10 +937,24 @@ pub struct FimRequest {
 
 #[tauri::command]
 pub async fn ollama_fim(
+    app: AppHandle,
     state: State<'_, AppState>,
     request_id: String,
     request: FimRequest,
 ) -> AppResult<String> {
+    let permit = acquire_inference(
+        &app,
+        &state,
+        InferenceClaim::new(
+            request_id.clone(),
+            request.model.clone(),
+            "inline_suggestion",
+            "Tab completion",
+        )
+        .interruptible(),
+        InferencePolicy::ReplaceMatchingInterruptible,
+    )
+    .await?;
     let mut cancel = state.cancels.lock().issue(&request_id);
     // Qwen2.5-Coder FIM template.
     let prompt = format!(
@@ -906,6 +1006,9 @@ pub async fn ollama_fim(
                             if line.is_empty() { continue; }
                             if let Ok(v) = serde_json::from_slice::<Value>(line) {
                                 if let Some(tok) = v.get("response").and_then(|x| x.as_str()) {
+                                    if !tok.is_empty() {
+                                        permit.note_tokens(1);
+                                    }
                                     out.push_str(tok);
                                 }
                                 if v.get("done").and_then(|d| d.as_bool()).unwrap_or(false) {
@@ -924,7 +1027,30 @@ pub async fn ollama_fim(
 }
 
 #[tauri::command]
-pub async fn ollama_embed(model: String, input: Vec<String>) -> AppResult<Vec<Vec<f32>>> {
+pub async fn ollama_embed(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    model: String,
+    input: Vec<String>,
+) -> AppResult<Vec<Vec<f32>>> {
+    let request_id = format!("embed_{}", uuid::Uuid::new_v4().simple());
+    let _permit = acquire_inference(
+        &app,
+        &state,
+        InferenceClaim::new(
+            request_id,
+            model.clone(),
+            "embedding",
+            format!(
+                "Embedding {} input{}",
+                input.len(),
+                if input.len() == 1 { "" } else { "s" }
+            ),
+        )
+        .non_cancellable(),
+        InferencePolicy::RejectBusy,
+    )
+    .await?;
     let resp = HTTP
         .post(format!("{OLLAMA_BASE}/api/embed"))
         .json(&json!({ "model": model, "input": input }))
