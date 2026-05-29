@@ -1,4 +1,7 @@
 use crate::error::{AppError, AppResult};
+use crate::services::context_lifecycle::{
+    compact_dialogue, CompactMessage, CompactOptions,
+};
 use crate::services::inference::{acquire_inference, InferenceClaim, InferencePolicy};
 use crate::state::AppState;
 use futures_util::StreamExt;
@@ -727,13 +730,7 @@ pub async fn ollama_chat(
     )
     .await?;
     let mut cancel = state.cancels.lock().issue(&request_id);
-    let mut messages: Vec<Value> = vec![];
-    if let Some(sys) = &request.system {
-        messages.push(json!({ "role": "system", "content": sys }));
-    }
-    for m in &request.messages {
-        messages.push(json!({ "role": m.role, "content": m.content }));
-    }
+    let messages = compact_ollama_chat_messages(request.system.as_deref(), &request.messages);
 
     let mut options = serde_json::Map::new();
     if let Some(t) = request.temperature {
@@ -747,6 +744,10 @@ pub async fn ollama_chat(
         "model": request.model,
         "messages": messages,
         "stream": true,
+        // Ollama chat is stateless unless Pointer sends prior messages.
+        // Context lifecycle is therefore handled above by compacting the
+        // message list before every call; we intentionally do not pass
+        // Ollama's legacy `context` field.
         "options": options,
     });
 
@@ -810,6 +811,26 @@ pub async fn ollama_chat(
     }
     state.cancels.lock().clear(&request_id);
     Ok(())
+}
+
+fn compact_ollama_chat_messages(system: Option<&str>, messages: &[ChatMsg]) -> Vec<Value> {
+    let mut raw = Vec::new();
+    if let Some(system) = system.map(str::trim).filter(|s| !s.is_empty()) {
+        raw.push(CompactMessage {
+            role: "system".into(),
+            content: system.to_string(),
+        });
+    }
+    for message in messages {
+        raw.push(CompactMessage {
+            role: message.role.clone(),
+            content: message.content.clone(),
+        });
+    }
+    compact_dialogue(&raw, CompactOptions::ollama_chat())
+        .into_iter()
+        .map(|message| json!({ "role": message.role, "content": message.content }))
+        .collect()
 }
 
 #[derive(Debug, Deserialize)]
@@ -1139,7 +1160,7 @@ pub async fn ollama_cancel(state: State<'_, AppState>, request_id: String) -> Ap
 
 #[cfg(test)]
 mod tests {
-    use super::fim_prompt_for_model;
+    use super::{compact_ollama_chat_messages, fim_prompt_for_model, ChatMsg};
 
     #[test]
     fn uses_deepseek_fim_template_for_deepseek_coder() {
@@ -1173,5 +1194,21 @@ mod tests {
             "<|fim_prefix|>pre<|fim_suffix|>suf<|fim_middle|>"
         );
         assert!(prompt.stop.iter().any(|s| s == "<|fim_middle|>"));
+    }
+
+    #[test]
+    fn ollama_chat_compacts_history_before_model_call() {
+        let messages = (0..20)
+            .map(|i| ChatMsg {
+                role: if i % 2 == 0 { "user" } else { "assistant" }.into(),
+                content: format!("turn {i} {}", "x".repeat(400)),
+            })
+            .collect::<Vec<_>>();
+        let packed = compact_ollama_chat_messages(Some("system rules"), &messages);
+        let rendered = serde_json::to_string(&packed).unwrap();
+        assert!(rendered.contains("system rules"));
+        assert!(rendered.contains("<compacted_context>"));
+        assert!(rendered.contains("turn 19"));
+        assert!(packed.len() < messages.len() + 1);
     }
 }

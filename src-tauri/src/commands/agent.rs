@@ -50,6 +50,9 @@
 #![allow(clippy::too_many_arguments)]
 
 use crate::error::AppResult;
+use crate::services::context_lifecycle::{
+    compact_dialogue, CompactMessage, CompactOptions,
+};
 use crate::services::history::{entry_for_answer, entry_for_tool, ActionLedger, LedgerEntry};
 use crate::services::inference::{acquire_inference, InferenceClaim, InferencePolicy};
 use crate::services::opencode::{run_opencode, OpenCodeMode, OpenCodeRunRequest};
@@ -460,6 +463,8 @@ pub async fn agent_continue(
         .map(str::trim)
         .is_some_and(|s| !s.is_empty())
     {
+        // OpenCode owns history/compaction once a native session exists.
+        // Pointer sends only the fresh user turn plus fresh explicit context.
         render_opencode_agent_prompt(
             &workspace,
             mode,
@@ -600,12 +605,21 @@ fn render_opencode_agent_prompt(
     active_file: Option<&str>,
 ) -> String {
     let mut out = String::new();
-    out.push_str(&format!("Workspace: {workspace}\n"));
+    out.push_str(&format!(
+        "Workspace: current OpenCode working directory ({})\n",
+        workspace_prompt_label(workspace),
+    ));
+    out.push_str(
+        "Tool path rule: use workspace-relative paths for OpenCode file tools. \
+         OpenCode is already running in the workspace directory. Use the path exactly as it \
+         exists under that directory; do not prefix it with the absolute workspace path or with \
+         an extra parent directory.\n",
+    );
     out.push_str(&format!("Mode: {}\n\n", execution_mode_label(mode)));
     if let Some(active) = active_file {
         if !active.trim().is_empty() {
             out.push_str("Active editor file:\n");
-            out.push_str(active.trim());
+            out.push_str(&workspace_relative_prompt_path(workspace, active));
             out.push_str("\n\n");
         }
     }
@@ -613,7 +627,7 @@ fn render_opencode_agent_prompt(
         out.push_str("Open tabs:\n");
         for tab in open_tabs.iter().take(20) {
             out.push_str("- ");
-            out.push_str(tab);
+            out.push_str(&workspace_relative_prompt_path(workspace, tab));
             out.push('\n');
         }
         out.push('\n');
@@ -622,7 +636,7 @@ fn render_opencode_agent_prompt(
         let context = context.trim();
         if !context.is_empty() {
             out.push_str("Attached context:\n");
-            out.push_str(context);
+            out.push_str(&workspace_relative_prompt_text(workspace, context));
             out.push_str("\n\n");
             out.push_str("Attached context may include <brain-frontier> and <context-memory>, Pointer's deterministic external memory. Use included evidence first, use frontier candidates to choose the next missing file/spec/config to inspect, and avoid rediscovering facts already supplied. Treat it as navigation memory and evidence, not as permission to invent unseen code.\n\n");
         }
@@ -646,6 +660,63 @@ fn render_opencode_agent_prompt(
     out
 }
 
+fn workspace_relative_prompt_path(workspace: &str, path: &str) -> String {
+    let trimmed = path.trim();
+    if trimmed.is_empty() {
+        return String::new();
+    }
+    let root = Path::new(workspace);
+    let candidate = Path::new(trimmed);
+    candidate
+        .strip_prefix(root)
+        .ok()
+        .map(normalize_prompt_path)
+        .or_else(|| existing_prompt_path_suffix(root, candidate))
+        .filter(|rel| !rel.is_empty())
+        .unwrap_or_else(|| trimmed.to_string())
+}
+
+fn workspace_prompt_label(workspace: &str) -> String {
+    Path::new(workspace)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .filter(|name| !name.trim().is_empty())
+        .unwrap_or("workspace")
+        .to_string()
+}
+
+fn workspace_relative_prompt_text(workspace: &str, text: &str) -> String {
+    let root = Path::new(workspace).to_string_lossy().replace('\\', "/");
+    if root.is_empty() {
+        return text.to_string();
+    }
+    let normalized = text.replace('\\', "/");
+    normalized
+        .replace(&format!("{root}/"), "")
+        .replace(&root, "workspace")
+}
+
+fn normalize_prompt_path(path: &Path) -> String {
+    path.to_string_lossy().replace('\\', "/")
+}
+
+fn existing_prompt_path_suffix(workspace: &Path, path: &Path) -> Option<String> {
+    let parts = path
+        .components()
+        .filter_map(|component| match component {
+            std::path::Component::Normal(part) => Some(part.to_os_string()),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    for start in 1..parts.len() {
+        let suffix = parts[start..].iter().collect::<PathBuf>();
+        if workspace.join(&suffix).exists() {
+            return Some(normalize_prompt_path(&suffix));
+        }
+    }
+    None
+}
+
 fn render_opencode_continue_prompt(
     workspace: &str,
     mode: ExecutionMode,
@@ -665,18 +736,30 @@ fn render_opencode_continue_prompt(
     );
     if !transcript.is_empty() {
         out.push_str("\n\nPrevious Pointer transcript summary/context:\n");
-        for msg in transcript.iter().rev().take(12).rev() {
+        let compacted = compact_agent_messages_for_prompt(transcript);
+        for msg in compacted {
             out.push_str(match msg.role.as_str() {
                 "assistant" => "Assistant: ",
                 "tool" => "Tool: ",
                 "system" => "System: ",
                 _ => "User: ",
             });
-            out.push_str(msg.content.trim());
+            out.push_str(&workspace_relative_prompt_text(workspace, msg.content.trim()));
             out.push_str("\n\n");
         }
     }
     out
+}
+
+fn compact_agent_messages_for_prompt(transcript: &[AgentMessage]) -> Vec<CompactMessage> {
+    let raw = transcript
+        .iter()
+        .map(|msg| CompactMessage {
+            role: msg.role.clone(),
+            content: msg.content.clone(),
+        })
+        .collect::<Vec<_>>();
+    compact_dialogue(&raw, CompactOptions::opencode_resume())
 }
 
 fn use_opencode_agent_runtime() -> bool {
@@ -1509,6 +1592,23 @@ async fn run_agent_loop(
                  Any later tool calls, invented tool results, or final text in the same turn were ignored. \
                  Wait for real tool results and emit exactly one next action.\n</protocol_note>",
             );
+        }
+        if call.tool == "read_file" && status == "error" {
+            let attempted_path = call
+                .attrs
+                .get("path")
+                .cloned()
+                .unwrap_or_else(|| call.body.trim().to_string());
+            let leaf = Path::new(&attempted_path)
+                .file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or(&attempted_path);
+            tool_result_body.push_str(&format!(
+                "\n<recovery_hint>\nThe read failed for `{}`. Do not retry the exact same path. \
+                 Use list_dir, glob for `**/{}`, or a targeted grep to discover the real file path. \
+                 If the file is optional, state that it was unavailable and continue from the evidence you have.\n</recovery_hint>",
+                attempted_path, leaf
+            ));
         }
         transcript.push(json!({"role": "user", "content": tool_result_body}));
 
@@ -6847,6 +6947,62 @@ mod tests {
         fs::write(dir.path().join("a.txt"), "x").unwrap();
         let hits = find_similar_paths(&ws, "src/zzz.html");
         assert!(hits.is_empty());
+    }
+
+    #[test]
+    fn opencode_prompt_uses_workspace_relative_paths_for_tools() {
+        let dir = tempdir().unwrap();
+        let project = dir.path().join("project");
+        fs::create_dir_all(project.join("src")).unwrap();
+        fs::write(project.join("src/entry.txt"), "content").unwrap();
+        let ws = project.to_string_lossy().to_string();
+        let abs = project.join("src/entry.txt");
+        let abs_str = abs.to_string_lossy().to_string();
+        let stale_relative = "project/src/entry.txt".to_string();
+        let prompt = render_opencode_agent_prompt(
+            &ws,
+            ExecutionMode::Plan,
+            Some(&format!("<file path=\"{abs_str}\">\ncontent\n</file>")),
+            "Plan a change",
+            &[stale_relative.clone()],
+            Some(&stale_relative),
+        );
+        assert!(prompt.contains("Tool path rule"));
+        assert!(prompt.contains("src/entry.txt"));
+        assert!(
+            !prompt.contains("project/src/entry.txt"),
+            "prompt leaked a stale parent-prefixed path: {prompt}"
+        );
+        assert!(
+            !prompt.contains(&format!("{ws}/src/entry.txt")),
+            "prompt leaked absolute workspace path in file evidence: {prompt}"
+        );
+        assert!(
+            !prompt.contains(&ws),
+            "prompt leaked the absolute workspace root: {prompt}"
+        );
+    }
+
+    #[test]
+    fn opencode_continue_prompt_compacts_pointer_transcript() {
+        let transcript = (0..20)
+            .map(|i| AgentMessage {
+                role: if i % 2 == 0 { "user" } else { "assistant" }.into(),
+                content: format!("turn {i} {}", "x".repeat(500)),
+            })
+            .collect::<Vec<_>>();
+        let prompt = render_opencode_continue_prompt(
+            "/tmp/project",
+            ExecutionMode::Plan,
+            &transcript,
+            None,
+            "latest request",
+            &[],
+            None,
+        );
+        assert!(prompt.contains("<compacted_context>"));
+        assert!(prompt.contains("turn 19"));
+        assert!(prompt.len() < 18_000);
     }
 
     #[test]

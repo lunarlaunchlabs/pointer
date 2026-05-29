@@ -782,7 +782,7 @@ async function subscribeAgentEvents(
         });
         break;
       case "tool_result":
-        set({ phase: { kind: "warming", step: 0, sinceMs: Date.now() } });
+        set({ phase: { kind: "warming", step: e.step, sinceMs: Date.now() } });
         break;
       case "done":
         patchSession(set, get, sessionId, { status: "done" });

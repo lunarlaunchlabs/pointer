@@ -1,3 +1,4 @@
+pub mod context_lifecycle;
 pub mod history;
 pub mod indexer;
 pub mod inference;

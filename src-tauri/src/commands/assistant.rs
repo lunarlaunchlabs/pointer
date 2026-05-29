@@ -28,6 +28,9 @@ use crate::commands::agent::{
 };
 use crate::commands::ollama::ChatMsg;
 use crate::error::AppResult;
+use crate::services::context_lifecycle::{
+    compact_dialogue, CompactMessage, CompactOptions,
+};
 use crate::services::history::{entry_for_answer, LedgerEntry};
 use crate::services::opencode::{run_opencode, OpenCodeMode, OpenCodeRunRequest};
 use crate::state::AppState;
@@ -177,15 +180,30 @@ fn render_opencode_ask_prompt(
 ) -> String {
     let mut out = String::new();
     out.push_str("Conversation:\n");
-    let visible_messages: Vec<&ChatMsg> = if resume_opencode {
+    let visible_messages = if resume_opencode {
+        // OpenCode owns history and compaction for resumed sessions.
+        // Pointer sends only the newest user turn; fresh @file/selection
+        // context is appended separately below when present.
         messages
             .iter()
             .rev()
             .find(|m| m.role == "user")
-            .into_iter()
-            .collect()
+            .map(|m| {
+                vec![CompactMessage {
+                    role: m.role.clone(),
+                    content: m.content.clone(),
+                }]
+            })
+            .unwrap_or_default()
     } else {
-        messages.iter().collect()
+        let raw = messages
+            .iter()
+            .map(|m| CompactMessage {
+                role: m.role.clone(),
+                content: m.content.clone(),
+            })
+            .collect::<Vec<_>>();
+        compact_dialogue(&raw, CompactOptions::opencode_prompt())
     };
     for m in visible_messages {
         out.push_str(match m.role.as_str() {
@@ -418,5 +436,41 @@ mod tests {
             format!("Execute the following plan:\n{}", plan)
         };
         assert_eq!(goal, "Execute the previously-discussed plan.");
+    }
+
+    #[test]
+    fn ask_prompt_compacts_old_history_without_opencode_resume() {
+        let messages = (0..20)
+            .map(|i| ChatMsg {
+                role: if i % 2 == 0 { "user" } else { "assistant" }.into(),
+                content: format!("turn {i} {}", "x".repeat(500)),
+            })
+            .collect::<Vec<_>>();
+        let prompt = render_opencode_ask_prompt(None, &messages, false);
+        assert!(prompt.contains("<compacted_context>"));
+        assert!(prompt.contains("turn 19"));
+        assert!(prompt.len() < 18_000);
+    }
+
+    #[test]
+    fn ask_prompt_with_opencode_resume_sends_only_latest_user_turn() {
+        let messages = vec![
+            ChatMsg {
+                role: "user".into(),
+                content: "old question".into(),
+            },
+            ChatMsg {
+                role: "assistant".into(),
+                content: "old answer".into(),
+            },
+            ChatMsg {
+                role: "user".into(),
+                content: "latest question".into(),
+            },
+        ];
+        let prompt = render_opencode_ask_prompt(None, &messages, true);
+        assert!(prompt.contains("latest question"));
+        assert!(!prompt.contains("old question"));
+        assert!(!prompt.contains("old answer"));
     }
 }

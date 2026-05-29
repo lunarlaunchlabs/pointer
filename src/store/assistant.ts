@@ -277,12 +277,20 @@ export const useAssistant = create<State>((set, get) => ({
       active.mode === "ask" && isDirectAskEditRequest(text);
 
     const editor = useEditorStore.getState();
+    const workspaceRoot = useWorkspace.getState().root;
+    const openTabs = scopedWorkspacePaths(
+      editor.tabs.map((t) => t.path),
+      workspaceRoot,
+    );
+    const activePath = pathBelongsToWorkspace(editor.activePath, workspaceRoot)
+      ? editor.activePath
+      : null;
     const implicitRefs = directAskRedirect
       ? []
       : await inferImplicitFileReferences(text, {
           existingRefs: explicitRefs,
-          activePath: editor.activePath,
-          openTabs: editor.tabs.map((t) => t.path),
+          activePath,
+          openTabs,
         });
     const refs = mergeReferences(explicitRefs, implicitRefs);
 
@@ -304,7 +312,7 @@ export const useAssistant = create<State>((set, get) => ({
     const context = directAskRedirect
       ? undefined
       : (await buildContext?.(refs, text, active.mode)) ?? undefined;
-    const attachedFiles = attachedFilesFor(refs, editor.activePath, editor.tabs.map((t) => t.path));
+    const attachedFiles = attachedFilesFor(refs, activePath, openTabs);
 
     switch (active.mode) {
       case "ask":
@@ -344,18 +352,47 @@ export const useAssistant = create<State>((set, get) => ({
     set({ currentRequestId: rid });
     const off = await subscribeAgentEvents(set, get, id, rid);
     try {
+      const currentRoot = useWorkspace.getState().root;
+      const previousRunFailed = session.status === "error" || session.events.at(-1)?.kind === "error";
+      const workspaceChanged = Boolean(
+        currentRoot && !sameWorkspacePath(session.workspace, currentRoot),
+      );
+      const runWorkspace = currentRoot ?? undefined;
+      const resumeTranscript = workspaceChanged || previousRunFailed ? [] : session.transcript;
+      const resumeOpencodeSessionId =
+        !workspaceChanged && !previousRunFailed && resumeTranscript.length > 0
+          ? session.opencodeSessionId ?? undefined
+          : undefined;
+      const resumeLedger = workspaceChanged || previousRunFailed ? [] : session.ledger;
+      if (currentRoot && !sameWorkspacePath(session.workspace, currentRoot)) {
+        patchSession(set, get, id, {
+          workspace: currentRoot,
+          transcript: [],
+          opencodeSessionId: null,
+          ledger: [],
+          updatedAt: Date.now(),
+        });
+      }
       await ipc.agentExecutePlan(rid, {
         session_id: id,
         plan_text: planText,
         model: session.model,
-        opencode_session_id: session.opencodeSessionId ?? undefined,
-        workspace: session.workspace ?? undefined,
-        transcript: session.transcript.length ? session.transcript : undefined,
-        ledger: session.ledger.length ? session.ledger : undefined,
+        opencode_session_id: resumeOpencodeSessionId,
+        workspace: runWorkspace,
+        transcript: resumeOpencodeSessionId
+          ? undefined
+          : resumeTranscript.length
+            ? resumeTranscript
+            : undefined,
+        ledger: resumeOpencodeSessionId
+          ? undefined
+          : resumeLedger.length
+            ? resumeLedger
+            : undefined,
       });
     } catch (e) {
-      pushEvent(set, get, id, { kind: "error", text: String(e) });
-      patchSession(set, get, id, { status: "error" });
+      pushRunErrorIfMissing(set, get, id, String(e));
+      patchSession(set, get, id, { status: "error", opencodeSessionId: null });
       set({ phase: { kind: "idle" }, currentRequestId: null });
       off();
       flush(get());
@@ -379,17 +416,18 @@ export const useAssistant = create<State>((set, get) => ({
     const session = get().sessions.find((s) => s.id === sessionId);
     const change = session?.changes.find((c) => c.id === changeId);
     if (!session || !change || change.status !== "pending") return;
+    const workspace = session.workspace ?? useWorkspace.getState().root ?? "";
     setChangeStatus(set, get, sessionId, changeId, "undone");
     try {
       await ipc.agentUndoChange({
         changeId: change.id,
-        workspace: session.workspace ?? useWorkspace.getState().root ?? "",
+        workspace,
         kind: change.kind,
         path: change.path,
         from: change.from,
       });
-      await refreshOpenEditorAfterUndo(change.path);
-      if (change.from) await refreshOpenEditorAfterUndo(change.from);
+      await refreshOpenEditorAfterUndo(change.path, workspace);
+      if (change.from) await refreshOpenEditorAfterUndo(change.from, workspace);
     } catch {
       setChangeStatus(set, get, sessionId, changeId, "pending");
       throw new Error("undo failed — file may have changed since");
@@ -413,12 +451,19 @@ export const useAssistant = create<State>((set, get) => ({
         ?.changes.filter((c) => c.status === "pending")
         .slice()
         .reverse() ?? [];
+    let failures = 0;
     for (const change of pending) {
       try {
         await get().undoChange(sessionId, change.id);
       } catch {
         // Per-row status is restored to pending; keep unwinding the rest.
+        failures += 1;
       }
+    }
+    if (failures > 0) {
+      throw new Error(
+        `${failures} change${failures === 1 ? "" : "s"} could not be undone`,
+      );
     }
   },
 
@@ -574,19 +619,47 @@ async function sendAgent(
   const off = await subscribeAgentEvents(set, get, sessionId, rid);
 
   const editor = useEditorStore.getState();
-  const openTabs = editor.tabs.map((t) => t.path);
-  const activeFile = editor.activePath ?? undefined;
+  const currentRoot = useWorkspace.getState().root;
+  const openTabs = scopedWorkspacePaths(
+    editor.tabs.map((t) => t.path),
+    currentRoot,
+  );
+  const activeFile = pathBelongsToWorkspace(editor.activePath, currentRoot)
+    ? editor.activePath ?? undefined
+    : undefined;
   const mode = toAgentMode(session.mode);
 
   try {
-    if (session.transcript.length === 0) {
+    const previousRunFailed = session.status === "error" || session.events.at(-1)?.kind === "error";
+    const workspaceChanged = Boolean(
+      currentRoot && !sameWorkspacePath(session.workspace, currentRoot),
+    );
+    const runWorkspace = currentRoot ?? undefined;
+    const resumeTranscript = workspaceChanged || previousRunFailed ? [] : session.transcript;
+    const resumeOpencodeSessionId = workspaceChanged
+      ? undefined
+      : !previousRunFailed && resumeTranscript.length > 0
+        ? session.opencodeSessionId ?? undefined
+        : undefined;
+    const resumeLedger = workspaceChanged || previousRunFailed ? [] : session.ledger;
+    if (currentRoot && !sameWorkspacePath(session.workspace, currentRoot)) {
+      patchSession(set, get, sessionId, {
+        workspace: currentRoot,
+        transcript: [],
+        opencodeSessionId: null,
+        ledger: [],
+        updatedAt: Date.now(),
+      });
+    }
+
+    if (resumeTranscript.length === 0) {
       await ipc.agentRun(rid, {
         model: session.model,
         goal: text,
-        workspace: session.workspace ?? undefined,
+        workspace: runWorkspace,
         mode,
         lint_command: session.lintCommand.trim() || undefined,
-        opencode_session_id: session.opencodeSessionId ?? undefined,
+        opencode_session_id: resumeOpencodeSessionId,
         context: context?.trim() ? context : undefined,
         open_tabs: openTabs.length ? openTabs : undefined,
         active_file: activeFile,
@@ -596,21 +669,25 @@ async function sendAgent(
       await ipc.agentContinue(rid, {
         model: session.model,
         user_message: text,
-        transcript: session.transcript,
-        workspace: session.workspace ?? undefined,
+        transcript: resumeOpencodeSessionId ? [] : resumeTranscript,
+        workspace: runWorkspace,
         mode,
         lint_command: session.lintCommand.trim() || undefined,
-        opencode_session_id: session.opencodeSessionId ?? undefined,
+        opencode_session_id: resumeOpencodeSessionId,
         context: context?.trim() ? context : undefined,
         open_tabs: openTabs.length ? openTabs : undefined,
         active_file: activeFile,
         attached_files: attachedFiles.length ? attachedFiles : undefined,
-        ledger: session.ledger.length ? session.ledger : undefined,
+        ledger: resumeOpencodeSessionId
+          ? undefined
+          : resumeLedger.length
+            ? resumeLedger
+            : undefined,
       });
     }
   } catch (e) {
-    pushEvent(set, get, sessionId, { kind: "error", text: String(e) });
-    patchSession(set, get, sessionId, { status: "error" });
+    pushRunErrorIfMissing(set, get, sessionId, String(e));
+    patchSession(set, get, sessionId, { status: "error", opencodeSessionId: null });
     set({ phase: { kind: "idle" }, currentRequestId: null });
     off();
     flush(get());
@@ -675,7 +752,7 @@ async function subscribeAgentEvents(
           set({ phase: { kind: "awaiting_approval", tool: e.tool } });
           break;
         case "tool_result":
-          set({ phase: { kind: "warming", step: 0, sinceMs: Date.now() } });
+          set({ phase: { kind: "warming", step: e.step, sinceMs: Date.now() } });
           break;
         case "final":
           appendAgentOutputMessage(set, get, sessionId, e.text);
@@ -697,7 +774,10 @@ async function subscribeAgentEvents(
           break;
         case "error":
           appendAgentOutputMessage(set, get, sessionId, e.text);
-          patchSession(set, get, sessionId, { status: "error" });
+          patchSession(set, get, sessionId, {
+            status: "error",
+            opencodeSessionId: null,
+          });
           set({ phase: { kind: "idle" }, currentRequestId: null });
           off();
           flush(get());
@@ -944,6 +1024,56 @@ function blankSession(mode: AssistantMode, model: string): AssistantSession {
   };
 }
 
+function sameWorkspacePath(a: string | null | undefined, b: string | null | undefined): boolean {
+  if (!a || !b) return false;
+  return normalizeWorkspacePath(a) === normalizeWorkspacePath(b);
+}
+
+function normalizeWorkspacePath(path: string): string {
+  return path.replace(/\\/g, "/").replace(/\/+$/, "");
+}
+
+function pathBelongsToWorkspace(
+  path: string | null | undefined,
+  root: string | null | undefined,
+): boolean {
+  const value = path?.trim();
+  if (!value) return false;
+  if (!root) return true;
+  const normalizedPath = normalizeWorkspacePath(value);
+  const normalizedRoot = normalizeWorkspacePath(root);
+  if (!isAbsolutePath(normalizedPath)) return true;
+  return (
+    normalizedPath === normalizedRoot ||
+    normalizedPath.startsWith(`${normalizedRoot}/`)
+  );
+}
+
+function scopedWorkspacePaths(paths: string[], root: string | null | undefined): string[] {
+  return paths.filter((path) => pathBelongsToWorkspace(path, root));
+}
+
+function isAbsolutePath(path: string): boolean {
+  return path.startsWith("/") || /^[A-Za-z]:\//.test(path);
+}
+
+function pushRunErrorIfMissing(
+  set: (p: Partial<State> | ((s: State) => Partial<State>)) => void,
+  get: () => State,
+  sessionId: string,
+  text: string,
+) {
+  const session = get().sessions.find((s) => s.id === sessionId);
+  const alreadyRecorded = session?.events.some(
+    (event) =>
+      event.kind === "error" &&
+      (event.text === text || event.text.includes(text) || text.includes(event.text)),
+  );
+  if (!alreadyRecorded) {
+    pushEvent(set, get, sessionId, { kind: "error", text });
+  }
+}
+
 function appendMessage(
   set: (p: Partial<State> | ((s: State) => Partial<State>)) => void,
   get: () => State,
@@ -1184,23 +1314,46 @@ function setChangeStatus(
   flush(get());
 }
 
-async function refreshOpenEditorAfterUndo(path: string) {
+async function refreshOpenEditorAfterUndo(path: string, workspace: string) {
   const editor = useEditorStore.getState();
-  const tab = editor.tabs.find((t) => t.path === path);
+  const readPath = resolveWorkspacePath(path, workspace);
+  const tab = editor.tabs.find((t) => pathsReferToSameFile(t.path, path, workspace));
   if (!tab || tab.dirty) return;
   try {
-    const content = await ipc.readTextFile(path);
+    const content = await ipc.readTextFile(readPath);
     useEditorStore.setState((s) => ({
       tabs: s.tabs.map((t) =>
-        t.path === path ? { ...t, content, dirty: false, externalContent: null } : t,
+        pathsReferToSameFile(t.path, path, workspace)
+          ? { ...t, content, dirty: false, externalContent: null }
+          : t,
       ),
     }));
   } catch {
     useEditorStore.setState((s) => ({
-      tabs: s.tabs.filter((t) => t.path !== path),
-      activePath: s.activePath === path ? s.tabs.find((t) => t.path !== path)?.path ?? null : s.activePath,
+      tabs: s.tabs.filter((t) => !pathsReferToSameFile(t.path, path, workspace)),
+      activePath:
+        s.activePath && pathsReferToSameFile(s.activePath, path, workspace)
+          ? s.tabs.find((t) => !pathsReferToSameFile(t.path, path, workspace))?.path ?? null
+          : s.activePath,
     }));
   }
+}
+
+function resolveWorkspacePath(path: string, workspace: string | null | undefined): string {
+  const trimmed = path.trim();
+  if (!trimmed || isAbsolutePath(trimmed) || !workspace) return trimmed;
+  return `${normalizeWorkspacePath(workspace)}/${trimmed.replace(/^\/+/, "")}`;
+}
+
+function pathsReferToSameFile(
+  candidate: string,
+  target: string,
+  workspace: string | null | undefined,
+): boolean {
+  const normalizedCandidate = normalizeWorkspacePath(candidate);
+  const normalizedTarget = normalizeWorkspacePath(target);
+  if (normalizedCandidate === normalizedTarget) return true;
+  return normalizedCandidate === normalizeWorkspacePath(resolveWorkspacePath(target, workspace));
 }
 
 function pushEvent(

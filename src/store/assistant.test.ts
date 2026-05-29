@@ -10,6 +10,8 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { invoke } from "@tauri-apps/api/core";
 import { migrateLegacy, useAssistant } from "./assistant";
+import { useWorkspace } from "./workspace";
+import { useEditorStore, type Tab } from "./editor";
 import type { ChatSession } from "./chat";
 import type { AgentSession } from "./agentSessions";
 
@@ -283,6 +285,8 @@ describe("useAssistant mode switching + plan promotion", () => {
       },
       true,
     );
+    useWorkspace.setState({ root: null });
+    useEditorStore.setState({ tabs: [], activePath: null });
   });
 
   it("preserves transcript and ledger when switching modes mid-session", () => {
@@ -423,6 +427,140 @@ describe("useAssistant mode switching + plan promotion", () => {
     });
   });
 
+  it("runs plan turns against the currently opened workspace, not a stale session root", async () => {
+    vi.mocked(invoke).mockResolvedValue(undefined);
+    useWorkspace.setState({ root: "/old/project" });
+    const id = getStore().newSession({ mode: "plan", model: "qwen" });
+    useAssistant.setState((s) => ({
+      sessions: s.sessions.map((sess) =>
+        sess.id === id
+          ? {
+              ...sess,
+              transcript: [{ role: "assistant", content: "old workspace transcript" }],
+              opencodeSessionId: "ses_old",
+              ledger: [
+                {
+                  turn: 1,
+                  timestamp_ms: 0,
+                  mode: "plan",
+                  kind: { type: "answered_only", summary: "old workspace" },
+                },
+              ],
+            }
+          : sess,
+      ),
+    }));
+    useWorkspace.setState({ root: "/current/project" });
+    const oldTab = testTab("/old/project/src/App.ts");
+    const currentTab = testTab("/current/project/src/Main.ts");
+    useEditorStore.setState({
+      tabs: [oldTab, currentTab],
+      activePath: oldTab.path,
+    });
+
+    await getStore().send("Plan the change", { defaultModel: "qwen" });
+
+    expect(invoke).toHaveBeenCalledWith(
+      "agent_run",
+      expect.objectContaining({
+        request: expect.objectContaining({
+          workspace: "/current/project",
+          opencode_session_id: undefined,
+          open_tabs: ["/current/project/src/Main.ts"],
+          active_file: undefined,
+          attached_files: ["/current/project/src/Main.ts"],
+        }),
+      }),
+    );
+    const session = getStore().sessions.find((s) => s.id === id)!;
+    expect(session.workspace).toBe("/current/project");
+    expect(session.transcript).toEqual([]);
+    expect(session.ledger).toEqual([]);
+  });
+
+  it("starts a fresh OpenCode run after a failed plan session", async () => {
+    vi.mocked(invoke).mockResolvedValue(undefined);
+    useWorkspace.setState({ root: "/repo" });
+    const id = getStore().newSession({ mode: "plan", model: "qwen" });
+    useAssistant.setState((s) => ({
+      sessions: s.sessions.map((sess) =>
+        sess.id === id
+          ? {
+              ...sess,
+              status: "error" as const,
+              transcript: [{ role: "assistant", content: "stale failed turn" }],
+              opencodeSessionId: "ses_bad",
+              ledger: [
+                {
+                  turn: 1,
+                  timestamp_ms: 0,
+                  mode: "plan",
+                  kind: { type: "answered_only", summary: "failed old run" },
+                },
+              ],
+              events: [
+                {
+                  kind: "error",
+                  step: 1,
+                  text: "opencode exited with exit status: 1\nError: File not found",
+                },
+              ],
+            }
+          : sess,
+      ),
+    }));
+
+    await getStore().send("Plan the change again", { defaultModel: "qwen" });
+
+    expect(invoke).toHaveBeenCalledWith(
+      "agent_run",
+      expect.objectContaining({
+        request: expect.objectContaining({
+          workspace: "/repo",
+          opencode_session_id: undefined,
+        }),
+      }),
+    );
+  });
+
+  it("does not send Pointer transcript or ledger when continuing an OpenCode session", async () => {
+    vi.mocked(invoke).mockResolvedValue(undefined);
+    useWorkspace.setState({ root: "/repo" });
+    const id = getStore().newSession({ mode: "agent", model: "qwen" });
+    useAssistant.setState((s) => ({
+      sessions: s.sessions.map((sess) =>
+        sess.id === id
+          ? {
+              ...sess,
+              transcript: [
+                { role: "user", content: "old prompt" },
+                { role: "assistant", content: "old answer" },
+              ],
+              opencodeSessionId: "ses_live",
+              ledger: [
+                {
+                  turn: 1,
+                  timestamp_ms: 0,
+                  mode: "agent",
+                  kind: { type: "answered_only", summary: "old answer" },
+                },
+              ],
+            }
+          : sess,
+      ),
+    }));
+
+    await getStore().send("continue with the next step", { defaultModel: "qwen" });
+
+    const call = vi.mocked(invoke).mock.calls.find(([cmd]) => cmd === "agent_continue");
+    expect(call).toBeTruthy();
+    const request = (call?.[1] as { request: Record<string, unknown> }).request;
+    expect(request.opencode_session_id).toBe("ses_live");
+    expect(request.user_message).toBe("continue with the next step");
+    expect(request.transcript).toEqual([]);
+    expect(request.ledger).toBeUndefined();
+  });
+
   it("deleting the active session clears activeSessionId or falls back", () => {
     const a = getStore().newSession({ mode: "ask", model: "qwen" });
     const b = getStore().newSession({ mode: "plan", model: "qwen" });
@@ -471,6 +609,45 @@ describe("useAssistant mode switching + plan promotion", () => {
       }),
     );
     expect(getStore().sessions.find((s) => s.id === id)?.mode).toBe("agent");
+  });
+
+  it("lets OpenCode own plan execution context when a session id exists", async () => {
+    vi.mocked(invoke).mockResolvedValue(undefined);
+    useWorkspace.setState({ root: "/repo" });
+    const id = getStore().newSession({ mode: "plan", model: "qwen" });
+    useAssistant.setState((s) => ({
+      sessions: s.sessions.map((sess) =>
+        sess.id === id
+          ? {
+              ...sess,
+              status: "done" as const,
+              transcript: [
+                { role: "user", content: "old planning prompt" },
+                { role: "assistant", content: "old plan" },
+              ],
+              opencodeSessionId: "ses_plan",
+              ledger: [
+                {
+                  turn: 1,
+                  timestamp_ms: 0,
+                  mode: "plan",
+                  kind: { type: "answered_only", summary: "old plan" },
+                },
+              ],
+              events: [{ kind: "plan", step: 1, text: "1. Edit src/App.jsx" }],
+            }
+          : sess,
+      ),
+    }));
+
+    await getStore().executePlan(id);
+
+    const call = vi.mocked(invoke).mock.calls.find(([cmd]) => cmd === "agent_execute_plan");
+    expect(call).toBeTruthy();
+    const request = (call?.[1] as { request: Record<string, unknown> }).request;
+    expect(request.opencode_session_id).toBe("ses_plan");
+    expect(request.transcript).toBeUndefined();
+    expect(request.ledger).toBeUndefined();
   });
 
   it("does not start agent execution without a plan block", async () => {
@@ -562,6 +739,87 @@ describe("useAssistant mode switching + plan promotion", () => {
     ).toBe("undone");
   });
 
+  it("refreshes absolute editor tabs after undoing a relative agent change", async () => {
+    vi.mocked(invoke).mockImplementation(async (cmd, args) => {
+      if (cmd === "agent_undo_change") return undefined;
+      if (cmd === "read_text_file") {
+        expect(args).toEqual({ path: "/tmp/ws/src/app.ts" });
+        return "before";
+      }
+      throw new Error(`unexpected ${cmd}`);
+    });
+    const id = getStore().newSession({ mode: "agent", model: "qwen" });
+    useEditorStore.setState({
+      tabs: [{ ...testTab("/tmp/ws/src/app.ts"), content: "after" }],
+      activePath: "/tmp/ws/src/app.ts",
+    });
+    useAssistant.setState((s) => ({
+      sessions: s.sessions.map((sess) =>
+        sess.id === id
+          ? {
+              ...sess,
+              workspace: "/tmp/ws",
+              changes: [
+                {
+                  id: "55555555-5555-5555-5555-555555555555",
+                  step: 5,
+                  kind: "modify" as const,
+                  path: "src/app.ts",
+                  before_bytes: 6,
+                  after_bytes: 5,
+                  status: "pending" as const,
+                },
+              ],
+            }
+          : sess,
+      ),
+    }));
+
+    await getStore().undoChange(id, "55555555-5555-5555-5555-555555555555");
+
+    expect(useEditorStore.getState().tabs.at(0)?.content).toBe("before");
+    expect(useEditorStore.getState().activePath).toBe("/tmp/ws/src/app.ts");
+  });
+
+  it("closes an open absolute editor tab when undo removes a created file", async () => {
+    vi.mocked(invoke).mockImplementation(async (cmd) => {
+      if (cmd === "agent_undo_change") return undefined;
+      if (cmd === "read_text_file") throw new Error("missing");
+      throw new Error(`unexpected ${cmd}`);
+    });
+    const id = getStore().newSession({ mode: "agent", model: "qwen" });
+    useEditorStore.setState({
+      tabs: [{ ...testTab("/tmp/ws/src/new.ts"), content: "created" }],
+      activePath: "/tmp/ws/src/new.ts",
+    });
+    useAssistant.setState((s) => ({
+      sessions: s.sessions.map((sess) =>
+        sess.id === id
+          ? {
+              ...sess,
+              workspace: "/tmp/ws",
+              changes: [
+                {
+                  id: "66666666-6666-6666-6666-666666666666",
+                  step: 5,
+                  kind: "create" as const,
+                  path: "src/new.ts",
+                  before_bytes: 0,
+                  after_bytes: 7,
+                  status: "pending" as const,
+                },
+              ],
+            }
+          : sess,
+      ),
+    }));
+
+    await getStore().undoChange(id, "66666666-6666-6666-6666-666666666666");
+
+    expect(useEditorStore.getState().tabs).toEqual([]);
+    expect(useEditorStore.getState().activePath).toBeNull();
+  });
+
   it("purges only unresolved change snapshots when deleting a session", () => {
     vi.mocked(invoke).mockResolvedValue(undefined);
     const id = getStore().newSession({ mode: "agent", model: "qwen" });
@@ -602,3 +860,13 @@ describe("useAssistant mode switching + plan promotion", () => {
     });
   });
 });
+
+function testTab(path: string): Tab {
+  return {
+    path,
+    name: path.split("/").pop() ?? path,
+    content: "",
+    dirty: false,
+    language: "typescript",
+  };
+}

@@ -14,16 +14,19 @@ use regex::Regex;
 use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::process::Stdio;
+use std::process::{ExitStatus, Stdio};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tauri::{AppHandle, Emitter, Manager};
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::Command;
+use tokio::sync::Mutex;
 use tokio::time::timeout;
 
 const OLLAMA_OPENAI_BASE: &str = "http://127.0.0.1:11434/v1";
 const CHANGE_SNAPSHOT_MAX_FILE_BYTES: u64 = 2 * 1024 * 1024;
 const CHANGE_SNAPSHOT_MAX_TOTAL_BYTES: u64 = 96 * 1024 * 1024;
+const PROCESS_TAIL_LIMIT: usize = 8_000;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OpenCodeMode {
@@ -87,11 +90,12 @@ pub async fn run_opencode(
     .await?;
     let mut cancel = state.cancels.lock().issue(&req.request_id);
 
-    let workspace = if req.workspace.trim().is_empty() {
-        std::env::current_dir().map_err(AppError::Io)?
-    } else {
-        PathBuf::from(req.workspace.trim())
-    };
+    if req.workspace.trim().is_empty() {
+        return Err(AppError::Msg(
+            "No workspace is open for this OpenCode run.".into(),
+        ));
+    }
+    let workspace = PathBuf::from(req.workspace.trim());
     let workspace = std::fs::canonicalize(&workspace).unwrap_or(workspace);
     let bin = resolve_opencode_bin()?;
     let runtime = prepare_runtime_dir(&app, &req.model)?;
@@ -111,6 +115,8 @@ pub async fn run_opencode(
     cmd.current_dir(&workspace)
         .arg("run")
         .arg("--pure")
+        .arg("--dir")
+        .arg(&workspace)
         .arg("--model")
         .arg(&model_arg)
         .arg("--agent")
@@ -147,10 +153,13 @@ pub async fn run_opencode(
             if req.mode == OpenCodeMode::Ask && req.prompt.contains("<file path=") {
                 continue;
             }
-            if req.mode != OpenCodeMode::Agent && is_large_workspace_file(&workspace, file) {
+            let Some(file_arg) = opencode_file_arg(&workspace, file) else {
+                continue;
+            };
+            if req.mode != OpenCodeMode::Agent && is_large_workspace_file(&workspace, &file_arg) {
                 continue;
             }
-            cmd.arg(format!("--file={file}"));
+            cmd.arg(format!("--file={file_arg}"));
         }
     }
 
@@ -173,16 +182,22 @@ pub async fn run_opencode(
         .stdout
         .take()
         .ok_or_else(|| AppError::Msg("opencode stdout unavailable".into()))?;
+    let process_tail = Arc::new(Mutex::new(String::new()));
     let stderr = child.stderr.take();
     if let Some(stderr) = stderr {
         let app_for_stderr = app.clone();
         let rid = req.request_id.clone();
+        let process_tail = process_tail.clone();
         tokio::spawn(async move {
             let mut lines = BufReader::new(stderr).lines();
             while let Ok(Some(line)) = lines.next_line().await {
                 let trimmed = strip_ansi(&line);
                 if trimmed.trim().is_empty() {
                     continue;
+                }
+                {
+                    let mut tail = process_tail.lock().await;
+                    append_process_tail(&mut tail, &trimmed);
                 }
                 let _ = app_for_stderr.emit(
                     &format!("agent:event:{rid}"),
@@ -225,6 +240,10 @@ pub async fn run_opencode(
                 let parsed: Value = match serde_json::from_str(&trimmed) {
                     Ok(v) => v,
                     Err(_) => {
+                        {
+                            let mut tail = process_tail.lock().await;
+                            append_process_tail(&mut tail, &trimmed);
+                        }
                         if req.mode != OpenCodeMode::Ask {
                             let _ = app.emit(&evt, json!({
                                 "kind": "shell_progress",
@@ -314,7 +333,7 @@ pub async fn run_opencode(
                             });
                         }
                         if req.mode != OpenCodeMode::Ask {
-                            emit_tool_event(&app, &evt, step.max(1), &parsed);
+                            emit_tool_event(&app, &evt, step.max(1), &workspace, &parsed);
                         }
                     }
                     "error" => {
@@ -342,7 +361,8 @@ pub async fn run_opencode(
     let status = child.wait().await.map_err(AppError::Io)?;
     cleanup_runtime_dir(&runtime.root);
     if !status.success() {
-        let msg = last_error.unwrap_or_else(|| format!("opencode exited with {status}"));
+        let tail = process_tail.lock().await.clone();
+        let msg = last_error.unwrap_or_else(|| opencode_exit_message(status, &tail));
         if req.mode == OpenCodeMode::Ask {
             let _ = app.emit(&chat_evt, json!({ "error": msg, "done": true }));
         } else {
@@ -431,7 +451,31 @@ pub async fn run_opencode(
     Ok(out)
 }
 
-fn emit_tool_event(app: &AppHandle, evt: &str, step: u32, parsed: &Value) {
+fn append_process_tail(tail: &mut String, line: &str) {
+    tail.push_str(line.trim_end());
+    tail.push('\n');
+    if tail.len() > PROCESS_TAIL_LIMIT {
+        *tail = tail
+            .chars()
+            .rev()
+            .take(PROCESS_TAIL_LIMIT)
+            .collect::<String>()
+            .chars()
+            .rev()
+            .collect();
+    }
+}
+
+fn opencode_exit_message(status: ExitStatus, tail: &str) -> String {
+    let tail = tail.trim();
+    if tail.is_empty() {
+        format!("opencode exited with {status}")
+    } else {
+        format!("opencode exited with {status}\n\n{tail}")
+    }
+}
+
+fn emit_tool_event(app: &AppHandle, evt: &str, step: u32, workspace: &Path, parsed: &Value) {
     let Some(part) = parsed.get("part") else {
         return;
     };
@@ -452,7 +496,7 @@ fn emit_tool_event(app: &AppHandle, evt: &str, step: u32, parsed: &Value) {
         .and_then(|v| v.as_str())
         .unwrap_or("completed")
         .to_string();
-    let attrs = attrs_from_input(&input);
+    let attrs = attrs_from_input(&input, workspace);
     let args = serde_json::to_string_pretty(&input).unwrap_or_else(|_| "{}".into());
 
     let _ = app.emit(
@@ -700,16 +744,70 @@ fn change_kind_label(record: &agent_changes::FileChangeRecord) -> &'static str {
     }
 }
 
-fn attrs_from_input(input: &Value) -> serde_json::Map<String, Value> {
+fn attrs_from_input(input: &Value, workspace: &Path) -> serde_json::Map<String, Value> {
     let mut attrs = serde_json::Map::new();
     if let Some(obj) = input.as_object() {
         for key in ["filePath", "path", "pattern", "command", "description"] {
             if let Some(v) = obj.get(key).and_then(|v| v.as_str()) {
-                attrs.insert(key.to_string(), json!(v));
+                attrs.insert(
+                    key.to_string(),
+                    json!(workspace_relative_tool_value(workspace, v)),
+                );
             }
         }
     }
     attrs
+}
+
+fn workspace_relative_tool_value(workspace: &Path, value: &str) -> String {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return String::new();
+    }
+    let path = Path::new(trimmed);
+    path.strip_prefix(workspace)
+        .ok()
+        .map(|rel| rel.to_string_lossy().replace('\\', "/"))
+        .or_else(|| existing_workspace_relative_suffix(workspace, path))
+        .filter(|rel| !rel.is_empty())
+        .unwrap_or_else(|| trimmed.to_string())
+}
+
+fn opencode_file_arg(workspace: &Path, file: &str) -> Option<String> {
+    let trimmed = file.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let path = Path::new(trimmed);
+    if path.is_absolute() {
+        if let Ok(rel) = path.strip_prefix(workspace) {
+            if workspace.join(rel).exists() {
+                return Some(rel.to_string_lossy().replace('\\', "/"));
+            }
+        }
+        return None;
+    }
+    if workspace.join(path).exists() {
+        return Some(path.to_string_lossy().replace('\\', "/"));
+    }
+    existing_workspace_relative_suffix(workspace, path)
+}
+
+fn existing_workspace_relative_suffix(workspace: &Path, path: &Path) -> Option<String> {
+    let parts = path
+        .components()
+        .filter_map(|component| match component {
+            std::path::Component::Normal(part) => Some(part.to_os_string()),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    for start in 1..parts.len() {
+        let suffix = parts[start..].iter().collect::<PathBuf>();
+        if workspace.join(&suffix).exists() {
+            return Some(suffix.to_string_lossy().replace('\\', "/"));
+        }
+    }
+    None
 }
 
 fn emit_snapshots(
@@ -1390,6 +1488,55 @@ mod tests {
     #[test]
     fn strips_basic_ansi_sequences() {
         assert_eq!(strip_ansi("\u{1b}[91mError\u{1b}[0m"), "Error");
+    }
+
+    #[test]
+    fn opencode_exit_message_includes_process_tail() {
+        let status = std::process::Command::new("sh")
+            .arg("-c")
+            .arg("exit 1")
+            .status()
+            .unwrap();
+        let msg = opencode_exit_message(status, "File not found: Add a new slide\n");
+        assert!(msg.contains("opencode exited with exit status: 1"));
+        assert!(msg.contains("File not found: Add a new slide"));
+    }
+
+    #[test]
+    fn opencode_tool_values_are_workspace_relative_when_possible() {
+        let dir = tempfile::tempdir().unwrap();
+        let project = dir.path().join("project");
+        std::fs::create_dir_all(project.join("src")).unwrap();
+        std::fs::write(project.join("src/entry.txt"), "content").unwrap();
+        let abs = project.join("src/entry.txt");
+        assert_eq!(
+            workspace_relative_tool_value(dir.path(), &abs.to_string_lossy()),
+            "project/src/entry.txt"
+        );
+        assert_eq!(
+            workspace_relative_tool_value(dir.path(), "project/src/entry.txt"),
+            "project/src/entry.txt"
+        );
+        assert_eq!(
+            opencode_file_arg(&project, "project/src/entry.txt").as_deref(),
+            Some("src/entry.txt")
+        );
+        assert_eq!(
+            opencode_file_arg(&project, &abs.to_string_lossy()).as_deref(),
+            Some("src/entry.txt")
+        );
+        assert_eq!(
+            opencode_file_arg(
+                &project,
+                &dir.path().join("other/src/entry.txt").to_string_lossy()
+            ),
+            None
+        );
+        assert_eq!(
+            workspace_relative_tool_value(&project, "project/src/entry.txt"),
+            "src/entry.txt"
+        );
+        assert_eq!(opencode_file_arg(dir.path(), "missing/entry.txt"), None);
     }
 
     #[test]

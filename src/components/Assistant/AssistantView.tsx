@@ -44,6 +44,7 @@ import { useDiffViewer } from "@/store/diffViewer";
 import { toast } from "@/components/Toast";
 import {
   agentActivityItems,
+  latestActivityPhase,
   visibleEventOutputs,
   type ActivityItem,
   type EventOutput,
@@ -105,18 +106,24 @@ export function AssistantView() {
     refs: Parameters<typeof buildContext>[0],
     prompt: string,
     mode: "ask" | "plan" | "agent",
-  ) =>
-    buildContext(refs, {
+  ) => {
+    const store = useEditorStore.getState();
+    const activeEditor =
+      editor && pathBelongsToWorkspace(editor.path, root) ? editor : null;
+    return buildContext(refs, {
       budgetTokens: mode === "ask" ? 8000 : 14000,
       embedModel,
       codebaseUsable: indexUsable,
-      currentFile: editor
-        ? { path: editor.path, content: editor.content }
+      currentFile: activeEditor
+        ? { path: activeEditor.path, content: activeEditor.content }
         : null,
       userPrompt: prompt,
       mode,
-      openTabs: useEditorStore.getState().tabs.map((t) => t.path),
+      openTabs: store.tabs
+        .map((t) => t.path)
+        .filter((path) => pathBelongsToWorkspace(path, root)),
     });
+  };
 
   const onSend = (text: string) => {
     void send(text, {
@@ -156,6 +163,7 @@ export function AssistantView() {
             mode={activeMode}
             model={active?.model ?? modelForMode(activeMode, chatModel, agentModel)}
             phase={phase}
+            session={active}
           />
         )}
       </div>
@@ -181,6 +189,7 @@ export function AssistantView() {
                 mode={active.mode}
                 model={active.model}
                 phase={phase}
+                session={active}
               />
             )}
             <EventOutputs session={active} />
@@ -210,20 +219,23 @@ function AssistantStatusPill({
   mode,
   model,
   phase,
+  session,
 }: {
   mode: AssistantMode;
   model: string;
   phase: Phase;
+  session: AssistantSession | null | undefined;
 }) {
+  const label = phaseLabel(phase, session);
   return (
     <span
       className="ml-auto inline-flex min-w-0 items-center gap-1.5 rounded-full border border-noir-accent/25 bg-noir-accent/10 px-2 py-0.5 text-[10px] font-sans text-noir-accent"
       role="status"
       aria-live="polite"
-      title={`${modeLabel(mode)} using ${model}: ${phaseLabel(phase)}`}
+      title={`${modeLabel(mode)} using ${model}: ${label}`}
     >
       <Loader2 size={10} className="shrink-0 animate-spin" aria-hidden="true" />
-      <span className="truncate max-w-[160px]">{phaseLabel(phase)}</span>
+      <span className="truncate max-w-[160px]">{label}</span>
     </span>
   );
 }
@@ -232,11 +244,14 @@ function AssistantActivityBanner({
   mode,
   model,
   phase,
+  session,
 }: {
   mode: AssistantMode;
   model: string;
   phase: Phase;
+  session: AssistantSession | null | undefined;
 }) {
+  const label = phaseLabel(phase, session);
   return (
     <div className="mx-3 my-3 rounded-md border border-noir-accent/30 bg-noir-accent/5 px-3 py-2">
       <div className="flex items-center gap-2">
@@ -246,7 +261,7 @@ function AssistantActivityBanner({
         </span>
         <div className="min-w-0">
           <div className="text-[11px] font-sans font-medium text-noir-text">
-            {phaseLabel(phase)}
+            {label}
           </div>
           <div className="text-[10px] font-sans text-noir-mute truncate">
             {modeLabel(mode)} · {model || "model"} is active
@@ -257,16 +272,24 @@ function AssistantActivityBanner({
   );
 }
 
-function phaseLabel(phase: Phase): string {
+function phaseLabel(phase: Phase, session?: AssistantSession | null): string {
+  const latest = session ? latestActivityPhase(session.events) : null;
   switch (phase.kind) {
     case "warming":
-      return phase.step > 0
-        ? `Starting model for step ${phase.step}`
-        : "Starting model";
+      if (latest && latest !== "Starting plan" && latest !== "Starting agent") {
+        return latest.startsWith("Starting model") && phase.step === 0
+          ? "Starting model"
+          : latest;
+      }
+      return phase.step > 0 ? `Thinking through step ${phase.step}` : "Starting model";
     case "streaming":
-      return phase.step > 0 ? `Writing step ${phase.step}` : "Writing response";
+      return latest?.startsWith("Writing step")
+        ? latest
+        : phase.step > 0
+          ? `Writing step ${phase.step}`
+          : "Writing response";
     case "tool":
-      return `Running ${phase.tool}`;
+      return latest && !latest.startsWith("Thinking after") ? latest : `Running ${phase.tool}`;
     case "awaiting_approval":
       return `Waiting on ${phase.tool}`;
     case "awaiting_budget_bump":
@@ -439,7 +462,11 @@ function ChangeReviewCard({ session }: { session: AssistantSession }) {
             <Check size={12} aria-hidden="true" />
           </button>
           <button
-            onClick={() => void undoAllChanges(session.id)}
+            onClick={() =>
+              void undoAllChanges(session.id).catch((error) => {
+                toast.error("Couldn't undo every change", { body: String(error) });
+              })
+            }
             disabled={busy || pending.length === 0}
             className="pn-icon-button"
             title="Undo all pending changes"
@@ -484,7 +511,11 @@ function ChangeReviewCard({ session }: { session: AssistantSession }) {
                 <Check size={12} aria-hidden="true" />
               </button>
               <button
-                onClick={() => void undoChange(session.id, change.id)}
+                onClick={() =>
+                  void undoChange(session.id, change.id).catch((error) => {
+                    toast.error("Couldn't undo change", { body: String(error) });
+                  })
+                }
                 disabled={busy || !pendingRow}
                 className="pn-icon-button"
                 title="Undo this file change"
@@ -511,6 +542,27 @@ function formatBytes(bytes: number): string {
   if (bytes < 1024) return `${bytes}B`;
   if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)}KB`;
   return `${(bytes / (1024 * 1024)).toFixed(1)}MB`;
+}
+
+function pathBelongsToWorkspace(path: string | null | undefined, root: string | null): boolean {
+  const value = path?.trim();
+  if (!value) return false;
+  if (!root) return true;
+  const normalizedPath = normalizeWorkspacePath(value);
+  const normalizedRoot = normalizeWorkspacePath(root);
+  if (!isAbsolutePath(normalizedPath)) return true;
+  return (
+    normalizedPath === normalizedRoot ||
+    normalizedPath.startsWith(`${normalizedRoot}/`)
+  );
+}
+
+function normalizeWorkspacePath(path: string): string {
+  return path.replace(/\\/g, "/").replace(/\/+$/, "");
+}
+
+function isAbsolutePath(path: string): boolean {
+  return path.startsWith("/") || /^[A-Za-z]:\//.test(path);
 }
 
 function ActivityTrace({ session }: { session: AssistantSession }) {
