@@ -35,7 +35,8 @@ export type ToolName =
   | "git_status"
   | "commit"
   | "create_checkpoint"
-  | "rollback";
+  | "rollback"
+  | "update_todo";
 
 export type AgentPhase =
   | "understand"
@@ -183,6 +184,7 @@ export const MODE_TOOLS: Record<HarnessMode, Set<ToolName>> = {
     "search_symbols",
     "get_diagnostics",
     "git_status",
+    "update_todo",
   ]),
   plan: new Set([
     "list_tree",
@@ -192,6 +194,7 @@ export const MODE_TOOLS: Record<HarnessMode, Set<ToolName>> = {
     "get_diagnostics",
     "find_tests_for_file",
     "git_status",
+    "update_todo",
   ]),
   agent: new Set([
     "list_tree",
@@ -206,10 +209,11 @@ export const MODE_TOOLS: Record<HarnessMode, Set<ToolName>> = {
     "run_command",
     "create_checkpoint",
     "rollback",
+    "update_todo",
   ]),
   autocomplete: new Set([]),
-  commit_message: new Set(["git_diff", "git_status", "read_file"]),
-  verify: new Set(["run_command", "get_diagnostics", "git_status"]),
+  commit_message: new Set(["git_diff", "git_status", "read_file", "update_todo"]),
+  verify: new Set(["run_command", "get_diagnostics", "git_status", "update_todo"]),
   repair: new Set([
     "read_file",
     "search_text",
@@ -217,6 +221,7 @@ export const MODE_TOOLS: Record<HarnessMode, Set<ToolName>> = {
     "apply_patch",
     "run_command",
     "rollback",
+    "update_todo",
   ]),
   review: new Set([
     "list_tree",
@@ -226,6 +231,7 @@ export const MODE_TOOLS: Record<HarnessMode, Set<ToolName>> = {
     "get_diagnostics",
     "git_diff",
     "git_status",
+    "update_todo",
   ]),
 };
 
@@ -251,6 +257,22 @@ const DANGEROUS_COMMAND_PATTERNS = [
   /\bdeploy\b/,
   /\bdrop\s+database\b/i,
 ];
+
+const DECISION_LIKE_MEMORY_KINDS = new Set<HarnessMemoryKind>([
+  "proposal",
+  "chunk_summary",
+  "compact_summary",
+  "file_summary",
+  "decision",
+  "navigation",
+  "risk",
+  "command_plan",
+  "patch_plan",
+  "safety_review",
+  "action_plan",
+  "draft",
+  "final",
+]);
 
 export class PermissionEngine {
   decide(mode: HarnessMode, call: ToolCall, state?: AgentOrchestratorState): PermissionDecision {
@@ -736,6 +758,21 @@ function currentPromptIndex(input: JudgedStageInput, stack: AgentPromptFrame[]):
 
 export type AgentArchetype =
   | "cartographer"
+  | "navigator"
+  | "todo_manager"
+  | "todo_checker"
+  | "folder_scout"
+  | "file_scout"
+  | "symbol_scout"
+  | "context_retriever"
+  | "context_pruner"
+  | "memory_compactor"
+  | "dependency_mapper"
+  | "risk_assessor"
+  | "verification_planner"
+  | "command_planner"
+  | "patch_planner"
+  | "safety_guard"
   | "scout"
   | "scout_troop_leader"
   | "researcher"
@@ -761,13 +798,23 @@ export type HarnessMemoryKind =
   | "proposal"
   | "judge_verdict"
   | "tool_result"
+  | "tool_request"
   | "directory_listing"
   | "file_metadata"
   | "file_content"
+  | "context_slice"
+  | "symbol_reference"
   | "diff_chunk"
   | "chunk_summary"
+  | "compact_summary"
   | "file_summary"
   | "decision"
+  | "navigation"
+  | "todo"
+  | "risk"
+  | "command_plan"
+  | "patch_plan"
+  | "safety_review"
   | "action_plan"
   | "draft"
   | "verification"
@@ -825,11 +872,11 @@ export class MemoryGraph {
   private memories = new Map<string, HarnessMemory>();
   private lanes = new Map<string, MemoryLane>();
 
-  constructor(baseLaneId = "main", label = "Main") {
+  constructor(readonly baseLaneId = "main", label = "Main") {
     this.lanes.set(baseLaneId, { id: baseLaneId, label, createdAt: Date.now() });
   }
 
-  forkLane(label: string, parentId = "main"): string {
+  forkLane(label: string, parentId = this.baseLaneId): string {
     if (!this.lanes.has(parentId)) throw new Error(`Unknown parent lane: ${parentId}`);
     const id = `lane-${this.nextLaneId++}`;
     this.lanes.set(id, { id, label, parentId, createdAt: Date.now() });
@@ -837,7 +884,7 @@ export class MemoryGraph {
   }
 
   add<T>(write: MemoryWrite<T>): HarnessMemory<T> {
-    const laneId = write.laneId ?? "main";
+    const laneId = write.laneId ?? this.baseLaneId;
     if (!this.lanes.has(laneId)) throw new Error(`Unknown memory lane: ${laneId}`);
     const memory: HarnessMemory<T> = {
       id: `memory-${this.nextMemoryId++}`,
@@ -918,6 +965,27 @@ export class MemoryGraph {
     return updated;
   }
 
+  update<T>(
+    id: string,
+    patch: Partial<
+      Pick<
+        HarnessMemory<T>,
+        "content" | "summary" | "tags" | "parentIds" | "status" | "confidence" | "source"
+      >
+    >,
+  ): HarnessMemory<T> {
+    const memory = this.memories.get(id) as HarnessMemory<T> | undefined;
+    if (!memory) throw new Error(`Unknown memory: ${id}`);
+    const updated: HarnessMemory<T> = {
+      ...memory,
+      ...patch,
+      tags: patch.tags ? [...new Set(patch.tags)] : memory.tags,
+      parentIds: patch.parentIds ? [...new Set(patch.parentIds)] : memory.parentIds,
+    };
+    this.memories.set(id, updated);
+    return updated;
+  }
+
   materializeContext(options: {
     laneId?: string;
     kinds?: HarnessMemoryKind[];
@@ -938,6 +1006,138 @@ export class MemoryGraph {
   }
 }
 
+export type TodoStatus = "pending" | "in_progress" | "completed" | "blocked";
+
+export type HarnessTodo = {
+  id: string;
+  title: string;
+  status: TodoStatus;
+  stage: string;
+  assignedArchetype?: AgentArchetype;
+  parentTodoId?: string;
+  evidenceMemoryIds: string[];
+  blockReason?: string;
+  updatedAt: number;
+};
+
+export type TodoWrite = {
+  id?: string;
+  title: string;
+  stage: string;
+  assignedArchetype?: AgentArchetype;
+  parentTodoId?: string;
+  evidenceMemoryIds?: string[];
+  status?: TodoStatus;
+};
+
+export class TodoLedger {
+  private nextTodoId = 1;
+  private todoToMemory = new Map<string, string>();
+
+  constructor(
+    private readonly memory: MemoryGraph,
+    private readonly laneId = "main",
+  ) {
+    for (const item of memory.byKind("todo")) {
+      const todo = item.content as HarnessTodo;
+      if (todo?.id) this.todoToMemory.set(todo.id, item.id);
+    }
+  }
+
+  add(write: TodoWrite): HarnessMemory<HarnessTodo> {
+    const id = write.id ?? `todo-${this.nextTodoId++}`;
+    const laneId = this.resolveLaneId();
+    const todo: HarnessTodo = {
+      id,
+      title: write.title,
+      status: write.status ?? "pending",
+      stage: write.stage,
+      assignedArchetype: write.assignedArchetype,
+      parentTodoId: write.parentTodoId,
+      evidenceMemoryIds: [...new Set(write.evidenceMemoryIds ?? [])],
+      updatedAt: Date.now(),
+    };
+    const memory = this.memory.add({
+      laneId,
+      stage: write.stage,
+      kind: "todo",
+      archetype: "todo_manager",
+      content: todo,
+      summary: formatTodoSummary(todo),
+      tags: ["todo", todo.status, write.stage],
+      parentIds: todo.evidenceMemoryIds,
+      status: "approved",
+    });
+    this.todoToMemory.set(id, memory.id);
+    return memory;
+  }
+
+  updateStatus(
+    id: string,
+    status: TodoStatus,
+    options: { evidenceMemoryIds?: string[]; blockReason?: string } = {},
+  ): HarnessMemory<HarnessTodo> {
+    const memoryId = this.todoToMemory.get(id);
+    if (!memoryId) throw new Error(`Unknown todo: ${id}`);
+    const current = this.memory.get<HarnessTodo>(memoryId);
+    if (!current) throw new Error(`Unknown todo memory: ${memoryId}`);
+    const todo: HarnessTodo = {
+      ...current.content,
+      status,
+      blockReason: options.blockReason,
+      evidenceMemoryIds: [
+        ...new Set([...current.content.evidenceMemoryIds, ...(options.evidenceMemoryIds ?? [])]),
+      ],
+      updatedAt: Date.now(),
+    };
+    return this.memory.update<HarnessTodo>(memoryId, {
+      content: todo,
+      summary: formatTodoSummary(todo),
+      tags: ["todo", todo.status, todo.stage],
+      parentIds: todo.evidenceMemoryIds,
+      status: "approved",
+    });
+  }
+
+  start(id: string, evidenceMemoryIds?: string[]): HarnessMemory<HarnessTodo> {
+    return this.updateStatus(id, "in_progress", { evidenceMemoryIds });
+  }
+
+  complete(id: string, evidenceMemoryIds?: string[]): HarnessMemory<HarnessTodo> {
+    return this.updateStatus(id, "completed", { evidenceMemoryIds });
+  }
+
+  block(id: string, blockReason: string, evidenceMemoryIds?: string[]): HarnessMemory<HarnessTodo> {
+    return this.updateStatus(id, "blocked", { blockReason, evidenceMemoryIds });
+  }
+
+  snapshot(): HarnessTodo[] {
+    return this.memory
+      .byKind("todo", { approvedOnly: true })
+      .map((memory) => memory.content as HarnessTodo)
+      .sort((a, b) => a.updatedAt - b.updatedAt || a.id.localeCompare(b.id));
+  }
+
+  open(): HarnessTodo[] {
+    return this.snapshot().filter((todo) => todo.status === "pending" || todo.status === "in_progress");
+  }
+
+  isComplete(id: string): boolean {
+    return this.snapshot().some((todo) => todo.id === id && todo.status === "completed");
+  }
+
+  private resolveLaneId(): string {
+    if (this.memory.getLane(this.laneId)) return this.laneId;
+    const first = this.memory.snapshot().lanes[0];
+    if (!first) throw new Error("Todo ledger requires at least one memory lane.");
+    return first.id;
+  }
+}
+
+function formatTodoSummary(todo: HarnessTodo): string {
+  return `[${todo.status}] ${todo.title}`;
+}
+
 export type AgentArchetypeDefinition = {
   archetype: AgentArchetype;
   actionMode: AgentActionMode;
@@ -952,6 +1152,111 @@ export const AGENT_ARCHETYPES: Record<AgentArchetype, AgentArchetypeDefinition> 
     actionMode: "none",
     purpose: "Map visible workspace structure into durable, queryable memory.",
     outputs: ["prompt", "directory_listing", "file_metadata"],
+    requiresJudgeBeforeUse: false,
+  },
+  navigator: {
+    archetype: "navigator",
+    actionMode: "propose",
+    purpose: "Choose the next layer after an approved result, or stop with an explicit reason.",
+    outputs: ["navigation", "decision"],
+    requiresJudgeBeforeUse: true,
+  },
+  todo_manager: {
+    archetype: "todo_manager",
+    actionMode: "none",
+    purpose: "Create and update durable task checkboxes in harness memory.",
+    outputs: ["todo"],
+    requiresJudgeBeforeUse: false,
+  },
+  todo_checker: {
+    archetype: "todo_checker",
+    actionMode: "propose",
+    purpose: "Inspect the current todo ledger and propose whether work is complete or blocked.",
+    outputs: ["decision", "todo"],
+    requiresJudgeBeforeUse: true,
+  },
+  folder_scout: {
+    archetype: "folder_scout",
+    actionMode: "propose",
+    purpose: "Propose directories worth expanding from the current prompt and directory memory.",
+    outputs: ["proposal"],
+    requiresJudgeBeforeUse: true,
+  },
+  file_scout: {
+    archetype: "file_scout",
+    actionMode: "propose",
+    purpose: "Propose files worth reading from approved directory and search evidence.",
+    outputs: ["proposal"],
+    requiresJudgeBeforeUse: true,
+  },
+  symbol_scout: {
+    archetype: "symbol_scout",
+    actionMode: "propose",
+    purpose: "Propose symbols, definitions, and references to resolve with typed language tools.",
+    outputs: ["proposal", "symbol_reference"],
+    requiresJudgeBeforeUse: true,
+  },
+  context_retriever: {
+    archetype: "context_retriever",
+    actionMode: "none",
+    purpose: "Materialize approved memories and small source slices for a bounded model call.",
+    outputs: ["context_slice", "tool_result"],
+    requiresJudgeBeforeUse: false,
+  },
+  context_pruner: {
+    archetype: "context_pruner",
+    actionMode: "propose",
+    purpose: "Propose which stale or low-value memories should be excluded from the next context window.",
+    outputs: ["decision", "compact_summary"],
+    requiresJudgeBeforeUse: true,
+  },
+  memory_compactor: {
+    archetype: "memory_compactor",
+    actionMode: "none",
+    purpose: "Collapse approved parallel memories into a smaller retrieval artifact without adding facts.",
+    outputs: ["compact_summary"],
+    requiresJudgeBeforeUse: true,
+  },
+  dependency_mapper: {
+    archetype: "dependency_mapper",
+    actionMode: "propose",
+    purpose: "Propose dependency and call-graph edges that should be checked before planning or patching.",
+    outputs: ["proposal", "decision"],
+    requiresJudgeBeforeUse: true,
+  },
+  risk_assessor: {
+    archetype: "risk_assessor",
+    actionMode: "propose",
+    purpose: "Identify blast radius, unsafe operations, and verification risk before actions are taken.",
+    outputs: ["risk", "decision"],
+    requiresJudgeBeforeUse: true,
+  },
+  verification_planner: {
+    archetype: "verification_planner",
+    actionMode: "propose",
+    purpose: "Propose the smallest verification ladder that can prove the current change.",
+    outputs: ["verification", "action_plan"],
+    requiresJudgeBeforeUse: true,
+  },
+  command_planner: {
+    archetype: "command_planner",
+    actionMode: "propose",
+    purpose: "Propose bounded, allowlisted commands with timeouts and expected outputs.",
+    outputs: ["command_plan", "action_plan"],
+    requiresJudgeBeforeUse: true,
+  },
+  patch_planner: {
+    archetype: "patch_planner",
+    actionMode: "propose",
+    purpose: "Propose a minimal edit set from approved evidence before any file mutation.",
+    outputs: ["patch_plan", "action_plan"],
+    requiresJudgeBeforeUse: true,
+  },
+  safety_guard: {
+    archetype: "safety_guard",
+    actionMode: "none",
+    purpose: "Block dangerous tool requests, secret access, broad rewrites, and unapproved side effects.",
+    outputs: ["safety_review", "decision"],
     requiresJudgeBeforeUse: false,
   },
   scout: {
@@ -1113,6 +1418,13 @@ export class HarnessBlueprint {
       ) {
         issues.push(`${layer.id} proposes memory without a judge gate.`);
       }
+      if (
+        layer.archetype !== "judge" &&
+        layer.outputKinds.some((kind) => DECISION_LIKE_MEMORY_KINDS.has(kind)) &&
+        layer.judge.kind === "none"
+      ) {
+        issues.push(`${layer.id} emits decision-like memory without a judge gate.`);
+      }
       if (layer.actionMode === "take" && this.mode !== "agent" && this.mode !== "repair") {
         issues.push(`${layer.id} takes actions in ${this.mode} mode.`);
       }
@@ -1212,6 +1524,314 @@ export class JudgeCouncil {
   }
 }
 
+export type CouncilDecisionRecord = {
+  itemId: string;
+  label: string;
+  approved: boolean;
+  requiredYes: number;
+  yes: number;
+  no: number;
+  invalid: number;
+  votes: CouncilVote[];
+};
+
+export type GatedDecisionInput<T = unknown> = {
+  laneId?: string;
+  stage: string;
+  kind: HarnessMemoryKind;
+  archetype: AgentArchetype;
+  content: T;
+  summary: string;
+  tags?: string[];
+  parentIds?: string[];
+  confidence?: number;
+  source?: HarnessMemorySource;
+  buildPrompt?: (memory: HarnessMemory<T>) => string;
+};
+
+export type GatedDecisionResult<T = unknown> = {
+  memory: HarnessMemory<T>;
+  verdict: CouncilItemVerdict<HarnessMemory<T>>;
+  judgeMemory: HarnessMemory<CouncilDecisionRecord>;
+  approved: boolean;
+};
+
+export type NavigationAction = "continue" | "retry" | "backtrack" | "branch" | "done" | "blocked";
+
+export type NavigationDecision = {
+  action: NavigationAction;
+  fromLayerId: string;
+  nextLayerId?: string;
+  reason: string;
+  requiredMemoryKinds?: HarnessMemoryKind[];
+  todoIds?: string[];
+  retryPromptIndex?: number;
+};
+
+export type StrictLayerRunResult<T = unknown> =
+  | {
+      status: "ready";
+      decision: GatedDecisionResult<T>;
+      navigation: GatedDecisionResult<NavigationDecision>;
+      nextLayerId: string;
+    }
+  | {
+      status: "done";
+      decision: GatedDecisionResult<T>;
+      navigation: GatedDecisionResult<NavigationDecision>;
+    }
+  | {
+      status: "blocked";
+      reason: string;
+      decision?: GatedDecisionResult<T>;
+      navigation?: GatedDecisionResult<NavigationDecision>;
+    };
+
+export class DecisionCouncilRuntime {
+  constructor(
+    private readonly memory: MemoryGraph,
+    private readonly council = new JudgeCouncil(),
+  ) {}
+
+  async approveDecision<T>(
+    input: GatedDecisionInput<T>,
+    call: CouncilJudgeCall<HarnessMemory<T>>,
+  ): Promise<GatedDecisionResult<T>> {
+    const proposed = this.memory.add({
+      laneId: input.laneId,
+      stage: input.stage,
+      kind: input.kind,
+      archetype: input.archetype,
+      content: input.content,
+      summary: input.summary,
+      tags: input.tags,
+      parentIds: input.parentIds,
+      status: "pending",
+      confidence: input.confidence,
+      source: input.source,
+    });
+    const council = await this.council.evaluateItems(
+      [{ id: proposed.id, label: input.summary, value: proposed }],
+      (item) => input.buildPrompt?.(item.value) ?? buildDefaultDecisionPrompt(item.value),
+      call,
+    );
+    const verdict = council.all[0];
+    const memory = this.memory.setStatus(proposed.id, verdict.approved ? "approved" : "rejected") as HarnessMemory<T>;
+    const judgeMemory = this.recordCouncilVerdict(input.stage, verdict, [memory.id]);
+    return { memory, verdict, judgeMemory, approved: verdict.approved };
+  }
+
+  async approveNavigation(
+    decision: NavigationDecision,
+    parentIds: string[],
+    call: CouncilJudgeCall<HarnessMemory<NavigationDecision>>,
+  ): Promise<GatedDecisionResult<NavigationDecision>> {
+    return this.approveDecision(
+      {
+        stage: `${decision.fromLayerId}:navigator`,
+        kind: "navigation",
+        archetype: "navigator",
+        content: decision,
+        summary: `${decision.action}${decision.nextLayerId ? ` -> ${decision.nextLayerId}` : ""}: ${decision.reason}`,
+        tags: ["navigation", decision.action, decision.fromLayerId],
+        parentIds,
+        buildPrompt: (memory) => buildNavigationJudgePrompt(memory.content),
+      },
+      call,
+    );
+  }
+
+  private recordCouncilVerdict<T>(
+    stage: string,
+    verdict: CouncilItemVerdict<T>,
+    parentIds: string[],
+  ): HarnessMemory<CouncilDecisionRecord> {
+    return this.memory.add({
+      stage: `${stage}:council`,
+      kind: "judge_verdict",
+      archetype: "judge",
+      content: councilDecisionRecord(verdict),
+      summary: `${verdict.approved ? "approved" : "rejected"} ${verdict.item.label} (${verdict.yes}Y/${verdict.no}N/${verdict.invalid} invalid)`,
+      tags: ["judge", verdict.approved ? "approved" : "rejected"],
+      parentIds,
+      status: "approved",
+    });
+  }
+}
+
+export class Navigator {
+  proposeAfterLayer(
+    blueprint: HarnessBlueprint,
+    currentLayerId: string,
+    memory: MemoryGraph,
+    todos?: TodoLedger,
+  ): NavigationDecision {
+    const index = blueprint.layers.findIndex((layer) => layer.id === currentLayerId);
+    if (index < 0) throw new Error(`Unknown layer: ${currentLayerId}`);
+    const openTodos = todos?.open() ?? [];
+    const next = blueprint.layers[index + 1];
+    if (!next) {
+      return {
+        action: openTodos.length > 0 ? "blocked" : "done",
+        fromLayerId: currentLayerId,
+        reason:
+          openTodos.length > 0
+            ? `Cannot finish while ${openTodos.length} todo(s) remain open.`
+            : "All blueprint layers have completed.",
+        todoIds: openTodos.map((todo) => todo.id),
+      };
+    }
+    const missingKinds = next.inputKinds.filter(
+      (kind) => memory.byKind(kind, { approvedOnly: true }).length === 0,
+    );
+    if (missingKinds.length > 0) {
+      return {
+        action: "retry",
+        fromLayerId: currentLayerId,
+        nextLayerId: currentLayerId,
+        reason: `Next layer ${next.id} is missing approved memory: ${missingKinds.join(", ")}.`,
+        requiredMemoryKinds: missingKinds,
+        todoIds: openTodos.map((todo) => todo.id),
+      };
+    }
+    return {
+      action: "continue",
+      fromLayerId: currentLayerId,
+      nextLayerId: next.id,
+      reason: `Approved memory satisfies ${next.id} inputs.`,
+      requiredMemoryKinds: next.inputKinds,
+      todoIds: openTodos.map((todo) => todo.id),
+    };
+  }
+}
+
+export class StrictLayerRuntime {
+  readonly decisions: DecisionCouncilRuntime;
+  readonly navigator: Navigator;
+  readonly todos: TodoLedger;
+
+  constructor(
+    readonly blueprint: HarnessBlueprint,
+    readonly memory = new MemoryGraph(),
+    options: {
+      decisions?: DecisionCouncilRuntime;
+      navigator?: Navigator;
+      todos?: TodoLedger;
+    } = {},
+  ) {
+    this.decisions = options.decisions ?? new DecisionCouncilRuntime(memory);
+    this.navigator = options.navigator ?? new Navigator();
+    this.todos = options.todos ?? new TodoLedger(memory);
+  }
+
+  async approveLayerDecision<T>(
+    layerId: string,
+    input: Omit<GatedDecisionInput<T>, "stage" | "kind" | "archetype"> & {
+      kind?: HarnessMemoryKind;
+      archetype?: AgentArchetype;
+    },
+    call: CouncilJudgeCall<HarnessMemory<T>>,
+  ): Promise<GatedDecisionResult<T>> {
+    const layer = this.requireLayer(layerId);
+    return this.decisions.approveDecision(
+      {
+        ...input,
+        stage: layer.id,
+        kind: input.kind ?? layer.outputKinds[0],
+        archetype: input.archetype ?? layer.archetype,
+      },
+      call,
+    );
+  }
+
+  async approveNavigation(
+    layerId: string,
+    parentIds: string[],
+    call: CouncilJudgeCall<HarnessMemory<NavigationDecision>>,
+  ): Promise<GatedDecisionResult<NavigationDecision>> {
+    const decision = this.navigator.proposeAfterLayer(this.blueprint, layerId, this.memory, this.todos);
+    return this.decisions.approveNavigation(decision, parentIds, call);
+  }
+
+  async runDecisionAndNavigate<T>(
+    layerId: string,
+    input: Omit<GatedDecisionInput<T>, "stage" | "kind" | "archetype"> & {
+      kind?: HarnessMemoryKind;
+      archetype?: AgentArchetype;
+    },
+    call: CouncilJudgeCall<HarnessMemory<T | NavigationDecision>>,
+  ): Promise<StrictLayerRunResult<T>> {
+    const decision = await this.approveLayerDecision(
+      layerId,
+      input,
+      call as CouncilJudgeCall<HarnessMemory<T>>,
+    );
+    if (!decision.approved) {
+      return {
+        status: "blocked",
+        reason: `Layer ${layerId} failed judge council.`,
+        decision,
+      };
+    }
+    const navigation = await this.approveNavigation(
+      layerId,
+      [decision.memory.id, decision.judgeMemory.id],
+      call as CouncilJudgeCall<HarnessMemory<NavigationDecision>>,
+    );
+    if (!navigation.approved) {
+      return {
+        status: "blocked",
+        reason: `Navigator after ${layerId} failed judge council.`,
+        decision,
+        navigation,
+      };
+    }
+    const nav = navigation.memory.content;
+    if (nav.action === "continue" && nav.nextLayerId) {
+      return { status: "ready", decision, navigation, nextLayerId: nav.nextLayerId };
+    }
+    if (nav.action === "done") {
+      return { status: "done", decision, navigation };
+    }
+    return {
+      status: "blocked",
+      reason: `Navigator chose ${nav.action}: ${nav.reason}`,
+      decision,
+      navigation,
+    };
+  }
+
+  canTakeAction(layerId: string, approvedActionPlanId: string): PermissionDecision {
+    const layer = this.requireLayer(layerId);
+    if (layer.actionMode !== "take") {
+      return {
+        allow: false,
+        reason: `${layerId} is not an action-taking layer.`,
+        tag: "bad_tool_call",
+      };
+    }
+    const plan = this.memory.get(approvedActionPlanId);
+    if (
+      !plan ||
+      plan.status !== "approved" ||
+      !["action_plan", "command_plan", "patch_plan"].includes(plan.kind)
+    ) {
+      return {
+        allow: false,
+        reason: "Action takers require an approved action plan memory.",
+        tag: "edited_too_early",
+      };
+    }
+    return { allow: true };
+  }
+
+  private requireLayer(layerId: string): HarnessLayerSpec {
+    const layer = this.blueprint.layers.find((candidate) => candidate.id === layerId);
+    if (!layer) throw new Error(`Unknown layer: ${layerId}`);
+    return layer;
+  }
+}
+
 export class LayeredHarness {
   constructor(
     readonly blueprint: HarnessBlueprint,
@@ -1233,6 +1853,65 @@ export class LayeredHarness {
       kinds: layer.inputKinds,
       approvedOnly: true,
     });
+  }
+
+  strictRuntime(options?: {
+    decisions?: DecisionCouncilRuntime;
+    navigator?: Navigator;
+    todos?: TodoLedger;
+  }): StrictLayerRuntime {
+    return new StrictLayerRuntime(this.blueprint, this.memory, options);
+  }
+}
+
+function buildDefaultDecisionPrompt<T>(memory: HarnessMemory<T>): string {
+  return [
+    `Stage: ${memory.stage}`,
+    `Archetype: ${memory.archetype}`,
+    `Memory kind: ${memory.kind}`,
+    "Approve this decision only if it is grounded, bounded, and useful for the current harness goal.",
+    "",
+    "Summary:",
+    memory.summary ?? "",
+    "",
+    "Content:",
+    safeJson(memory.content),
+  ].join("\n");
+}
+
+function buildNavigationJudgePrompt(decision: NavigationDecision): string {
+  return [
+    `Navigation from layer: ${decision.fromLayerId}`,
+    `Action: ${decision.action}`,
+    decision.nextLayerId ? `Next layer: ${decision.nextLayerId}` : "Next layer: none",
+    "Approve only if the navigation follows from the approved memory and does not skip required work.",
+    "",
+    `Reason: ${decision.reason}`,
+    decision.requiredMemoryKinds?.length
+      ? `Required memory kinds: ${decision.requiredMemoryKinds.join(", ")}`
+      : "Required memory kinds: none",
+    decision.todoIds?.length ? `Open todos: ${decision.todoIds.join(", ")}` : "Open todos: none",
+  ].join("\n");
+}
+
+function councilDecisionRecord<T>(verdict: CouncilItemVerdict<T>): CouncilDecisionRecord {
+  return {
+    itemId: verdict.item.id,
+    label: verdict.item.label,
+    approved: verdict.approved,
+    requiredYes: verdict.requiredYes,
+    yes: verdict.yes,
+    no: verdict.no,
+    invalid: verdict.invalid,
+    votes: verdict.votes.map((vote) => ({ ...vote })),
+  };
+}
+
+function safeJson(value: unknown): string {
+  try {
+    return JSON.stringify(value, null, 2);
+  } catch {
+    return String(value);
   }
 }
 

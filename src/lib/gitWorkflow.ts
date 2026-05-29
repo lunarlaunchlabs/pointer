@@ -628,7 +628,7 @@ function looksLikeBroadConcept(concept: string): boolean {
 }
 
 function looksLikeLowValueConcept(concept: string): boolean {
-  return /\b(char count|lower case|upper case|data testid|get role|get text|set state|class name|line range|raw chunk|return chunks?|raw commit|raw draft|normalized file summary|trace harness|memory ids?|stage counts?|recent|looks like|first sentences?|file paths?|path fragments?|num predict|parent ids?|body start line|git file entry|match all|limit chars?|max chars?|judge index|failure tags?|approved memory|writes approved|action mode|agent orbit|allowed tools?|requires judge use|input kinds?|commit main|single line|drop shadow|box shadow|accent hot|align items|border radius|end line|strip model decorations|raw symbols|harness mode|harness core|council item verdict|apply patch|due diligence trace|commit message inaccurate)\b/.test(
+  return /\b(char count|lower case|upper case|data testid|get role|get text|set state|class name|line range|raw chunk|return chunks?|raw commit|raw draft|normalized file summary|trace harness|memory ids?|stage counts?|recent|looks like|first sentences?|file paths?|path fragments?|num predict|parent ids?|body start line|git file entry|match all|limit chars?|max chars?|judge index|required yes|failure tags?|approved memory|writes approved|action mode|agent orbit|allowed tools?|requires judge use|input kinds?|commit main|single line|drop shadow|box shadow|accent hot|align items|border radius|end line|strip model decorations|raw symbols|harness mode|harness core|council item verdict|apply patch|due diligence trace|commit message inaccurate)\b/.test(
     concept,
   );
 }

@@ -242,14 +242,28 @@ transcript can show which scheduled task did not complete.
 packs, stopping at the first incomplete stage so later work cannot start
 on top of unvalidated context.
 
+`DecisionCouncilRuntime`, `Navigator`, `TodoLedger`, and
+`StrictLayerRuntime` are the full composable runtime for weaker local
+models. Model agents do not directly promote their own decisions. A
+micro-agent writes pending memory, a judge council approves or rejects
+that exact memory, and only approved memory can feed later layers. After
+any layer passes, the navigator proposes the next step (`continue`,
+`retry`, `backtrack`, `done`, or `blocked`), and that navigation decision
+is itself judged before Pointer advances. The todo ledger stores
+checkbox-style task state as durable harness memory, so a todo checker
+can mark work complete only by writing an auditable `todo` memory update.
+
 The shared harness is composable rather than feature-specific. Core
-agent archetypes include scouts, scout troop leaders, researchers,
-summarizers, consolidators, evaluators, action proposers, action takers,
-judges, critics, verifiers, drafters, and memory curators. Each feature
-gets a dedicated blueprint made from those archetypes. The blueprint
-declares allowed tools, memory inputs/outputs, whether a layer may only
-propose or may take an action, and which judge gate must approve the
-layer before its output becomes usable.
+agent archetypes include cartographers, navigators, todo managers,
+folder/file/symbol scouts, context retrievers and pruners, dependency
+mappers, risk assessors, verification planners, command planners, patch
+planners, safety guards, researchers, summarizers, consolidators,
+evaluators, action proposers, action takers, judges, critics, verifiers,
+drafters, and memory curators. Each feature gets a dedicated blueprint
+made from those archetypes. The blueprint declares allowed tools, memory
+inputs/outputs, whether a layer may only propose or may take an action,
+and which judge gate must approve the layer before its output becomes
+usable.
 
 `MemoryGraph` stores durable memories by lane, kind, stage, archetype,
 parents, tags, and approval status. This lets Pointer keep parallel lanes
@@ -297,7 +311,9 @@ which intentionally emits bad strings like template literals, path
 fragments, and theme-only commit subjects. Use `--fail-on-warnings` in
 CI-style loops to make leaks fail the command. Add `--judge` to run the
 six-vote Judge layer over both final commit-message quality and pipeline
-due diligence.
+due diligence. Add `--trace-harness` to print memory stages, including
+todo updates, judged navigator decisions, chunk memories, file
+summaries, drafts, red-team decisions, and final verdict memory.
 
 Useful commands inside the REPL:
 

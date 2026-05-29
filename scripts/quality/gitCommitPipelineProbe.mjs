@@ -48,10 +48,17 @@ try {
   };
 
   const harness = new GitCommitHarness();
+  const strictRuntime = harness.strictRuntime();
   const seedMemory = harness.seed({
     prompt: `Generate an accurate git commit message for the ${staged ? "staged" : "unstaged"} diff.`,
     workspaceRoot: cwd,
     openDirectoryEntries: files.map((file) => ({ path: file.path, kind: "file" })),
+  });
+  const scoutTodo = strictRuntime.todos.add({
+    title: "Approve git status targets for commit drafting",
+    stage: "scout_targets",
+    assignedArchetype: "scout",
+    evidenceMemoryIds: [seedMemory.id],
   });
   const targetMemories = harness.rememberScoutTargets(
     files.map((file) => ({
@@ -79,6 +86,15 @@ try {
     targetMemories.map((memory) => memory.id),
   );
   harness.approveMemories(targetMemories.map((memory) => memory.id));
+  strictRuntime.todos.complete(
+    scoutTodo.content.id,
+    targetMemories.map((memory) => memory.id),
+  );
+  await strictRuntime.approveNavigation(
+    "scout_targets",
+    targetMemories.map((memory) => memory.id),
+    async () => "Y",
+  );
   const approvedFileByPath = new Map(
     approvedFiles.map((memory) => [memory.content.path, memory.id]),
   );
@@ -571,6 +587,7 @@ function analyzeHarnessTrace(transcript) {
     "align items",
     "allowed tools",
     "requires judge use",
+    "required yes",
   ].filter((term) => finalText.toLowerCase().includes(term));
   for (const term of lowValue) {
     transcript.polish.push({

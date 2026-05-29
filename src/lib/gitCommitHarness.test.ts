@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { JudgeCouncil } from "./harnessCore";
+import { JudgeCouncil, type HarnessTodo } from "./harnessCore";
 import {
   GitCommitHarness,
   createGitCommitHarnessBlueprint,
@@ -20,6 +20,23 @@ describe("git commit specialized harness", () => {
       blueprint.layers
         .filter((layer) => layer.actionMode === "propose")
         .every((layer) => layer.judge.kind !== "none"),
+    ).toBe(true);
+    expect(
+      blueprint.layers
+        .filter((layer) =>
+          layer.outputKinds.some((kind) =>
+            [
+              "proposal",
+              "chunk_summary",
+              "file_summary",
+              "decision",
+              "action_plan",
+              "draft",
+              "final",
+            ].includes(kind),
+          ),
+        )
+        .every((layer) => layer.archetype === "judge" || layer.judge.kind !== "none"),
     ).toBe(true);
   });
 
@@ -113,6 +130,41 @@ describe("git commit specialized harness", () => {
         approvedOnly: true,
       }).map((item) => item.id),
     ).toEqual([approved.id]);
+  });
+
+  it("can run the generic strict decision plus navigator runtime for commit layers", async () => {
+    const harness = new GitCommitHarness();
+    const seed = harness.seed({
+      prompt: "Draft a commit message.",
+      workspaceRoot: "/repo",
+      openDirectoryEntries: [],
+    });
+    const runtime = harness.strictRuntime();
+    const todo = runtime.todos.add({
+      title: "Approve commit scout target",
+      stage: "scout_targets",
+      assignedArchetype: "scout",
+      evidenceMemoryIds: [seed.id],
+    });
+    runtime.todos.complete(todo.content.id, [seed.id]);
+
+    const result = await runtime.runDecisionAndNavigate(
+      "scout_targets",
+      {
+        content: { kind: "file", path: "src/lib/gitWorkflow.ts", reason: "Owns commit drafting." },
+        summary: "Scout commit workflow file",
+        parentIds: [seed.id],
+      },
+      async () => "Y",
+    );
+
+    expect(result.status).toBe("ready");
+    if (result.status === "ready") expect(result.nextLayerId).toBe("target_council");
+    expect(harness.memory.byKind("navigation", { approvedOnly: true })).toHaveLength(1);
+    const [todoMemory] = harness.memory.byKind("todo", { approvedOnly: true }) as Array<{
+      content: HarnessTodo;
+    }>;
+    expect(todoMemory.content.status).toBe("completed");
   });
 
   it("promotes and supersedes memories as later layers validate them", () => {

@@ -202,8 +202,8 @@ export function createGitCommitHarnessBlueprint(): HarnessBlueprint {
       inputKinds: ["draft", "file_summary"],
       outputKinds: ["draft"],
       allowedTools: [],
-      judge: { kind: "none" },
-      writesApprovedMemory: true,
+      judge: { kind: "stage", judges: 3, requiredYes: 4 },
+      writesApprovedMemory: false,
     },
     {
       id: "message_red_team",
@@ -213,8 +213,8 @@ export function createGitCommitHarnessBlueprint(): HarnessBlueprint {
       inputKinds: ["draft", "file_summary", "diff_chunk"],
       outputKinds: ["decision", "judge_verdict"],
       allowedTools: [],
-      judge: { kind: "none" },
-      writesApprovedMemory: true,
+      judge: { kind: "stage", judges: 3, requiredYes: 4 },
+      writesApprovedMemory: false,
     },
     {
       id: "final_message_council",

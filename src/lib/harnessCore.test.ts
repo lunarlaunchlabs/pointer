@@ -2,14 +2,18 @@ import { describe, expect, it } from "vitest";
 import {
   AgentOrchestrator,
   Critic,
+  DecisionCouncilRuntime,
   FailureTaxonomy,
+  HarnessBlueprint,
   Judge,
   JudgeCouncil,
   MemoryGraph,
+  StrictLayerRuntime,
   PermissionEngine,
   RegressionRunner,
   ScenarioRunner,
   StageJudge,
+  TodoLedger,
   TranscriptRecorder,
   TranscriptGrader,
   validateExperimentCard,
@@ -158,6 +162,177 @@ describe("harness core", () => {
     expect(result.rejected.map((item) => item.item.id)).toEqual(["b"]);
     expect(result.all[0].yes).toBe(2);
     expect(result.all[0].requiredYes).toBe(2);
+  });
+
+  it("promotes decisions only after a council verdict is written to memory", async () => {
+    const memory = new MemoryGraph();
+    const runtime = new DecisionCouncilRuntime(memory);
+    const result = await runtime.approveDecision(
+      {
+        stage: "file_scout",
+        kind: "proposal",
+        archetype: "file_scout",
+        content: { path: "src/lib/harnessCore.ts", reason: "Owns the harness runtime." },
+        summary: "Read the harness runtime",
+      },
+      async (_prompt, judgeIndex) => (judgeIndex < 2 ? "Y" : "N"),
+    );
+
+    expect(result.approved).toBe(true);
+    expect(memory.get(result.memory.id)?.status).toBe("approved");
+    const verdicts = memory.byKind("judge_verdict", { approvedOnly: true });
+    expect(verdicts).toHaveLength(1);
+    expect(verdicts[0].parentIds).toEqual([result.memory.id]);
+  });
+
+  it("rejects decisions that fail council instead of making them usable context", async () => {
+    const memory = new MemoryGraph();
+    const result = await new DecisionCouncilRuntime(memory).approveDecision(
+      {
+        stage: "symbol_scout",
+        kind: "proposal",
+        archetype: "symbol_scout",
+        content: { symbol: "ImaginaryApi" },
+        summary: "Inspect an unsupported symbol",
+      },
+      async () => "N",
+    );
+
+    expect(result.approved).toBe(false);
+    expect(memory.materializeContext({ approvedOnly: true, kinds: ["proposal"] })).toEqual([]);
+    expect(memory.get(result.memory.id)?.status).toBe("rejected");
+  });
+
+  it("requires a judged navigator after an approved layer before advancing", async () => {
+    const blueprint = new HarnessBlueprint("strict-test", "ask", [
+      {
+        id: "scout",
+        name: "Scout files",
+        archetype: "file_scout",
+        actionMode: "propose",
+        inputKinds: [],
+        outputKinds: ["proposal"],
+        allowedTools: [],
+        judge: { kind: "item" },
+        writesApprovedMemory: false,
+      },
+      {
+        id: "read",
+        name: "Read approved file",
+        archetype: "context_retriever",
+        actionMode: "none",
+        inputKinds: ["proposal"],
+        outputKinds: ["context_slice"],
+        allowedTools: ["read_file"],
+        judge: { kind: "none" },
+        writesApprovedMemory: true,
+      },
+    ]);
+    const runtime = new StrictLayerRuntime(blueprint, new MemoryGraph());
+    const result = await runtime.runDecisionAndNavigate(
+      "scout",
+      {
+        content: { path: "src/lib/harnessCore.ts" },
+        summary: "Read the harness runtime",
+      },
+      async () => "Y",
+    );
+
+    expect(result.status).toBe("ready");
+    if (result.status === "ready") {
+      expect(result.nextLayerId).toBe("read");
+      expect(result.navigation.memory.content.action).toBe("continue");
+      expect(runtime.memory.byKind("navigation", { approvedOnly: true })).toHaveLength(1);
+      expect(runtime.memory.byKind("judge_verdict", { approvedOnly: true })).toHaveLength(2);
+    }
+  });
+
+  it("blocks advancement when the navigator council rejects the next step", async () => {
+    const blueprint = new HarnessBlueprint("strict-test", "ask", [
+      {
+        id: "scout",
+        name: "Scout files",
+        archetype: "file_scout",
+        actionMode: "propose",
+        inputKinds: [],
+        outputKinds: ["proposal"],
+        allowedTools: [],
+        judge: { kind: "item" },
+        writesApprovedMemory: false,
+      },
+      {
+        id: "read",
+        name: "Read approved file",
+        archetype: "context_retriever",
+        actionMode: "none",
+        inputKinds: ["proposal"],
+        outputKinds: ["context_slice"],
+        allowedTools: ["read_file"],
+        judge: { kind: "none" },
+        writesApprovedMemory: true,
+      },
+    ]);
+    const runtime = new StrictLayerRuntime(blueprint, new MemoryGraph());
+    const result = await runtime.runDecisionAndNavigate(
+      "scout",
+      {
+        content: { path: "src/lib/harnessCore.ts" },
+        summary: "Read the harness runtime",
+      },
+      async (_prompt, _judgeIndex, item) => (item.value.kind === "navigation" ? "N" : "Y"),
+    );
+
+    expect(result.status).toBe("blocked");
+    if (result.status === "blocked") {
+      expect(result.reason).toContain("Navigator");
+      expect(result.navigation?.memory.status).toBe("rejected");
+    }
+  });
+
+  it("stores todo checkboxes in memory and updates completion through the ledger", () => {
+    const memory = new MemoryGraph();
+    const todos = new TodoLedger(memory);
+    const scout = todos.add({
+      title: "Find files that answer the ask-mode prompt",
+      stage: "scout",
+      assignedArchetype: "file_scout",
+    });
+    expect(scout.content.status).toBe("pending");
+    todos.start(scout.content.id);
+    const completed = todos.complete(scout.content.id, ["memory-99"]);
+
+    expect(completed.content.status).toBe("completed");
+    expect(completed.content.evidenceMemoryIds).toContain("memory-99");
+    expect(todos.open()).toEqual([]);
+    expect(memory.byKind("todo", { approvedOnly: true })).toHaveLength(1);
+  });
+
+  it("blocks action takers until an approved action plan exists", () => {
+    const blueprint = new HarnessBlueprint("agent-test", "agent", [
+      {
+        id: "patch",
+        name: "Apply approved patch",
+        archetype: "action_taker",
+        actionMode: "take",
+        inputKinds: ["action_plan"],
+        outputKinds: ["tool_result"],
+        allowedTools: ["apply_patch"],
+        judge: { kind: "none" },
+        writesApprovedMemory: true,
+      },
+    ]);
+    const memory = new MemoryGraph();
+    const runtime = new StrictLayerRuntime(blueprint, memory);
+    expect(runtime.canTakeAction("patch", "missing").allow).toBe(false);
+    const plan = memory.add({
+      stage: "patch_planner",
+      kind: "action_plan",
+      archetype: "patch_planner",
+      content: { files: ["src/App.tsx"], reason: "Minimal fix." },
+      summary: "Patch one file",
+      status: "approved",
+    });
+    expect(runtime.canTakeAction("patch", plan.id).allow).toBe(true);
   });
 
   it("runs outcome and diligence votes and requires four of six Y", async () => {

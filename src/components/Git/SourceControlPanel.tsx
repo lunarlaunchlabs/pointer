@@ -288,6 +288,7 @@ export function SourceControlPanel() {
     });
     try {
       const harness = new GitCommitHarness();
+      const strictRuntime = harness.strictRuntime();
       const seedMemory = harness.seed({
         prompt: "Draft a commit message for the selected git changes.",
         workspaceRoot: root,
@@ -295,6 +296,12 @@ export function SourceControlPanel() {
           path: entry.path,
           kind: "file" as const,
         })),
+      });
+      const scoutTodo = strictRuntime.todos.add({
+        title: "Approve git status targets for commit drafting",
+        stage: "scout_targets",
+        assignedArchetype: "scout",
+        evidenceMemoryIds: [seedMemory.id],
       });
       const targetMemories = harness.rememberScoutTargets(
         files.map((file) => ({
@@ -321,6 +328,15 @@ export function SourceControlPanel() {
         targetMemories.map((memory) => memory.id),
       );
       harness.approveMemories(targetMemories.map((memory) => memory.id));
+      strictRuntime.todos.complete(
+        scoutTodo.content.id,
+        targetMemories.map((memory) => memory.id),
+      );
+      await strictRuntime.approveNavigation(
+        "scout_targets",
+        targetMemories.map((memory) => memory.id),
+        async () => "Y",
+      );
       const approvedFileByPath = new Map(
         approvedFiles.map((memory) => [memory.content.path, memory.id]),
       );
