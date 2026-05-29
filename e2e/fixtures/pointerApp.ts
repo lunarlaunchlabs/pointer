@@ -579,6 +579,7 @@ function mockPointerDesktop(fixture: {
       case "git_push":
       case "git_pull":
       case "git_fetch":
+      case "git_credential_respond":
       case "git_checkout":
       case "git_create_branch":
       case "git_create_branch_from":

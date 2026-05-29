@@ -115,9 +115,10 @@ import { useDiagnostics, type Diagnostic } from "@/store/diagnostics";
 import { useSession } from "@/store/session";
 import { useAssistant } from "@/store/assistant";
 import { dispatchAction, onAction, type ActionId } from "@/lib/actions";
-import { ipc, listenEvent } from "@/lib/ipc";
+import { ipc, listenEvent, type GitCredentialPrompt } from "@/lib/ipc";
 import { markE2EAppReady } from "@/lib/e2eHooks";
 import { choose, useConfirm, ConfirmModalHost } from "@/components/Confirm";
+import { secretPrompt, SecretPromptHost } from "@/components/SecretPrompt";
 import { open as openDialog } from "@tauri-apps/plugin-dialog";
 import { open as shellOpen } from "@tauri-apps/plugin-shell";
 
@@ -135,6 +136,8 @@ const SystemMonitor = lazy(() =>
 const SettingsPage = lazy(() =>
   import("@/components/SettingsPage").then((m) => ({ default: m.SettingsPage })),
 );
+
+const activeGitCredentialPrompts = new Set<string>();
 
 export default function App() {
   const [showPalette, setShowPalette] = useState(false);
@@ -796,6 +799,30 @@ export default function App() {
     return () => off?.();
   }, []);
 
+  // Git remote operations can request SSH key passphrases or HTTPS
+  // credentials. Those prompts must stay inside Pointer rather than
+  // leaking to the terminal that launched `tauri dev`.
+  useEffect(() => {
+    let off: (() => void) | undefined;
+    listenEvent<GitCredentialPrompt>("git:credential-prompt", async (prompt) => {
+      if (!prompt?.id) return;
+      if (activeGitCredentialPrompts.has(prompt.id)) return;
+      activeGitCredentialPrompts.add(prompt.id);
+      const response = await secretPrompt({
+        title: "Git authentication",
+        prompt: prompt.prompt,
+        secret: prompt.secret,
+        confirmLabel: "Send to Git",
+      });
+      await ipc.gitCredentialRespond(prompt.id, response).catch((error) => {
+        toast.error("Git prompt expired", { body: String(error) });
+      }).finally(() => {
+        activeGitCredentialPrompts.delete(prompt.id);
+      });
+    }).then((u) => (off = u));
+    return () => off?.();
+  }, []);
+
   // Bridge "New File / New Folder" from the menu, palette, etc. into the
   // workspace store. The FileTree component watches `pendingCreate` and
   // renders the inline input. If no folder is open yet we tell the user
@@ -1295,9 +1322,21 @@ export default function App() {
           toast.warn("Open a folder first");
           return;
         }
+        noteDockView("scm");
+        const toastId = toast.info("Fetching from remote", {
+          body: "Pointer is running git fetch.",
+          sticky: true,
+        });
         ipc.gitFetch(r).then(
-          () => toast.success("Fetched"),
-          (e) => toast.error("Fetch failed", { body: String(e) }),
+          (out) => {
+            toast.dismiss(toastId);
+            void useGit.getState().refresh();
+            toast.success("Fetched", { body: out.trim() || undefined });
+          },
+          (e) => {
+            toast.dismiss(toastId);
+            toast.error("Fetch failed", { body: String(e) });
+          },
         );
       }),
       onAction("git:pull", () => {
@@ -1306,9 +1345,21 @@ export default function App() {
           toast.warn("Open a folder first");
           return;
         }
+        noteDockView("scm");
+        const toastId = toast.info("Pulling from remote", {
+          body: "Pointer is running git pull --ff-only.",
+          sticky: true,
+        });
         ipc.gitPull(r).then(
-          () => toast.success("Pulled"),
-          (e) => toast.error("Pull failed", { body: String(e) }),
+          (out) => {
+            toast.dismiss(toastId);
+            void useGit.getState().refresh();
+            toast.success("Pulled", { body: out.trim() || undefined });
+          },
+          (e) => {
+            toast.dismiss(toastId);
+            toast.error("Pull failed", { body: String(e) });
+          },
         );
       }),
       onAction("git:push", () => {
@@ -1317,9 +1368,21 @@ export default function App() {
           toast.warn("Open a folder first");
           return;
         }
+        noteDockView("scm");
+        const toastId = toast.info("Pushing to remote", {
+          body: "Pointer is running git push. Authentication prompts will open in Pointer.",
+          sticky: true,
+        });
         ipc.gitPush(r).then(
-          () => toast.success("Pushed"),
-          (e) => toast.error("Push failed", { body: String(e) }),
+          (out) => {
+            toast.dismiss(toastId);
+            void useGit.getState().refresh();
+            toast.success("Pushed", { body: out.trim() || undefined });
+          },
+          (e) => {
+            toast.dismiss(toastId);
+            toast.error("Push failed", { body: String(e) });
+          },
         );
       }),
       onAction("file:open_recent", () => setShowOpenRecent(true)),
@@ -1635,6 +1698,7 @@ export default function App() {
         />
       )}
       <ConfirmModalHost />
+      <SecretPromptHost />
       <ToastHost />
       <RefactorSuggestion />
     </div>

@@ -16,14 +16,24 @@
 //! cold and ~40ms warm. For typical project sizes we expect <50ms. We let
 //! the frontend debounce + cache the result rather than doing it here.
 
+use once_cell::sync::Lazy;
+use portable_pty::{CommandBuilder, PtySize};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fs;
+use std::io::{Read, Write};
 use std::path::Path;
 use std::path::PathBuf;
 use std::process::Command;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{mpsc, Mutex};
 use std::thread;
 use std::time::Duration;
+use tauri::{AppHandle, Emitter};
+
+static GIT_CREDENTIAL_PROMPTS: Lazy<Mutex<HashMap<String, mpsc::Sender<Option<String>>>>> =
+    Lazy::new(|| Mutex::new(HashMap::new()));
+static NEXT_GIT_PROMPT_ID: AtomicU64 = AtomicU64::new(1);
 
 /// One status letter per file. Mirrors `git status --porcelain` semantics
 /// distilled to the categories the UI cares about. We *don't* try to
@@ -536,18 +546,30 @@ pub async fn git_commit(workspace: String, message: String) -> Result<String, St
 }
 
 #[tauri::command]
-pub async fn git_push(workspace: String) -> Result<String, String> {
-    git_blocking(workspace, vec!["push".into()]).await
+pub async fn git_push(app: AppHandle, workspace: String) -> Result<String, String> {
+    git_blocking_interactive(app, workspace, vec!["push".into()]).await
 }
 
 #[tauri::command]
-pub async fn git_pull(workspace: String) -> Result<String, String> {
-    git_blocking(workspace, vec!["pull".into(), "--ff-only".into()]).await
+pub async fn git_pull(app: AppHandle, workspace: String) -> Result<String, String> {
+    git_blocking_interactive(app, workspace, vec!["pull".into(), "--ff-only".into()]).await
 }
 
 #[tauri::command]
-pub async fn git_fetch(workspace: String) -> Result<String, String> {
-    git_blocking(workspace, vec!["fetch".into()]).await
+pub async fn git_fetch(app: AppHandle, workspace: String) -> Result<String, String> {
+    git_blocking_interactive(app, workspace, vec!["fetch".into()]).await
+}
+
+#[tauri::command]
+pub async fn git_credential_respond(id: String, response: Option<String>) -> Result<(), String> {
+    let sender = GIT_CREDENTIAL_PROMPTS
+        .lock()
+        .map_err(|_| "credential prompt registry poisoned".to_string())?
+        .remove(&id)
+        .ok_or_else(|| "Git credential prompt expired".to_string())?;
+    sender
+        .send(response)
+        .map_err(|_| "Git credential prompt is no longer waiting".to_string())
 }
 
 #[tauri::command]
@@ -604,6 +626,13 @@ pub struct GitBranch {
     pub remote: bool,
     pub last_commit: String,
     pub upstream: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct GitCredentialPrompt {
+    pub id: String,
+    pub prompt: String,
+    pub secret: bool,
 }
 
 #[tauri::command]
@@ -993,6 +1022,205 @@ pub struct GitLogEntry {
 /// both stdout and stderr (joined) so the SCM panel can render a
 /// meaningful response — e.g. push errors include rejection
 /// details on stderr and we don't want to swallow them.
+async fn git_blocking_interactive(
+    app: AppHandle,
+    workspace: String,
+    args: Vec<String>,
+) -> Result<String, String> {
+    tokio::task::spawn_blocking(move || run_git_pty_collect(app, workspace, args))
+        .await
+        .map_err(|e| e.to_string())?
+}
+
+fn run_git_pty_collect(
+    app: AppHandle,
+    workspace: String,
+    args: Vec<String>,
+) -> Result<String, String> {
+    let pty_system = portable_pty::native_pty_system();
+    let pair = pty_system
+        .openpty(PtySize {
+            rows: 24,
+            cols: 120,
+            pixel_width: 0,
+            pixel_height: 0,
+        })
+        .map_err(|e| format!("openpty: {e}"))?;
+
+    let mut cmd = CommandBuilder::new("git");
+    for arg in &args {
+        cmd.arg(arg);
+    }
+    cmd.cwd(&workspace);
+    cmd.env("GIT_TERMINAL_PROMPT", "1");
+    cmd.env("GIT_OPTIONAL_LOCKS", "1");
+
+    let mut child = pair
+        .slave
+        .spawn_command(cmd)
+        .map_err(|e| format!("spawn git {:?}: {e}", args))?;
+    drop(pair.slave);
+
+    let mut reader = pair
+        .master
+        .try_clone_reader()
+        .map_err(|e| format!("clone git pty reader: {e}"))?;
+    let mut writer = pair
+        .master
+        .take_writer()
+        .map_err(|e| format!("take git pty writer: {e}"))?;
+
+    let mut output = String::new();
+    let mut recent = String::new();
+    let mut buf = [0u8; 4096];
+    loop {
+        let n = match reader.read(&mut buf) {
+            Ok(0) => break,
+            Ok(n) => n,
+            Err(e) => {
+                log::warn!("git {:?} pty read error: {}", args, e);
+                break;
+            }
+        };
+        let chunk = String::from_utf8_lossy(&buf[..n]).to_string();
+        output.push_str(&chunk);
+        recent.push_str(&chunk);
+        if recent.len() > 4_000 {
+            let keep_from = recent.len().saturating_sub(2_000);
+            recent = recent[keep_from..].to_string();
+        }
+
+        if let Some(prompt) = detect_git_prompt(&recent) {
+            let response = request_git_credential(&app, prompt)?;
+            match response {
+                Some(value) => {
+                    writer
+                        .write_all(value.as_bytes())
+                        .and_then(|_| writer.write_all(b"\n"))
+                        .and_then(|_| writer.flush())
+                        .map_err(|e| format!("write git credential response: {e}"))?;
+                    recent.clear();
+                }
+                None => {
+                    let _ = child.kill();
+                    return Err("Git authentication cancelled".into());
+                }
+            }
+        }
+    }
+
+    let status = child
+        .wait()
+        .map_err(|e| format!("wait for git {:?}: {e}", args))?;
+    let clean = strip_ansi(&output).trim().to_string();
+    if status.success() {
+        Ok(clean)
+    } else if clean.is_empty() {
+        Err(format!(
+            "git {:?} exited with {:?}",
+            args,
+            status.exit_code()
+        ))
+    } else {
+        Err(clean)
+    }
+}
+
+fn request_git_credential(
+    app: &AppHandle,
+    prompt: GitCredentialPromptCandidate,
+) -> Result<Option<String>, String> {
+    let id = format!(
+        "git-credential-{}",
+        NEXT_GIT_PROMPT_ID.fetch_add(1, Ordering::Relaxed)
+    );
+    let (tx, rx) = mpsc::channel();
+    GIT_CREDENTIAL_PROMPTS
+        .lock()
+        .map_err(|_| "credential prompt registry poisoned".to_string())?
+        .insert(id.clone(), tx);
+
+    let payload = GitCredentialPrompt {
+        id: id.clone(),
+        prompt: prompt.prompt,
+        secret: prompt.secret,
+    };
+    if let Err(e) = app.emit("git:credential-prompt", payload) {
+        let _ = GIT_CREDENTIAL_PROMPTS
+            .lock()
+            .map(|mut prompts| prompts.remove(&id));
+        return Err(format!("open Git credential prompt: {e}"));
+    }
+
+    let response = rx
+        .recv_timeout(Duration::from_secs(300))
+        .map_err(|_| "Git authentication timed out".to_string())?;
+    let _ = GIT_CREDENTIAL_PROMPTS
+        .lock()
+        .map(|mut prompts| prompts.remove(&id));
+    Ok(response)
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct GitCredentialPromptCandidate {
+    prompt: String,
+    secret: bool,
+}
+
+fn detect_git_prompt(text: &str) -> Option<GitCredentialPromptCandidate> {
+    let clean = strip_ansi(text).replace('\r', "\n");
+    let lower = clean.to_lowercase();
+    let promptish = lower.contains("enter passphrase for key")
+        || lower.contains("passphrase for key")
+        || lower.contains("password for ")
+        || lower.contains("username for ")
+        || lower.contains("are you sure you want to continue connecting");
+    if !promptish {
+        return None;
+    }
+    let prompt = clean
+        .lines()
+        .rev()
+        .find(|line| {
+            let l = line.to_lowercase();
+            l.contains("passphrase")
+                || l.contains("password for ")
+                || l.contains("username for ")
+                || l.contains("continue connecting")
+        })
+        .unwrap_or(clean.trim())
+        .trim()
+        .trim_end_matches(':')
+        .to_string();
+    if prompt.is_empty() {
+        return None;
+    }
+    let lower_prompt = prompt.to_lowercase();
+    let secret =
+        !lower_prompt.contains("username for ") && !lower_prompt.contains("continue connecting");
+    Some(GitCredentialPromptCandidate { prompt, secret })
+}
+
+fn strip_ansi(input: &str) -> String {
+    let mut out = String::with_capacity(input.len());
+    let mut chars = input.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '\x1b' {
+            if chars.peek() == Some(&'[') {
+                chars.next();
+                for next in chars.by_ref() {
+                    if ('@'..='~').contains(&next) {
+                        break;
+                    }
+                }
+                continue;
+            }
+        }
+        out.push(c);
+    }
+    out
+}
+
 async fn git_blocking(workspace: String, args: Vec<String>) -> Result<String, String> {
     tokio::task::spawn_blocking(move || {
         let mut last_err = String::new();
@@ -1151,6 +1379,21 @@ mod tests {
             lock_error_message("fatal: Unable to create '/repo/.git/index.lock': File exists.");
         assert!(msg.contains("Pointer retried"));
         assert!(msg.contains(".git/index.lock"));
+    }
+
+    #[test]
+    fn detects_git_passphrase_prompt_as_secret() {
+        let prompt = detect_git_prompt("Enter passphrase for key '/Users/me/.ssh/id_ed25519': ")
+            .expect("prompt");
+        assert!(prompt.secret);
+        assert!(prompt.prompt.contains("id_ed25519"));
+    }
+
+    #[test]
+    fn detects_git_username_prompt_as_visible_input() {
+        let prompt = detect_git_prompt("Username for 'https://github.com': ").expect("prompt");
+        assert!(!prompt.secret);
+        assert!(prompt.prompt.contains("github.com"));
     }
 
     #[test]

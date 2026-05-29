@@ -179,6 +179,12 @@ export type GitBranch = {
   upstream: string | null;
 };
 
+export type GitCredentialPrompt = {
+  id: string;
+  prompt: string;
+  secret: boolean;
+};
+
 export type GitLogEntry = {
   hash: string;
   short_hash: string;
@@ -539,6 +545,8 @@ export const ipc = {
   gitPush: (workspace: string) => invoke<string>("git_push", { workspace }),
   gitPull: (workspace: string) => invoke<string>("git_pull", { workspace }),
   gitFetch: (workspace: string) => invoke<string>("git_fetch", { workspace }),
+  gitCredentialRespond: (id: string, response: string | null) =>
+    invoke<void>("git_credential_respond", { id, response }),
   gitBranches: (workspace: string) =>
     invoke<GitBranch[]>("git_branches", { workspace }),
   gitCheckout: (workspace: string, branch: string) =>

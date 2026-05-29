@@ -133,6 +133,11 @@ test.describe("workspace tree and assistant flows", () => {
     await page.getByRole("tab", { name: "Source Control" }).click();
     await expect(page.getByRole("region", { name: "Source control" })).toBeVisible();
     await expect(page.getByText("Git workflow")).toBeVisible();
+    await expect(page.getByText("Remote sync")).toBeVisible();
+    const sync = page.locator("section").filter({ hasText: "Remote sync" });
+    await sync.getByRole("button", { name: "Push to remote" }).click();
+    await expect(page.getByText(/git push done/)).toBeVisible();
+
     await expect(page.getByRole("button", { name: /Generate commit message/ })).toBeEnabled();
 
     await page.getByRole("button", { name: /Generate commit message/ }).click();
@@ -142,8 +147,33 @@ test.describe("workspace tree and assistant flows", () => {
     await expect(page.getByText(/Commit intelligence/)).toBeVisible();
 
     const calls = await commandLog(page);
+    expect(calls.some((entry) => entry.command === "git_push")).toBe(true);
     expect(calls.some((entry) => entry.command === "git_diff")).toBe(true);
     expect(calls.some((entry) => entry.command === "ollama_generate")).toBe(true);
+  });
+
+  test("handles Git credential prompts inside Pointer", async ({ appPage: page }) => {
+    await page.evaluate(() => {
+      window.__POINTER_E2E__?.emitTauri?.("git:credential-prompt", {
+        id: "prompt-1",
+        prompt: "Enter passphrase for key '/Users/me/.ssh/id_ed25519':",
+        secret: true,
+      });
+    });
+
+    await expect(page.getByRole("dialog", { name: "Git authentication" })).toBeVisible();
+    await page.getByLabel("Git passphrase").fill("test-passphrase");
+    await page.getByRole("button", { name: "Send to Git" }).click();
+    await page.waitForFunction(() =>
+      window.__POINTER_E2E__?.commandLog?.some(
+        (entry: { command: string }) => entry.command === "git_credential_respond",
+      ),
+    );
+
+    const calls = await commandLog(page);
+    const response = calls.find((entry) => entry.command === "git_credential_respond");
+    expect(JSON.stringify(response?.args)).toContain("prompt-1");
+    expect(JSON.stringify(response?.args)).toContain("test-passphrase");
   });
 
   test("commits from a fresh git index snapshot when the panel is stale", async ({
