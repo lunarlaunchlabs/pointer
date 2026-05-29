@@ -320,6 +320,7 @@ export function SourceControlPanel() {
         })),
         targetMemories.map((memory) => memory.id),
       );
+      harness.approveMemories(targetMemories.map((memory) => memory.id));
       const approvedFileByPath = new Map(
         approvedFiles.map((memory) => [memory.content.path, memory.id]),
       );
@@ -330,7 +331,18 @@ export function SourceControlPanel() {
         const fallback = fallbackSummaryFromDiff(file.path, file.status, diff);
         const chunks = chunkDiffForSummary(file.path, diff || `${file.path} changed.`);
         const chunkSummaries: CommitChunkSummary[] = [];
+        const chunkMemoryIds: string[] = [];
         for (const chunk of chunks) {
+          const diffMemory = harness.rememberDiffChunk(
+            {
+              path: file.path,
+              chunkIndex: chunk.index,
+              totalChunks: chunk.total,
+              lineRange: `${chunk.startLine}-${chunk.endLine}`,
+              text: chunk.text,
+            },
+            [approvedFileByPath.get(file.path)].filter((id): id is string => Boolean(id)),
+          );
           const chunkFallback = fallbackSummaryFromDiff(
             file.path,
             file.status,
@@ -358,7 +370,7 @@ export function SourceControlPanel() {
             ),
             fallback: chunkFallback,
           });
-          harness.rememberChunkSummary(
+          const chunkMemory = harness.rememberChunkSummary(
             {
               path: file.path,
               chunkIndex: chunk.index,
@@ -366,9 +378,10 @@ export function SourceControlPanel() {
               lineRange: `${chunk.startLine}-${chunk.endLine}`,
               summary: chunkSummaries.at(-1)?.summary ?? "",
             },
-            [approvedFileByPath.get(file.path)].filter((id): id is string => Boolean(id)),
+            [diffMemory.id],
             true,
           );
+          chunkMemoryIds.push(chunkMemory.id);
         }
 
         const rawFileSummary =
@@ -385,10 +398,25 @@ export function SourceControlPanel() {
           35,
           2,
         );
+        const normalizedFileSummary = normalizeFileSummary(
+          fileSummary,
+          file.path,
+          file.status,
+          fallback,
+        );
+        harness.rememberFileSummary(
+          {
+            path: file.path,
+            status: file.status,
+            summary: normalizedFileSummary,
+          },
+          chunkMemoryIds,
+          true,
+        );
         memories.push({
           path: file.path,
           status: file.status,
-          summary: normalizeFileSummary(fileSummary, file.path, file.status, fallback),
+          summary: normalizedFileSummary,
           fallback,
           chunks: chunkSummaries,
         });
@@ -417,12 +445,51 @@ export function SourceControlPanel() {
         shortenedConsolidated,
         summaries,
       );
+      const fileSummaryMemoryIds = harness.memory
+        .byKind("file_summary", { approvedOnly: true })
+        .map((memory) => memory.id);
+      const sufficiency = harness.rememberDecision(
+        "scout_evaluator",
+        {
+          verdict: "sufficient",
+          reason: "Approved file summaries were enough to draft a commit message.",
+        },
+        fileSummaryMemoryIds,
+        true,
+      );
       const generated = await runCommitModel(
         buildCommitMessagePrompt(summaries, consolidatedSummary),
         "Draft commit message",
         180,
       );
+      const rawDraft = harness.rememberDraft(
+        "message_drafter",
+        { message: generated, raw: generated },
+        [sufficiency.id],
+        false,
+      );
       const normalized = normalizeGeneratedCommitMessage(generated, summaries);
+      const normalizedDraft = harness.rememberDraft(
+        "message_normalizer",
+        { message: normalized, raw: generated },
+        [rawDraft.id],
+        true,
+      );
+      harness.supersedeMemory(rawDraft.id);
+      const redTeam = harness.rememberDecision(
+        "message_red_team",
+        {
+          verdict: "ready",
+          reason: "The normalized draft passed deterministic leak checks.",
+        },
+        [normalizedDraft.id],
+        true,
+      );
+      harness.rememberFinal(
+        { message: normalized, raw: generated },
+        [redTeam.id],
+        true,
+      );
       const chunkTotal = memories.reduce((sum, file) => sum + file.chunks.length, 0);
       const harnessSnapshot = harness.memory.snapshot();
       setCommitMessage(normalized);

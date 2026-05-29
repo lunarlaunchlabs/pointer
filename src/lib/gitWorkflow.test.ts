@@ -419,9 +419,9 @@ describe("git workflow helpers", () => {
           fallback: "Adds memory graph, archetypes, and judge councils.",
         },
         {
-          path: "src/components/Git/SourceControlPanel.tsx",
+          path: "src/components/CommitPanel.tsx",
           status: "modified",
-          summary: "Updates commit draft feedback.",
+          summary: "Updates raw draft.",
           fallback: "Updates commit draft feedback.",
         },
         {
@@ -438,6 +438,9 @@ describe("git workflow helpers", () => {
     expect(msg).not.toContain("action mode");
     expect(msg).not.toContain("commit agent orbit");
     expect(msg).not.toContain("border radius");
+    expect(msg).not.toContain("normalized file summary");
+    expect(msg).not.toContain("memory ids");
+    expect(msg).not.toContain("raw draft");
   });
 
   it("prioritizes the primary commit harness over support tooling noise", () => {

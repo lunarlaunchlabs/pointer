@@ -114,4 +114,95 @@ describe("git commit specialized harness", () => {
       }).map((item) => item.id),
     ).toEqual([approved.id]);
   });
+
+  it("promotes and supersedes memories as later layers validate them", () => {
+    const harness = new GitCommitHarness();
+    const seed = harness.seed({
+      prompt: "Draft a commit message.",
+      workspaceRoot: "/repo",
+      openDirectoryEntries: [],
+    });
+    const [target] = harness.rememberScoutTargets(
+      [{ kind: "file", path: "src/commit/CommitHarness.ts", reason: "Primary change." }],
+      [seed.id],
+    );
+    expect(target.status).toBe("pending");
+    expect(harness.approveMemories([target.id])[0].status).toBe("approved");
+
+    const raw = harness.rememberDraft(
+      "message_drafter",
+      { message: "Improve things." },
+      [target.id],
+      false,
+    );
+    expect(raw.status).toBe("pending");
+    expect(harness.supersedeMemory(raw.id).status).toBe("superseded");
+  });
+
+  it("records diff chunks, file summaries, decisions, and drafts with lineage", () => {
+    const harness = new GitCommitHarness();
+    const seed = harness.seed({
+      prompt: "Draft a commit message.",
+      workspaceRoot: "/repo",
+      openDirectoryEntries: [],
+    });
+    const diff = harness.rememberDiffChunk(
+      {
+        path: "src/commit/CommitHarness.ts",
+        chunkIndex: 1,
+        totalChunks: 1,
+        lineRange: "1-80",
+        text: "+export class CommitHarness {}",
+      },
+      [seed.id],
+    );
+    const chunk = harness.rememberChunkSummary(
+      {
+        path: "src/commit/CommitHarness.ts",
+        chunkIndex: 1,
+        totalChunks: 1,
+        lineRange: "1-80",
+        summary: "Adds commit harness orchestration.",
+      },
+      [diff.id],
+      true,
+    );
+    const file = harness.rememberFileSummary(
+      {
+        path: "src/commit/CommitHarness.ts",
+        status: "added",
+        summary: "Adds commit harness orchestration.",
+      },
+      [chunk.id],
+      true,
+    );
+    const decision = harness.rememberDecision(
+      "scout_evaluator",
+      { verdict: "sufficient", reason: "Approved file summaries cover the staged diff." },
+      [file.id],
+      true,
+    );
+    const draft = harness.rememberDraft(
+      "message_normalizer",
+      { message: "feat: add commit harness orchestration" },
+      [decision.id],
+      true,
+    );
+    const final = harness.rememberFinal(
+      { message: "feat: add commit harness orchestration" },
+      [draft.id],
+      true,
+    );
+
+    expect(harness.memory.lineage(final.id).map((item) => item.id)).toEqual([
+      seed.id,
+      diff.id,
+      chunk.id,
+      file.id,
+      decision.id,
+      draft.id,
+      final.id,
+    ]);
+    expect(harness.memory.snapshot().memories).toHaveLength(7);
+  });
 });

@@ -28,6 +28,30 @@ export type CommitChunkMemory = {
   summary: string;
 };
 
+export type CommitDiffChunkMemory = {
+  path: string;
+  chunkIndex: number;
+  totalChunks: number;
+  lineRange: string;
+  text: string;
+};
+
+export type CommitFileSummaryMemory = {
+  path: string;
+  status: GitFileEntry["status"];
+  summary: string;
+};
+
+export type CommitDraftMemory = {
+  message: string;
+  raw?: string;
+};
+
+export type CommitDecisionMemory = {
+  verdict: "sufficient" | "needs_more_context" | "mixed_changes" | "ready";
+  reason: string;
+};
+
 export type CommitHarnessSeed = {
   prompt: string;
   workspaceRoot: string;
@@ -282,6 +306,105 @@ export class GitCommitHarness extends LayeredHarness {
       parentIds,
       status: approved ? "approved" : "pending",
     });
+  }
+
+  rememberDiffChunk(
+    chunk: CommitDiffChunkMemory,
+    parentIds: string[],
+  ): HarnessMemory<CommitDiffChunkMemory> {
+    return this.remember({
+      laneId: "commit-main",
+      stage: "deterministic_gather",
+      kind: "diff_chunk",
+      archetype: "evidence_collector",
+      content: chunk,
+      summary: `${chunk.path} chunk ${chunk.chunkIndex}/${chunk.totalChunks} lines ${chunk.lineRange}`,
+      tags: ["commit", "diff-chunk", chunk.path],
+      parentIds,
+      status: "approved",
+    });
+  }
+
+  rememberFileSummary(
+    summary: CommitFileSummaryMemory,
+    parentIds: string[],
+    approved: boolean,
+  ): HarnessMemory<CommitFileSummaryMemory> {
+    return this.remember({
+      laneId: "commit-main",
+      stage: "file_consolidator",
+      kind: "file_summary",
+      archetype: "consolidator",
+      content: summary,
+      summary: `${summary.path}: ${summary.summary}`,
+      tags: ["commit", "file-summary", summary.path],
+      parentIds,
+      status: approved ? "approved" : "pending",
+    });
+  }
+
+  rememberDecision(
+    stage: string,
+    decision: CommitDecisionMemory,
+    parentIds: string[],
+    approved: boolean,
+  ): HarnessMemory<CommitDecisionMemory> {
+    return this.remember({
+      laneId: "commit-main",
+      stage,
+      kind: "decision",
+      archetype: stage === "message_red_team" ? "red_team" : "evaluator",
+      content: decision,
+      summary: `${decision.verdict}: ${decision.reason}`,
+      tags: ["commit", "decision", decision.verdict],
+      parentIds,
+      status: approved ? "approved" : "pending",
+    });
+  }
+
+  rememberDraft(
+    stage: string,
+    draft: CommitDraftMemory,
+    parentIds: string[],
+    approved: boolean,
+  ): HarnessMemory<CommitDraftMemory> {
+    return this.remember({
+      laneId: "commit-main",
+      stage,
+      kind: stage === "final_message_council" ? "final" : "draft",
+      archetype: stage === "message_normalizer" ? "normalizer" : "drafter",
+      content: draft,
+      summary: draft.message.split(/\r?\n/)[0] ?? draft.message,
+      tags: ["commit", "draft"],
+      parentIds,
+      status: approved ? "approved" : "pending",
+    });
+  }
+
+  rememberFinal(
+    draft: CommitDraftMemory,
+    parentIds: string[],
+    approved: boolean,
+  ): HarnessMemory<CommitDraftMemory> {
+    return this.remember({
+      laneId: "commit-main",
+      stage: "final_message_council",
+      kind: "final",
+      archetype: "judge",
+      content: draft,
+      summary: draft.message.split(/\r?\n/)[0] ?? draft.message,
+      tags: ["commit", "final"],
+      parentIds,
+      status: approved ? "approved" : "pending",
+    });
+  }
+
+  approveMemories(ids: string[]): HarnessMemory[] {
+    return ids.map((id) => this.memory.setStatus(id, "approved"));
+  }
+
+  supersedeMemory(id: string): HarnessMemory {
+    return this.memory.setStatus(id, "superseded");
   }
 }
 
