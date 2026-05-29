@@ -645,6 +645,8 @@ function mockPointerDesktop(fixture: {
         return null;
       case "ollama_generate":
         return ollamaGenerate(args.requestId, args.request);
+      case "ollama_fim":
+        return ollamaFim(args.requestId, args.request);
       case "index_status":
         return { in_progress: false, indexed_files: 0, indexed_chunks: 0, root: fixture.root };
       case "recommend_models":
@@ -1159,6 +1161,15 @@ function mockPointerDesktop(fixture: {
     });
   }
 
+  function ollamaFim(_requestId: string, request: any) {
+    return new Promise((resolve) => {
+      window.setTimeout(() => {
+        const prefix = String(request?.prefix ?? "");
+        resolve(prefix.endsWith("render") ? "Greeting('Pointer')" : "Completion");
+      }, 20);
+    });
+  }
+
   function agentRun(requestId: string, request: any) {
     const isPlan = request.mode === "plan";
     window.setTimeout(() => {
@@ -1332,9 +1343,11 @@ declare global {
         activeTab?: () => unknown;
         openFile?: (path: string) => Promise<void>;
         language?: () => string | null;
+        content?: () => string;
         markers?: () => unknown[];
         visibleTokenClasses?: () => string[];
         triggerSuggest?: (line: number, column: number) => Promise<void>;
+        triggerInlineSuggest?: (line: number, column: number) => Promise<void>;
         gotoDefinitionAt?: (line: number, column: number) => Promise<string | null>;
       };
       assistant?: {

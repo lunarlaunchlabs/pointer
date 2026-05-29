@@ -38,6 +38,7 @@ import { useAssistant } from "@/store/assistant";
 import { useRecentEdits } from "@/store/recentEdits";
 import { aiStageDecorationsFor } from "@/lib/aiStageDecorations";
 import { buildFimContext } from "@/lib/fimContext";
+import { FimRequestCoordinator } from "@/lib/fimRequestCoordinator";
 import {
   extractPathTarget,
   resolvePathTarget,
@@ -54,7 +55,6 @@ import {
 } from "@/lib/vueIntelligence";
 import { pathFromMonacoUri } from "@/lib/monacoUri";
 
-type FimPending = { id: string; cancel: () => void };
 type PointerLspCompletion = languages.CompletionItem & {
   __pointerLsp?: {
     path: string;
@@ -1334,8 +1334,7 @@ export function registerGlobalAiProviders(monaco: Monaco) {
   // FIM inline completion provider. Pulls all of its config via
   // `useSettings.getState()` at call time so the FIM model / debounce
   // can be reconfigured without a Monaco restart.
-  let pending: FimPending | null = null;
-  let debounce: number | null = null;
+  const fimCoordinator = new FimRequestCoordinator();
   monaco.languages.registerInlineCompletionsProvider(
     { pattern: "**" },
     {
@@ -1348,14 +1347,15 @@ export function registerGlobalAiProviders(monaco: Monaco) {
         if (!isFeatureUsable("fim")) return { items: [] };
         const line = textModel.getLineContent(position.lineNumber);
         if (position.column <= 1 && line.trim() === "") return { items: [] };
-        if (pending) {
-          ipc.ollamaCancel(pending.id).catch(() => {});
-          pending = null;
-        }
-        if (debounce) window.clearTimeout(debounce);
 
-        const text = await new Promise<string>((resolve) => {
-          debounce = window.setTimeout(async () => {
+        const text = await fimCoordinator.request({
+          debounceMs: useSettings.getState().fimDebounceMs,
+          token: cancelToken,
+          createRequestId: () => newRequestId("fim"),
+          cancelRequest: (id) => {
+            void ipc.ollamaCancel(id).catch(() => {});
+          },
+          generate: async (id) => {
             const rawPrefix = textModel.getValueInRange({
               startLineNumber: Math.max(1, position.lineNumber - 200),
               startColumn: 1,
@@ -1407,30 +1407,17 @@ export function registerGlobalAiProviders(monaco: Monaco) {
               // tight.
               budgetChars: 6_000,
             });
-            const id = newRequestId("fim");
-            pending = {
-              id,
-              cancel: () => ipc.ollamaCancel(id).catch(() => {}),
-            };
-            cancelToken.onCancellationRequested(() => pending?.cancel());
-            try {
-              const out = await ipc.ollamaFim(id, {
-                model: useSettings.getState().fimModel,
-                prefix: ctx.prefix,
-                suffix: ctx.suffix,
-                num_predict: 96,
-                stop: ctx.stop,
-              });
-              resolve(out);
-            } catch {
-              resolve("");
-            } finally {
-              pending = null;
-            }
-          }, useSettings.getState().fimDebounceMs);
+            return ipc.ollamaFim(id, {
+              model: useSettings.getState().fimModel,
+              prefix: ctx.prefix,
+              suffix: ctx.suffix,
+              num_predict: 96,
+              stop: ctx.stop,
+            });
+          },
         });
 
-        if (!text) return { items: [] };
+        if (!text.trim()) return { items: [] };
         return {
           items: [
             {

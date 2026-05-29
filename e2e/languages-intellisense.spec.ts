@@ -80,6 +80,24 @@ test.describe("editor language intelligence", () => {
     await expect(suggestWidget).toContainText("Button");
   });
 
+  test("shows and accepts FIM inline tab completion", async ({ appPage: page }) => {
+    await openE2EFile(page, paths.completion);
+    await page.evaluate(async () => {
+      await window.__POINTER_E2E__?.editor?.triggerInlineSuggest?.(4, 16);
+    });
+
+    await expect(page.getByRole("alert").filter({ hasText: "Greeting" })).toBeVisible();
+    await page.keyboard.press("Tab");
+    await expect
+      .poll(() =>
+        page.evaluate(() => {
+          const content = String(window.__POINTER_E2E__?.editor?.content?.());
+          return content.includes("renderGreeting") && content.includes("Pointer");
+        }),
+      )
+      .toBe(true);
+  });
+
   test("follows definitions across imported files and framework entrypoints", async ({
     appPage: page,
   }) => {

@@ -76,6 +76,11 @@ export function installEditorE2EHooks(
       editorInstance.focus();
       await editorInstance.getAction("editor.action.triggerSuggest")?.run();
     },
+    triggerInlineSuggest: async (line: number, column: number) => {
+      editorInstance.setPosition({ lineNumber: line, column });
+      editorInstance.focus();
+      await editorInstance.getAction("editor.action.inlineSuggest.trigger")?.run();
+    },
     gotoDefinitionAt: async (line: number, column: number) => {
       editorInstance.setPosition({ lineNumber: line, column });
       editorInstance.focus();
