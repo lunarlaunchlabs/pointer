@@ -137,4 +137,62 @@ describe("Composer", () => {
     // …and no ref was added by the category header click either.
     expect(onAddReference).not.toHaveBeenCalled();
   });
+
+  it("keeps @file queries live after the category alias", async () => {
+    const user = userEvent.setup();
+    renderComposer();
+    const ta = screen.getByPlaceholderText(/Ask, edit, generate/i);
+    await user.type(ta, "@file App");
+    expect(await screen.findByText("src/App.tsx")).toBeInTheDocument();
+  });
+
+  it("accepts dropped files, breakpoints, and debug values as context", async () => {
+    const { onAddReference } = renderComposer();
+    const root = screen
+      .getByPlaceholderText(/Ask, edit, generate/i)
+      .closest("[data-pointer-drop-context='assistant']")!;
+    const payloads = new Map<string, string>([
+      ["application/x-pointer-paths", JSON.stringify(["/repo/src/App.tsx"])],
+      [
+        "application/x-pointer-breakpoint",
+        JSON.stringify({
+          id: "bp_1",
+          path: "/repo/src/App.tsx",
+          line: 7,
+          enabled: true,
+          createdAt: 1,
+        }),
+      ],
+      [
+        "application/x-pointer-debug-value",
+        JSON.stringify({
+          id: "dbg_1",
+          name: "user",
+          value: "{ id: 1 }",
+          type: "User",
+          createdAt: 1,
+        }),
+      ],
+    ]);
+    fireEvent.drop(root, {
+      dataTransfer: {
+        types: Array.from(payloads.keys()),
+        files: [],
+        getData: (type: string) => payloads.get(type) ?? "",
+        dropEffect: "copy",
+      },
+    });
+    await waitFor(() => {
+      expect(onAddReference).toHaveBeenCalledWith(
+        expect.objectContaining({ kind: "breakpoint", line: 7 }),
+      );
+      expect(onAddReference).toHaveBeenCalledWith(
+        expect.objectContaining({ kind: "debugValue", name: "user" }),
+      );
+      expect(onAddReference).toHaveBeenCalledWith({
+        kind: "file",
+        path: "/repo/src/App.tsx",
+      });
+    });
+  });
 });

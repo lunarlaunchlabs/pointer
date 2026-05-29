@@ -45,6 +45,8 @@ pub struct AssistantAskRequest {
     pub model: String,
     pub messages: Vec<ChatMsg>,
     #[serde(default)]
+    pub opencode_session_id: Option<String>,
+    #[serde(default)]
     pub system: Option<String>,
     #[serde(default)]
     pub system_extras: Option<String>,
@@ -66,6 +68,8 @@ pub struct AssistantAskRequest {
 pub struct AssistantLedgerEvent {
     pub session_id: String,
     pub entry: LedgerEntry,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub opencode_session_id: Option<String>,
 }
 
 /// `assistant_ask` — Ask-mode passthrough.
@@ -91,6 +95,7 @@ pub async fn assistant_ask(
         session_id,
         model,
         messages,
+        opencode_session_id,
         system,
         system_extras,
         attached_files,
@@ -110,7 +115,11 @@ pub async fn assistant_ask(
         .as_ref()
         .map(|p| p.display().to_string())
         .unwrap_or_default();
-    let prompt = render_opencode_ask_prompt(extra_context, &messages);
+    let resume_opencode = opencode_session_id
+        .as_deref()
+        .map(str::trim)
+        .is_some_and(|s| !s.is_empty());
+    let prompt = render_opencode_ask_prompt(extra_context, &messages, resume_opencode);
     let res = run_opencode(
         app.clone(),
         &state,
@@ -121,8 +130,8 @@ pub async fn assistant_ask(
             prompt,
             mode: OpenCodeMode::Ask,
             title: "Ask mode".into(),
-            max_steps: 1,
             files: attached_files.unwrap_or_default(),
+            opencode_session_id: opencode_session_id.clone(),
         },
     )
     .await;
@@ -149,6 +158,11 @@ pub async fn assistant_ask(
             AssistantLedgerEvent {
                 session_id: session_id.clone(),
                 entry,
+                opencode_session_id: res
+                    .as_ref()
+                    .ok()
+                    .and_then(|r| r.session_id.clone())
+                    .or(opencode_session_id.clone()),
             },
         );
     }
@@ -156,10 +170,24 @@ pub async fn assistant_ask(
     res.map(|_| ())
 }
 
-fn render_opencode_ask_prompt(system: Option<&str>, messages: &[ChatMsg]) -> String {
+fn render_opencode_ask_prompt(
+    system: Option<&str>,
+    messages: &[ChatMsg],
+    resume_opencode: bool,
+) -> String {
     let mut out = String::new();
     out.push_str("Conversation:\n");
-    for m in messages {
+    let visible_messages: Vec<&ChatMsg> = if resume_opencode {
+        messages
+            .iter()
+            .rev()
+            .find(|m| m.role == "user")
+            .into_iter()
+            .collect()
+    } else {
+        messages.iter().collect()
+    };
+    for m in visible_messages {
         out.push_str(match m.role.as_str() {
             "assistant" => "Assistant: ",
             "system" => "System: ",
@@ -176,7 +204,32 @@ fn render_opencode_ask_prompt(system: Option<&str>, messages: &[ChatMsg]) -> Str
             out.push_str("\n\n");
         }
     }
-    out.push_str("Answer the latest user message. For file explanation questions, center the answer on the named or attached file and include a compact Key identifiers sentence with exact identifiers, dotted method names, and configuration keys visible in that file. For object methods, preserve their dotted form such as app.handle or app.use.");
+    out.push_str("ASK MODE CONTRACT:\n");
+    out.push_str(
+        "- Answer from the repository files OpenCode reads or receives as attached files.\n",
+    );
+    out.push_str("- If Additional context contains relevant file blocks or literal evidence lines that answer the question, answer directly from that context without using additional tools.\n");
+    out.push_str("- If Additional context contains <brain-frontier>, treat it as Pointer's deterministic external-memory search frontier: use included evidence first, inspect listed candidates before asserting behavior, and do not rediscover facts it already provides.\n");
+    out.push_str("- If Additional context contains <context-memory>, treat it as Pointer's deterministic retained source map: use its exact paths, symbols, imports, evidence lines, and reasons to ground the answer, but do not invent code that is not present in file blocks or repository reads.\n");
+    out.push_str("- For file explanation questions, name the file's purpose, important imports/exports, state or data flow, and notable risks or neighboring files.\n");
+    out.push_str("- For interface code, call out important state owners, event handlers, and conditional rendered UI when they are present.\n");
+    out.push_str("- For routing questions, name the exact router components visible in the file, including Switch when it is present.\n");
+    out.push_str("- For theme persistence questions, name the exact storage import/local variable and storage calls when they are visible, for example local-storage-fallback, storage.getItem, or storage.setItem only if those names appear in repository context.\n");
+    out.push_str("- For editor or media-heavy components, mention file operations, upload/image handling, export, and persistence flows when those symbols are visible.\n");
+    out.push_str("- For codebase research questions that ask where a behavior is configured, compiled, consumed, or flows through the project, use search/read tools to trace at least the definition file and consumer file before answering.\n");
+    out.push_str("- For codebase research or source-path answers, name exact repository-relative file paths for each hop; do not stop at import specifiers such as ./utils.\n");
+    out.push_str("- If a search finds the symbol or behavior, read the matching file before answering; do not answer from search snippets alone.\n");
+    out.push_str("- Unless the user explicitly asks for code samples, do not emit fenced code blocks in Ask mode; describe short code facts inline with backticks instead.\n");
+    out.push_str("- Include a compact Key identifiers sentence with 4-8 exact symbols, dotted assignments, method names, and configuration keys visible in the file; never list more than 8 identifiers and never repeat an identifier. If more than 8 identifiers are possible, choose the 8 most important.\n");
+    out.push_str("- If a file defines dotted exported assignments such as object.method = function, name the dotted assignment exactly instead of only the bare method name.\n");
+    out.push_str("- If Additional context includes app.defaultConfiguration, app.set(...), or setting keys, name the important literal setting keys in the prose.\n");
+    out.push_str("- Do not list bare prior-version method names such as mount or lazyrouter unless the file defines that exact method/export in the visible context.\n");
+    out.push_str("- Key identifiers must be real identifiers or setting keys from the file, not synthesized property chains.\n");
+    out.push_str("- Preserve literal identifiers exactly as they appear in files. Never copy identifier examples from instructions into the answer unless OpenCode actually saw them in repository content.\n");
+    out.push_str("- Never output internal progress blocks or headings like ## Goal, ## Progress, Constraints, Next Steps, or Continue if you have next steps.\n");
+    out.push_str("- Do not claim you lack access to a named, active, or attached file.\n");
+    out.push_str("- Do not modify files in Ask mode.\n\n");
+    out.push_str("Answer the latest user message using the ASK MODE CONTRACT above.");
     out
 }
 
@@ -195,9 +248,13 @@ pub struct AgentExecutePlanRequest {
     pub plan_text: String,
     pub model: String,
     #[serde(default)]
+    pub opencode_session_id: Option<String>,
+    #[serde(default)]
     pub workspace: Option<String>,
+    /// Legacy native-loop budget. Ignored by the OpenCode runtime.
     #[serde(default)]
     pub max_steps: Option<u32>,
+    /// Legacy native-loop runtime cap. Ignored by the OpenCode runtime.
     #[serde(default)]
     pub max_runtime_secs: Option<u64>,
     /// Existing transcript from the Plan-mode session — when
@@ -240,6 +297,7 @@ pub async fn agent_execute_plan(
         session_id: _,
         plan_text,
         model,
+        opencode_session_id,
         workspace,
         max_steps,
         max_runtime_secs,
@@ -274,6 +332,7 @@ pub async fn agent_execute_plan(
                 active_file: None,
                 attached_files: None,
                 ledger,
+                opencode_session_id,
             };
             agent_continue(app, state, request_id, cont).await
         }
@@ -298,6 +357,7 @@ pub async fn agent_execute_plan(
                 open_tabs: None,
                 active_file: None,
                 attached_files: None,
+                opencode_session_id,
             };
             agent_run(app, state, request_id, req).await
         }
@@ -326,9 +386,11 @@ mod tests {
         let evt = AssistantLedgerEvent {
             session_id: "sess-42".into(),
             entry: entry_for_answer(3, 1000, "ask", "The reason is X."),
+            opencode_session_id: Some("opencode-1".into()),
         };
         let json = serde_json::to_value(&evt).unwrap();
         assert_eq!(json["session_id"], "sess-42");
+        assert_eq!(json["opencode_session_id"], "opencode-1");
         assert_eq!(json["entry"]["mode"], "ask");
         assert_eq!(json["entry"]["turn"], 3);
         // The discriminator must stay `answered_only` (snake_case)

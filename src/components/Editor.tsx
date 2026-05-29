@@ -3,20 +3,24 @@ import type { editor, languages } from "monaco-editor";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { POINTER_NOIR_ID, pointerNoirTheme } from "@/theme/pointer-noir";
 import { setupMonaco } from "@/lib/setupMonaco";
+import { installEditorE2EHooks } from "@/lib/e2eHooks";
 import { useDiagnostics } from "@/store/diagnostics";
 import { useEditorStore } from "@/store/editor";
 import { useWorkspace } from "@/store/workspace";
 import { useInlineBlame } from "@/lib/inlineBlame";
 import { useBookmarkDecorations } from "@/lib/bookmarkDecorations";
+import { useBreakpointDecorations } from "@/lib/breakpointDecorations";
 import { registerColorProviders } from "@/lib/colorProvider";
 import { useSession } from "@/store/session";
 import { useSettings, isFeatureUsable } from "@/store/settings";
+import { useDebuggerStore } from "@/store/debugger";
 import {
   ipc,
   listenEvent,
   newRequestId,
   type LspCompletionItem,
   type LspDiagnosticEvent,
+  type LspLocation,
   type LspRange,
 } from "@/lib/ipc";
 import { onAction } from "@/lib/actions";
@@ -25,6 +29,7 @@ import { InlineEdit } from "@/components/InlineEdit";
 import { DiffOverlay } from "@/components/DiffOverlay";
 import { ImagePreview, BinaryPreview } from "@/components/Preview";
 import {
+  sendBreakpointToAI,
   sendDiagnosticToAI,
   sendSelectionToAI,
   type AiTarget,
@@ -241,6 +246,7 @@ export function Editor() {
     // defaults, and wire JSON schema-store validation. Idempotent — safe
     // to call on every mount.
     setupMonaco(monaco);
+    installEditorE2EHooks(ed, monaco);
 
     // Subscribe the diagnostics store to Monaco's global marker stream.
     // Also idempotent — guarded by an internal flag in the store.
@@ -292,6 +298,24 @@ export function Editor() {
         run: a.run,
       });
     }
+    ed.addAction({
+      id: "pointer.toggleBreakpoint",
+      label: "Pointer: Toggle breakpoint",
+      contextMenuGroupId: "1_pointer",
+      contextMenuOrder: 1.1,
+      run: () => {
+        toggleBreakpointAtCursor(ed);
+      },
+    });
+    for (const target of ["ask", "plan", "agent"] as const) {
+      ed.addAction({
+        id: `pointer.sendBreakpointTo${target[0].toUpperCase()}${target.slice(1)}`,
+        label: `Pointer: Send breakpoint to ${target === "ask" ? "Ask" : target}`,
+        contextMenuGroupId: "1_pointer",
+        contextMenuOrder: 1.7,
+        run: () => sendCurrentBreakpointFromEditor(ed, target),
+      });
+    }
     // Cmd+L sends the selection straight to Ask (Cursor-parity
     // shortcut). Cmd+Shift+L sends it to the agent.
     ed.addCommand(
@@ -302,6 +326,9 @@ export function Editor() {
       monaco.KeyMod.CtrlCmd | monaco.KeyMod.Shift | monaco.KeyCode.KeyL,
       () => sendSelectionFromEditor(ed, "agent"),
     );
+    ed.addCommand(monaco.KeyCode.F9, () => {
+      toggleBreakpointAtCursor(ed);
+    });
 
     // Global Monaco registrations — code-action provider, code lens,
     // marker-routing commands — only need to happen once. The Editor
@@ -350,6 +377,7 @@ export function Editor() {
     // files in the workbench. This small language-agnostic layer fills
     // that gap across frameworks without needing a full LSP for each one.
     ed.onMouseDown((mouseEvent) => {
+      if (toggleBreakpointFromGutter(ed, monaco, mouseEvent)) return;
       void openFileTargetUnderPointer(ed, mouseEvent);
     });
 
@@ -464,6 +492,8 @@ export function Editor() {
   useInlineBlame(editorInstance, activeTab?.path ?? null, activeTab?.dirty ?? false);
   // Persistent bookmark gutter glyphs.
   useBookmarkDecorations(editorInstance, activeTab?.path ?? null);
+  // Persistent debugger breakpoint glyphs.
+  useBreakpointDecorations(editorInstance, activeTab?.path ?? null);
 
   // Restore per-file editor state (cursor + scroll + folds) on
   // tab activation. Monaco's view-state blob is opaque JSON so we
@@ -657,7 +687,7 @@ export function Editor() {
           fontSize: editorFontSize,
           fontLigatures: true,
           lineHeight: 1.55,
-          letterSpacing: 0.1,
+          letterSpacing: 0,
           smoothScrolling: true,
           cursorBlinking: "smooth",
           cursorSmoothCaretAnimation: "on",
@@ -846,7 +876,7 @@ function usesExternalLspDiagnostics(language: string): boolean {
   return language !== "typescript" && language !== "javascript";
 }
 
-function registerGlobalAiProviders(monaco: Monaco) {
+export function registerGlobalAiProviders(monaco: Monaco) {
   if (aiProvidersRegistered) return;
   aiProvidersRegistered = true;
 
@@ -1064,6 +1094,66 @@ function registerGlobalAiProviders(monaco: Monaco) {
               start,
               hit.line,
               start + word.symbol.length,
+            ),
+          };
+        });
+      },
+    },
+  );
+
+  // Cross-language references. Prefer the active language server; when
+  // one is missing or warming up, fall back to a precise whole-word
+  // workspace scan so Shift+F12 / "Find All References" still works
+  // in repos that do not have every language tool installed.
+  monaco.languages.registerReferenceProvider(
+    { pattern: "**" },
+    {
+      provideReferences: async (model, position) => {
+        const word = symbolAtPosition(
+          model.getLineContent(position.lineNumber),
+          position.column,
+        );
+        if (!word) return null;
+        const sourcePath = pathFromMonacoUri(model.uri.toString());
+        const language = model.getLanguageId();
+        const lspLocations = await ipc
+          .lspReferences({
+            path: sourcePath,
+            language,
+            content: model.getValue(),
+            line: position.lineNumber,
+            column: position.column,
+            limit: 100,
+          })
+          .catch(() => []);
+        if (lspLocations.length > 0) {
+          return dedupeLocations(lspLocations).map((loc) =>
+            locationFromLsp(monaco, loc),
+          );
+        }
+
+        const hits = await ipc
+          .searchText(word.symbol, 100, {
+            case_sensitive: true,
+            whole_word: true,
+          })
+          .catch(() => []);
+        if (hits.length === 0) return null;
+        return hits.map((hit) => {
+          const start =
+            (hit.col ?? -1) >= 0
+              ? (hit.col ?? 0) + 1
+              : Math.max(1, hit.text.indexOf(word.symbol) + 1);
+          const length = hit.match_len && hit.match_len > 0
+            ? hit.match_len
+            : word.symbol.length;
+          return {
+            uri: monaco.Uri.file(hit.path),
+            range: new monaco.Range(
+              hit.line,
+              start,
+              hit.line,
+              start + length,
             ),
           };
         });
@@ -1360,6 +1450,74 @@ function registerGlobalAiProviders(monaco: Monaco) {
   );
 }
 
+function toggleBreakpointAtCursor(ed: editor.IStandaloneCodeEditor): boolean {
+  const model = ed.getModel();
+  const pos = ed.getPosition();
+  if (!model || !pos) return false;
+  const path = pathFromMonacoUri(model.uri.toString());
+  useDebuggerStore.getState().toggleBreakpoint(path, pos.lineNumber);
+  toast.info("Breakpoint toggled", { body: `${shortPath(path)}:${pos.lineNumber}` });
+  return true;
+}
+
+function sendCurrentBreakpointFromEditor(
+  ed: editor.IStandaloneCodeEditor,
+  target: AiTarget,
+) {
+  const model = ed.getModel();
+  const pos = ed.getPosition();
+  if (!model || !pos) {
+    toast.info("Open a file first", {
+      body: "Pointer needs an editor location to send a breakpoint.",
+    });
+    return;
+  }
+  const path = pathFromMonacoUri(model.uri.toString());
+  const store = useDebuggerStore.getState();
+  let breakpoint = store
+    .breakpointsForPath(path)
+    .find((bp) => bp.line === pos.lineNumber);
+  if (!breakpoint) {
+    const id = store.addBreakpoint({
+      path,
+      line: pos.lineNumber,
+      enabled: true,
+    });
+    breakpoint = useDebuggerStore.getState().breakpoints.find((bp) => bp.id === id);
+  }
+  if (!breakpoint) return;
+  sendBreakpointToAI(target, breakpoint);
+}
+
+function toggleBreakpointFromGutter(
+  ed: editor.IStandaloneCodeEditor,
+  monaco: Monaco,
+  mouseEvent: Parameters<editor.IStandaloneCodeEditor["onMouseDown"]>[0] extends (
+    listener: (event: infer E) => unknown,
+  ) => unknown
+    ? E
+    : any,
+): boolean {
+  const type = mouseEvent.target.type;
+  const isBreakpointZone =
+    type === monaco.editor.MouseTargetType.GUTTER_GLYPH_MARGIN ||
+    type === monaco.editor.MouseTargetType.GUTTER_LINE_NUMBERS;
+  if (!isBreakpointZone) return false;
+  const position = mouseEvent.target.position;
+  const model = ed.getModel();
+  if (!position || !model) return false;
+  const event = mouseEvent.event as unknown as {
+    preventDefault?: () => void;
+    stopPropagation?: () => void;
+  };
+  event.preventDefault?.();
+  event.stopPropagation?.();
+  useDebuggerStore
+    .getState()
+    .toggleBreakpoint(pathFromMonacoUri(model.uri.toString()), position.lineNumber);
+  return true;
+}
+
 async function openFileTargetUnderPointer(
   ed: editor.IStandaloneCodeEditor,
   mouseEvent: Parameters<editor.IStandaloneCodeEditor["onMouseDown"]>[0] extends (
@@ -1538,6 +1696,30 @@ function lspRangeToMonaco(monaco: Monaco, range: LspRange) {
     range.endLine,
     range.endColumn,
   );
+}
+
+function locationFromLsp(monaco: Monaco, loc: LspLocation): languages.Location {
+  return {
+    uri: monaco.Uri.file(loc.path),
+    range: new monaco.Range(
+      loc.line,
+      loc.column,
+      loc.endLine,
+      loc.endColumn,
+    ),
+  };
+}
+
+function dedupeLocations(locations: LspLocation[]): LspLocation[] {
+  const seen = new Set<string>();
+  const out: LspLocation[] = [];
+  for (const loc of locations) {
+    const key = `${loc.path}:${loc.line}:${loc.column}:${loc.endLine}:${loc.endColumn}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    out.push(loc);
+  }
+  return out;
 }
 
 function modelRangeFromLsp(

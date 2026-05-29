@@ -50,7 +50,14 @@ export type FileChange = {
 };
 
 export type AgentEvent =
-  | { kind: "started"; mode: AgentMode; max_steps: number; depth: number; workspace: string }
+  | {
+      kind: "started";
+      mode: AgentMode;
+      max_steps?: number | null;
+      depth: number;
+      workspace: string;
+      runtime?: string;
+    }
   | { kind: "step_start"; step: number; model: string; elapsed_ms: number }
   | { kind: "request_sent"; step: number; elapsed_ms: number }
   | { kind: "first_token"; step: number; warmup_ms: number }
@@ -103,7 +110,7 @@ export type AgentEvent =
   // Captured by the BE just before each terminal event so the FE can
   // persist the exact Ollama transcript needed to resume the
   // conversation later. Not rendered; consumed by the store listener.
-  | { kind: "transcript_snapshot"; messages: AgentMessage[] };
+  | { kind: "transcript_snapshot"; messages: AgentMessage[]; opencode_session_id?: string | null };
 
 export type AgentStatus = "idle" | "running" | "done" | "cancelled" | "error";
 

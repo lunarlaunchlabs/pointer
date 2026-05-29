@@ -23,6 +23,8 @@ import { useSession } from "@/store/session";
 import { useDiagnostics, type Diagnostic } from "@/store/diagnostics";
 import {
   sendAllDiagnosticsToAI,
+  sendBreakpointToAI,
+  sendDebugValueToAI,
   sendDiagnosticToAI,
   sendSelectionToAI,
 } from "./sendToAI";
@@ -190,5 +192,48 @@ describe("sendAllDiagnosticsToAI", () => {
     const n = await sendAllDiagnosticsToAI("chat");
     expect(n).toBe(0);
     expect(useAssistant.getState().pendingRefs).toHaveLength(0);
+  });
+});
+
+describe("send debugger references to AI", () => {
+  beforeEach(() => resetStores());
+
+  it("stages breakpoint references on the requested mode", () => {
+    sendBreakpointToAI("plan", {
+      id: "bp_1",
+      path: "/workspace/src/foo.ts",
+      line: 11,
+      enabled: true,
+      condition: "ready",
+      createdAt: 1,
+    });
+    const st = useAssistant.getState();
+    expect(st.sessions[0].mode).toBe("plan");
+    expect(st.pendingRefs[0]).toMatchObject({
+      kind: "breakpoint",
+      path: "/workspace/src/foo.ts",
+      line: 11,
+      condition: "ready",
+    });
+  });
+
+  it("stages debug values on the requested mode", () => {
+    sendDebugValueToAI("agent", {
+      id: "dbg_1",
+      name: "payload",
+      value: "{ ok: false }",
+      type: "Payload",
+      path: "/workspace/src/foo.ts",
+      line: 20,
+      createdAt: 1,
+    });
+    const st = useAssistant.getState();
+    expect(st.sessions[0].mode).toBe("agent");
+    expect(st.pendingRefs[0]).toMatchObject({
+      kind: "debugValue",
+      name: "payload",
+      value: "{ ok: false }",
+      type: "Payload",
+    });
   });
 });

@@ -3,15 +3,20 @@ import {
   ArrowDownToLine,
   ArrowUpToLine,
   Check,
+  CircleAlert,
   ChevronDown,
   ChevronRight,
   FileText,
   GitBranch,
   GitCommit,
+  GitMerge,
+  GitPullRequest,
   Loader2,
   Minus,
   Plus,
+  Play,
   RefreshCw,
+  Sparkles,
   Trash2,
   Undo2,
   X,
@@ -20,8 +25,28 @@ import { useGit, gitStatusColor, gitStatusLetter } from "@/store/git";
 import { useWorkspace } from "@/store/workspace";
 import { useEditorStore } from "@/store/editor";
 import { useDiffViewer } from "@/store/diffViewer";
-import { ipc, type GitBranch as GitBranchT, type GitFileEntry } from "@/lib/ipc";
+import {
+  ipc,
+  listenEvent,
+  newRequestId,
+  type ChatToken,
+  type GitBranch as GitBranchT,
+  type GitFileEntry,
+  type GitOperationState,
+} from "@/lib/ipc";
 import { languageFromPath } from "@/lib/lang";
+import {
+  buildCommitMessagePrompt,
+  buildFileSummaryPrompt,
+  changedFilesForCommit,
+  groupBranches,
+  normalizeGeneratedCommitMessage,
+  operationAbortLabel,
+  operationActionLabel,
+  operationProgress,
+  type CommitFileSummary,
+} from "@/lib/gitWorkflow";
+import { isFeatureUsable, useSettings } from "@/store/settings";
 import { toast } from "@/components/Toast";
 import { confirm } from "@/components/Confirm";
 
@@ -44,6 +69,8 @@ export function SourceControlPanel() {
   const refresh = useGit((s) => s.refresh);
   const openFile = useEditorStore((s) => s.openFile);
   const showDiff = useDiffViewer((s) => s.show);
+  const chatModel = useSettings((s) => s.chatModel);
+  const chatUsable = useSettings((s) => isFeatureUsable("chat", s));
 
   /** Read a file from the working tree. Returns "" if the file no
    *  longer exists (deleted entries) so the diff renders as
@@ -102,6 +129,11 @@ export function SourceControlPanel() {
     null,
   );
   const [busy, setBusy] = useState(false);
+  const [commitGenerating, setCommitGenerating] = useState(false);
+  const [commitDraft, setCommitDraft] = useState<{
+    summaries: CommitFileSummary[];
+    generated: string;
+  } | null>(null);
   const [showStaged, setShowStaged] = useState(true);
   const [showUnstaged, setShowUnstaged] = useState(true);
   const [branches, setBranches] = useState<GitBranchT[] | null>(null);
@@ -147,20 +179,22 @@ export function SourceControlPanel() {
     label: string,
     fn: () => Promise<string>,
     successToast?: string,
-  ) => {
-    if (!root) return;
+  ): Promise<boolean> => {
+    if (!root) return false;
     setBusy(true);
     setOutput({ kind: "info", body: `Running ${label}…` });
     try {
       const out = await fn();
       setOutput({ kind: "info", body: out.trim() || `${label} done.` });
       if (successToast) toast.info(successToast);
-      await refresh();
+      return true;
     } catch (e) {
       const body = e instanceof Error ? e.message : String(e);
       setOutput({ kind: "error", body });
       toast.error(`${label} failed`, { body });
+      return false;
     } finally {
+      await refresh();
       setBusy(false);
     }
   };
@@ -183,15 +217,19 @@ export function SourceControlPanel() {
   const stageAll = () => stage([]);
   const unstageAll = () => unstage([]);
   const commit = async () => {
+    if (!root) return;
     if (!commitMessage.trim()) {
       toast.warn("Commit message required");
       return;
     }
-    if (staged.length === 0) {
+    const currentStatus = await ipc.gitStatus(root).catch(() => status);
+    const currentStaged = currentStatus.entries.filter((e) => e.staged);
+    const currentUnstaged = currentStatus.entries.filter((e) => e.unstaged);
+    if (currentStaged.length === 0) {
       // Auto-stage all unstaged tracked changes when nothing is
       // explicitly staged — git's "commit -a" semantics. Skip
       // untracked files (must be explicitly added).
-      const trackable = unstaged
+      const trackable = currentUnstaged
         .filter((e) => e.status !== "untracked")
         .map((e) => e.path);
       if (trackable.length === 0) {
@@ -204,10 +242,132 @@ export function SourceControlPanel() {
         confirmLabel: "Stage & Commit",
       });
       if (!ok) return;
-      await runCommand("git add", () => ipc.gitStage(root!, trackable));
+      const stagedOk = await runCommand("git add", () =>
+        ipc.gitStage(root, trackable),
+      );
+      if (!stagedOk) return;
     }
-    await runCommand("git commit", () => ipc.gitCommit(root!, commitMessage));
-    setCommitMessage("");
+    const committed = await runCommand("git commit", () =>
+      ipc.gitCommit(root, commitMessage),
+    );
+    if (committed) {
+      setCommitMessage("");
+      setCommitDraft(null);
+    }
+  };
+
+  const generateCommitMessage = async () => {
+    if (!root) return;
+    if (!chatUsable || !chatModel) {
+      toast.warn("Chat model unavailable", {
+        body: "Install or select a chat model before generating a commit message.",
+      });
+      return;
+    }
+    const files = changedFilesForCommit(status.entries).slice(0, 10);
+    if (files.length === 0) {
+      toast.warn("No tracked changes to summarize");
+      return;
+    }
+
+    setCommitGenerating(true);
+    setOutput({
+      kind: "info",
+      body: `Summarizing ${files.length} file${files.length === 1 ? "" : "s"}…`,
+    });
+    try {
+      const summaries: CommitFileSummary[] = [];
+      for (const file of files) {
+        const diff = await commitDiffFor(file);
+        const summary = await runCommitModel(
+          buildFileSummaryPrompt(file.path, diff || `${file.path} changed.`),
+          `Summarize ${file.path}`,
+          96,
+        );
+        summaries.push({
+          path: file.path,
+          status: file.status,
+          summary:
+            summary.trim().replace(/^[-*]\s*/, "") ||
+            `${file.status} ${file.path}`,
+        });
+      }
+      const generated = await runCommitModel(
+        buildCommitMessagePrompt(summaries),
+        "Draft commit message",
+        180,
+      );
+      const normalized = normalizeGeneratedCommitMessage(generated, summaries);
+      setCommitMessage(normalized);
+      setCommitDraft({ summaries, generated: normalized });
+      setOutput({
+        kind: "info",
+        body: `Generated a commit message from ${summaries.length} independent file summary${summaries.length === 1 ? "" : "ies"}.`,
+      });
+    } catch (e) {
+      const body = e instanceof Error ? e.message : String(e);
+      setOutput({ kind: "error", body });
+      toast.error("Commit generation failed", { body });
+    } finally {
+      setCommitGenerating(false);
+    }
+  };
+
+  const commitDiffFor = async (entry: GitFileEntry): Promise<string> => {
+    if (!root) return "";
+    const summarizeStaged = staged.length > 0 && entry.staged;
+    const diff = await ipc.gitDiff(root, entry.path, summarizeStaged).catch(() => "");
+    if (diff.trim()) return diff;
+    if (entry.status === "untracked") {
+      const content = await ipc
+        .readTextFile(`${root}/${entry.path}`)
+        .catch(() => "");
+      return `New file ${entry.path}:\n${content.slice(0, 12000)}`;
+    }
+    return `${entry.status} ${entry.path}`;
+  };
+
+  const runCommitModel = async (
+    prompt: string,
+    title: string,
+    numPredict: number,
+  ): Promise<string> => {
+    const requestId = newRequestId("git_commit");
+    const chunks: string[] = [];
+    let streamError: string | null = null;
+    let sawStreamEvent = false;
+    let markDone: () => void = () => undefined;
+    const done = new Promise<void>((resolve) => {
+      markDone = resolve;
+    });
+    const off = await listenEvent<ChatToken>(`ollama:gen:${requestId}`, (event) => {
+      sawStreamEvent = true;
+      if ("token" in event) chunks.push(event.token);
+      if ("error" in event) streamError = event.error;
+      if ("done" in event && event.done) markDone();
+    });
+    try {
+      await ipc.ollamaGenerate(requestId, {
+        model: chatModel,
+        prompt,
+        system:
+          "You are Pointer's git assistant. Be concise, specific, and accurate. Never invent changes not shown in the diff.",
+        temperature: 0.1,
+        num_predict: numPredict,
+        purpose: "git_commit",
+        title,
+      });
+      if (sawStreamEvent) {
+        await Promise.race([
+          done,
+          new Promise<void>((resolve) => window.setTimeout(resolve, 250)),
+        ]);
+      }
+      if (streamError) throw new Error(streamError);
+      return chunks.join("").trim();
+    } finally {
+      off();
+    }
   };
 
   if (!root) {
@@ -262,6 +422,22 @@ export function SourceControlPanel() {
               loading={!branches}
               onSelect={async (name) => {
                 setBranchOpen(false);
+                const selected = branches?.find((branch) => branch.name === name);
+                if (selected?.remote) {
+                  const localName = name.replace(/^[^/]+\//, "");
+                  const ok = await confirm({
+                    title: `Create local branch ${localName}?`,
+                    body: `${name} is a remote branch. Pointer will create and checkout a local branch from it instead of detaching HEAD.`,
+                    confirmLabel: "Create local",
+                    cancelLabel: "Cancel",
+                  });
+                  if (!ok) return;
+                  await runCommand(`git checkout -b ${localName} ${name}`, () =>
+                    ipc.gitCreateBranchFrom(root, localName, name, true),
+                  );
+                  await loadBranches();
+                  return;
+                }
                 await runCommand(`git checkout ${name}`, () =>
                   ipc.gitCheckout(root, name),
                 );
@@ -302,6 +478,15 @@ export function SourceControlPanel() {
         </div>
       </header>
 
+      <GitWorkflowPanel
+        statusOperation={status.operation}
+        branches={branches}
+        busy={busy}
+        loadBranches={loadBranches}
+        runCommand={runCommand}
+        root={root}
+      />
+
       <div className="px-3 py-2 border-b border-noir-line/60 space-y-2">
         <textarea
           value={commitMessage}
@@ -317,24 +502,55 @@ export function SourceControlPanel() {
           rows={2}
           className="w-full text-[12px] bg-noir-canvas border border-noir-line rounded px-2 py-1.5 resize-none outline-none focus:border-noir-accent placeholder:text-noir-mute"
         />
+        {commitDraft && (
+          <details className="rounded border border-noir-line/60 bg-noir-canvas/20">
+            <summary className="cursor-pointer select-none px-2 py-1 text-[10px] uppercase tracking-wider text-noir-mute">
+              Commit intelligence · {commitDraft.summaries.length} file summaries
+            </summary>
+            <ul className="border-t border-noir-line/60 px-2 py-1.5 space-y-1">
+              {commitDraft.summaries.map((item) => (
+                <li key={item.path} className="text-[10.5px] leading-relaxed">
+                  <span className="font-mono text-noir-accent">{item.path}</span>
+                  <span className="text-noir-mute"> — {item.summary}</span>
+                </li>
+              ))}
+            </ul>
+          </details>
+        )}
         <div className="flex items-center justify-between gap-2">
           <span className="text-[10px] text-noir-mute" aria-live="polite" role="status">
             {staged.length} staged · {unstaged.length} changed
           </span>
-          <button
-            onClick={commit}
-            disabled={busy || !commitMessage.trim()}
-            className="flex items-center gap-1.5 px-2 py-1 rounded bg-noir-accent/15 text-noir-accent text-[11px] hover:bg-noir-accent/25 disabled:opacity-40 disabled:cursor-not-allowed"
-            title="Commit (⌘↵)"
-            aria-label="Commit staged changes (Command Enter)"
-          >
-            {busy ? (
-              <Loader2 size={11} className="animate-spin" aria-hidden="true" />
-            ) : (
-              <GitCommit size={11} aria-hidden="true" />
-            )}
-            Commit
-          </button>
+          <div className="flex items-center gap-1">
+            <button
+              onClick={generateCommitMessage}
+              disabled={busy || commitGenerating || status.entries.length === 0}
+              className="flex items-center gap-1.5 px-2 py-1 rounded border border-noir-line text-noir-subtext text-[11px] hover:border-noir-accent/50 hover:text-noir-accent disabled:opacity-40 disabled:cursor-not-allowed"
+              title="Generate commit message with the local model"
+              aria-label="Generate commit message with local model"
+            >
+              {commitGenerating ? (
+                <Loader2 size={11} className="animate-spin" aria-hidden="true" />
+              ) : (
+                <Sparkles size={11} aria-hidden="true" />
+              )}
+              Draft
+            </button>
+            <button
+              onClick={commit}
+              disabled={busy || commitGenerating || !commitMessage.trim()}
+              className="flex items-center gap-1.5 px-2 py-1 rounded bg-noir-accent/15 text-noir-accent text-[11px] hover:bg-noir-accent/25 disabled:opacity-40 disabled:cursor-not-allowed"
+              title="Commit (⌘↵)"
+              aria-label="Commit staged changes (Command Enter)"
+            >
+              {busy ? (
+                <Loader2 size={11} className="animate-spin" aria-hidden="true" />
+              ) : (
+                <GitCommit size={11} aria-hidden="true" />
+              )}
+              Commit
+            </button>
+          </div>
         </div>
       </div>
 
@@ -449,6 +665,351 @@ export function SourceControlPanel() {
         </div>
       )}
     </div>
+  );
+}
+
+type GitCommandRunner = (
+  label: string,
+  fn: () => Promise<string>,
+  successToast?: string,
+) => Promise<boolean>;
+
+function GitWorkflowPanel({
+  statusOperation,
+  branches,
+  busy,
+  loadBranches,
+  runCommand,
+  root,
+}: {
+  statusOperation: GitOperationState | null;
+  branches: GitBranchT[] | null;
+  busy: boolean;
+  loadBranches: () => Promise<void>;
+  runCommand: GitCommandRunner;
+  root: string;
+}) {
+  const [expanded, setExpanded] = useState(true);
+  const [newBranch, setNewBranch] = useState("");
+  const [branchBase, setBranchBase] = useState("");
+  const [mergeTarget, setMergeTarget] = useState("");
+  const [rebaseTarget, setRebaseTarget] = useState("");
+
+  useEffect(() => {
+    if (!branches) void loadBranches();
+  }, [branches, loadBranches]);
+
+  const branchList = branches ?? [];
+  const grouped = useMemo(() => groupBranches(branchList), [branchList]);
+  const branchOptions = useMemo(
+    () => [...grouped.local, ...grouped.remote],
+    [grouped.local, grouped.remote],
+  );
+
+  useEffect(() => {
+    const current = branchOptions.find((branch) => branch.current);
+    const fallback = current?.name ?? branchOptions[0]?.name ?? "";
+    if (!branchBase && fallback) setBranchBase(fallback);
+    const remoteMain =
+      branchOptions.find((branch) => branch.name === "origin/main")?.name ??
+      branchOptions.find((branch) => branch.name === "main")?.name ??
+      fallback;
+    if (!mergeTarget && remoteMain) setMergeTarget(remoteMain);
+    if (!rebaseTarget && remoteMain) setRebaseTarget(remoteMain);
+  }, [branchBase, branchOptions, mergeTarget, rebaseTarget]);
+
+  const createFromBase = async () => {
+    const name = newBranch.trim();
+    if (!name || !branchBase) return;
+    const ok = await runCommand(`git checkout -b ${name} ${branchBase}`, () =>
+      ipc.gitCreateBranchFrom(root, name, branchBase, true),
+    );
+    if (ok) {
+      setNewBranch("");
+      await loadBranches();
+    }
+  };
+
+  const startMerge = async () => {
+    if (!mergeTarget) return;
+    const ok = await confirm({
+      title: `Merge ${mergeTarget}?`,
+      body: "Pointer will run git merge and then show conflicts here if Git stops for resolution.",
+      confirmLabel: "Merge",
+      cancelLabel: "Cancel",
+    });
+    if (!ok) return;
+    await runCommand(`git merge ${mergeTarget}`, () =>
+      ipc.gitMerge(root, mergeTarget),
+    );
+  };
+
+  const startRebase = async () => {
+    if (!rebaseTarget) return;
+    const ok = await confirm({
+      title: `Rebase onto ${rebaseTarget}?`,
+      body: "Pointer will run git rebase and then show each blocked step here. You can abort from the same panel while the rebase is active.",
+      confirmLabel: "Rebase",
+      cancelLabel: "Cancel",
+    });
+    if (!ok) return;
+    await runCommand(`git rebase ${rebaseTarget}`, () =>
+      ipc.gitRebase(root, rebaseTarget),
+    );
+  };
+
+  if (statusOperation) {
+    return (
+      <OperationCard
+        operation={statusOperation}
+        busy={busy}
+        runCommand={runCommand}
+        root={root}
+      />
+    );
+  }
+
+  return (
+    <section className="border-b border-noir-line/60 bg-noir-chrome/20">
+      <button
+        onClick={() => setExpanded((v) => !v)}
+        className="w-full px-3 py-2 flex items-center justify-between text-left"
+        aria-expanded={expanded}
+      >
+        <span className="flex items-center gap-2 text-[11px] font-sans text-noir-text">
+          <GitPullRequest size={12} className="text-noir-accent" aria-hidden="true" />
+          Git workflow
+        </span>
+        {expanded ? (
+          <ChevronDown size={12} className="text-noir-mute" aria-hidden="true" />
+        ) : (
+          <ChevronRight size={12} className="text-noir-mute" aria-hidden="true" />
+        )}
+      </button>
+      {expanded && (
+        <div className="px-3 pb-3 space-y-2">
+          <div className="grid grid-cols-[1fr_auto] gap-1.5">
+            <input
+              value={newBranch}
+              onChange={(e) => setNewBranch(e.target.value)}
+              placeholder="new branch name"
+              className="min-w-0 rounded border border-noir-line bg-noir-canvas px-2 py-1 text-[11px] outline-none focus:border-noir-accent"
+              aria-label="New branch name"
+            />
+            <button
+              onClick={createFromBase}
+              disabled={busy || !newBranch.trim() || !branchBase}
+              className="pn-icon-button px-2"
+              title="Create branch from selected base"
+              aria-label="Create branch from selected base"
+            >
+              <Plus size={12} aria-hidden="true" />
+            </button>
+          </div>
+          <LabeledSelect
+            label="from"
+            value={branchBase}
+            onChange={setBranchBase}
+            branches={branchOptions}
+          />
+          <div className="grid grid-cols-2 gap-2">
+            <WorkflowAction
+              icon={<GitMerge size={12} aria-hidden="true" />}
+              label="Merge"
+              value={mergeTarget}
+              onChange={setMergeTarget}
+              branches={branchOptions}
+              disabled={busy || !mergeTarget}
+              onRun={startMerge}
+            />
+            <WorkflowAction
+              icon={<GitPullRequest size={12} aria-hidden="true" />}
+              label="Rebase"
+              value={rebaseTarget}
+              onChange={setRebaseTarget}
+              branches={branchOptions}
+              disabled={busy || !rebaseTarget}
+              onRun={startRebase}
+            />
+          </div>
+        </div>
+      )}
+    </section>
+  );
+}
+
+function OperationCard({
+  operation,
+  busy,
+  runCommand,
+  root,
+}: {
+  operation: GitOperationState;
+  busy: boolean;
+  runCommand: GitCommandRunner;
+  root: string;
+}) {
+  const progress = operationProgress(operation);
+  const hasConflicts = operation.conflicts.length > 0;
+  const canContinue = operation.kind === "rebase" || operation.kind === "merge";
+  const continueOp = () => {
+    if (operation.kind === "rebase") {
+      return runCommand("git rebase --continue", () => ipc.gitRebaseContinue(root));
+    }
+    if (operation.kind === "merge") {
+      return runCommand("git merge --continue", () => ipc.gitMergeContinue(root));
+    }
+    return Promise.resolve(false);
+  };
+  const abortOp = async () => {
+    const ok = await confirm({
+      title: operationAbortLabel(operation),
+      body: "This asks Git to return the repository to the state before the operation began.",
+      confirmLabel: "Abort",
+      cancelLabel: "Cancel",
+    });
+    if (!ok) return;
+    if (operation.kind === "rebase") {
+      await runCommand("git rebase --abort", () => ipc.gitRebaseAbort(root));
+    } else if (operation.kind === "merge") {
+      await runCommand("git merge --abort", () => ipc.gitMergeAbort(root));
+    }
+  };
+
+  return (
+    <section className="border-b border-noir-accent/25 bg-noir-accent/5 px-3 py-3">
+      <div className="flex items-start gap-2">
+        <CircleAlert size={14} className="mt-0.5 text-noir-accent shrink-0" aria-hidden="true" />
+        <div className="min-w-0 flex-1">
+          <div className="text-[12px] font-sans font-medium text-noir-text">
+            {operation.title}
+          </div>
+          <div className="text-[10.5px] text-noir-mute">
+            {operation.head ? `${operation.head} → ` : ""}
+            {operation.target ?? operation.kind}
+            {hasConflicts
+              ? ` · ${operation.conflicts.length} conflict${operation.conflicts.length === 1 ? "" : "s"}`
+              : " · ready to continue"}
+          </div>
+          {progress !== null && (
+            <div className="mt-2 h-1.5 rounded-full bg-noir-ridge overflow-hidden">
+              <div
+                className="h-full rounded-full bg-noir-accent"
+                style={{ width: `${progress}%` }}
+              />
+            </div>
+          )}
+        </div>
+      </div>
+      {hasConflicts && (
+        <ul className="mt-2 rounded border border-noir-line/60 bg-noir-canvas/25 divide-y divide-noir-line/50">
+          {operation.conflicts.map((path) => (
+            <li key={path} className="px-2 py-1 text-[10.5px] font-mono text-noir-text truncate">
+              {path}
+            </li>
+          ))}
+        </ul>
+      )}
+      <div className="mt-2 flex items-center justify-end gap-1">
+        <button
+          onClick={() => void continueOp()}
+          disabled={busy || hasConflicts || !canContinue}
+          className="flex items-center gap-1.5 rounded bg-noir-accent/15 px-2 py-1 text-[11px] text-noir-accent hover:bg-noir-accent/25 disabled:opacity-40 disabled:cursor-not-allowed"
+          title={hasConflicts ? "Resolve conflicts and stage files first" : operationActionLabel(operation)}
+          aria-label={operationActionLabel(operation)}
+        >
+          <Play size={11} aria-hidden="true" />
+          Continue
+        </button>
+        <button
+          onClick={() => void abortOp()}
+          disabled={busy || !canContinue}
+          className="flex items-center gap-1.5 rounded border border-noir-line px-2 py-1 text-[11px] text-noir-subtext hover:border-noir-warn/60 hover:text-noir-warn disabled:opacity-40 disabled:cursor-not-allowed"
+          title={operationAbortLabel(operation)}
+          aria-label={operationAbortLabel(operation)}
+        >
+          <Undo2 size={11} aria-hidden="true" />
+          Abort
+        </button>
+      </div>
+    </section>
+  );
+}
+
+function WorkflowAction({
+  icon,
+  label,
+  value,
+  onChange,
+  branches,
+  disabled,
+  onRun,
+}: {
+  icon: React.ReactNode;
+  label: string;
+  value: string;
+  onChange: (value: string) => void;
+  branches: GitBranchT[];
+  disabled: boolean;
+  onRun: () => void;
+}) {
+  return (
+    <div className="rounded border border-noir-line/70 bg-noir-canvas/20 p-2 space-y-1.5">
+      <div className="flex items-center gap-1.5 text-[10px] uppercase tracking-wider text-noir-mute">
+        {icon}
+        {label}
+      </div>
+      <select
+        value={value}
+        onChange={(e) => onChange(e.target.value)}
+        className="w-full rounded border border-noir-line bg-noir-canvas px-1.5 py-1 text-[10.5px] outline-none focus:border-noir-accent"
+        aria-label={`${label} target`}
+      >
+        {branches.map((branch) => (
+          <option key={`${label}:${branch.name}`} value={branch.name}>
+            {branch.remote ? "remote · " : ""}
+            {branch.name}
+          </option>
+        ))}
+      </select>
+      <button
+        onClick={onRun}
+        disabled={disabled}
+        className="w-full rounded bg-noir-ridge/60 px-2 py-1 text-[10.5px] text-noir-subtext hover:bg-noir-accent/15 hover:text-noir-accent disabled:opacity-40 disabled:cursor-not-allowed"
+      >
+        Run {label.toLowerCase()}
+      </button>
+    </div>
+  );
+}
+
+function LabeledSelect({
+  label,
+  value,
+  onChange,
+  branches,
+}: {
+  label: string;
+  value: string;
+  onChange: (value: string) => void;
+  branches: GitBranchT[];
+}) {
+  return (
+    <label className="grid grid-cols-[auto_1fr] items-center gap-1.5 text-[10px] text-noir-mute">
+      <span className="uppercase tracking-wider">{label}</span>
+      <select
+        value={value}
+        onChange={(e) => onChange(e.target.value)}
+        className="min-w-0 rounded border border-noir-line bg-noir-canvas px-1.5 py-1 text-[10.5px] text-noir-text outline-none focus:border-noir-accent"
+      >
+        {branches.map((branch) => (
+          <option key={`base:${branch.name}`} value={branch.name}>
+            {branch.remote ? "remote · " : ""}
+            {branch.name}
+          </option>
+        ))}
+      </select>
+    </label>
   );
 }
 
@@ -606,31 +1167,43 @@ function BranchPicker({
             + Create branch “{q.trim()}”
           </button>
         )}
-        {filtered.map((b) => (
-          <button
-            key={b.name}
-            onClick={() => onSelect(b.name)}
-            className="w-full text-left px-3 py-1 flex items-center justify-between gap-2 hover:bg-noir-ridge/40 text-[12px]"
-            role="option"
-            aria-selected={b.current}
-            aria-label={b.current ? `${b.name} (current)` : `Switch to ${b.name}`}
-          >
-            <span className="flex items-center gap-2 min-w-0">
-              <Check
-                size={10}
-                className={b.current ? "text-noir-accent" : "opacity-0"}
-                aria-hidden="true"
-              />
-              <span className="truncate">{b.name}</span>
-            </span>
-            <span className="text-[10px] text-noir-mute shrink-0">
-              {b.last_commit}
-            </span>
-          </button>
-        ))}
+        {(["local", "remote"] as const).map((kind) => {
+          const grouped = groupBranches(filtered);
+          const rows = kind === "local" ? grouped.local : grouped.remote;
+          if (rows.length === 0) return null;
+          return (
+            <div key={kind}>
+              <div className="px-3 py-1 text-[9px] uppercase tracking-wider text-noir-mute bg-noir-chrome/40">
+                {kind === "local" ? "Local" : "Remote"}
+              </div>
+              {rows.map((b) => (
+                <button
+                  key={b.name}
+                  onClick={() => onSelect(b.name)}
+                  className="w-full text-left px-3 py-1 flex items-center justify-between gap-2 hover:bg-noir-ridge/40 text-[12px]"
+                  role="option"
+                  aria-selected={b.current}
+                  aria-label={b.current ? `${b.name} (current)` : `Switch to ${b.name}`}
+                >
+                  <span className="flex items-center gap-2 min-w-0">
+                    <Check
+                      size={10}
+                      className={b.current ? "text-noir-accent" : "opacity-0"}
+                      aria-hidden="true"
+                    />
+                    <span className="truncate">{b.name}</span>
+                  </span>
+                  <span className="text-[10px] text-noir-mute shrink-0">
+                    {b.remote ? "remote" : b.last_commit}
+                  </span>
+                </button>
+              ))}
+            </div>
+          );
+        })}
       </div>
       <div className="px-3 py-1 text-[10px] text-noir-mute border-t border-noir-line/60">
-        Enter to checkout · Type a new name then Enter to create
+        Enter to checkout · Use Git workflow to create from a base
       </div>
     </div>
   );

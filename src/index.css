@@ -6,14 +6,18 @@
   :root {
     color-scheme: dark;
     --pn-canvas: #0a0a0c;
-    --pn-panel: #101014;
-    --pn-chrome: #15151b;
-    --pn-ridge: #1d1d26;
-    --pn-line: #26262f;
+    --pn-panel: #0f0f13;
+    --pn-chrome: #121218;
+    --pn-ridge: #191920;
+    --pn-line: #22222b;
     --pn-text: #e8e8f2;
-    --pn-subtext: #a9a9bd;
-    --pn-mute: #6b6b7b;
+    --pn-subtext: #b6b6c7;
+    --pn-mute: #7a7a8b;
     --pn-accent: #ff2d7e;
+    --pn-accent-hot: #ff4f9a;
+    --pn-accent-soft: #ff9ac3;
+    --pn-accent-deep: #7b123f;
+    --pn-cyan: #77d8ff;
     --pn-ok: #7cf0bd;
     --pn-warn: #ffd480;
     --pn-err: #ff6f91;
@@ -34,6 +38,10 @@
     --pn-subtext: #4d4d5b;
     --pn-mute: #7f7f8d;
     --pn-accent: #d92a6e;
+    --pn-accent-hot: #f0448b;
+    --pn-accent-soft: #ff9ec7;
+    --pn-accent-deep: #8f164a;
+    --pn-cyan: #0977a5;
     --pn-ok: #1d9d5f;
     --pn-warn: #ad7900;
     --pn-err: #c8233b;
@@ -50,6 +58,9 @@
   }
 
   body {
+    background: #070708;
+    font-family: "Inter", ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont,
+      "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
     font-feature-settings: "ss01", "ss02", "calt", "liga";
     text-rendering: optimizeLegibility;
     -webkit-font-smoothing: antialiased;
@@ -121,9 +132,9 @@
 
   /* Vibrancy/transparency on macOS — body keeps a subtle base. */
   .pn-glass {
-    background: linear-gradient(180deg, rgba(16, 16, 20, 0.86), rgba(10, 10, 12, 0.92));
-    backdrop-filter: blur(18px) saturate(140%);
-    -webkit-backdrop-filter: blur(18px) saturate(140%);
+    background: rgba(13, 13, 17, 0.92);
+    backdrop-filter: blur(16px) saturate(125%);
+    -webkit-backdrop-filter: blur(16px) saturate(125%);
   }
 
   .pn-noise::before {
@@ -132,20 +143,102 @@
     inset: 0;
     pointer-events: none;
     background-image: url("data:image/svg+xml,%3Csvg viewBox='0 0 200 200' xmlns='http://www.w3.org/2000/svg'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='0.85' numOctaves='2' stitchTiles='stitch'/%3E%3CfeColorMatrix values='0 0 0 0 1 0 0 0 0 1 0 0 0 0 1 0 0 0 0.06 0'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23n)'/%3E%3C/svg%3E");
-    opacity: 0.6;
+    opacity: 0.18;
     mix-blend-mode: overlay;
+  }
+
+  .pn-app-shell {
+    background:
+      linear-gradient(180deg, rgba(255, 255, 255, 0.018), transparent 28px),
+      #08080b;
+    box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.04);
+  }
+
+  .pn-titlebar {
+    position: relative;
+    background: rgba(13, 13, 17, 0.94);
+    border-bottom: 1px solid color-mix(in srgb, var(--pn-line) 90%, var(--pn-accent) 10%);
+    box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.045);
+  }
+
+  .pn-brand-mark {
+    background: #050507;
+    box-shadow:
+      0 0 0 1px rgba(255, 45, 126, 0.22),
+      0 1px 2px rgba(0, 0, 0, 0.45);
+    filter: saturate(1.08) contrast(1.03);
+  }
+
+  .pn-brand-logo {
+    mix-blend-mode: screen;
+    filter:
+      contrast(1.08)
+      saturate(1.12)
+      drop-shadow(0 0 10px rgba(255, 45, 126, 0.28));
+  }
+
+  .pn-welcome-surface {
+    background:
+      linear-gradient(180deg, rgba(255, 45, 126, 0.035), transparent 260px),
+      linear-gradient(180deg, rgba(255, 255, 255, 0.018), transparent 40px),
+      var(--pn-canvas);
+  }
+
+  .pn-welcome-surface::before {
+    content: none;
+  }
+
+  .pn-premium-panel {
+    background:
+      linear-gradient(180deg, rgba(20, 20, 25, 0.9), rgba(13, 13, 17, 0.94)),
+      var(--pn-panel);
+    border: 1px solid color-mix(in srgb, var(--pn-line) 88%, var(--pn-accent) 12%);
+    box-shadow:
+      inset 0 1px 0 rgba(255, 255, 255, 0.04),
+      0 18px 44px -36px rgba(0, 0, 0, 0.9);
+  }
+
+  .pn-soft-panel {
+    background:
+      linear-gradient(180deg, rgba(19, 19, 24, 0.9), rgba(12, 12, 15, 0.94)),
+      rgba(16, 16, 20, 0.88);
+    border-color: color-mix(in srgb, var(--pn-line) 90%, var(--pn-accent) 10%);
+    box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.035);
+  }
+
+  .pn-welcome-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(min(100%, 320px), 1fr));
   }
 }
 
 @layer components {
   .pn-button {
-    @apply px-3 py-1.5 rounded-md bg-noir-ridge text-noir-text text-xs font-medium hover:bg-noir-line transition-colors disabled:opacity-40 disabled:cursor-not-allowed disabled:hover:bg-noir-ridge;
+    @apply px-3 py-1.5 rounded-md border border-noir-line text-noir-text text-xs font-medium transition-colors disabled:opacity-40 disabled:cursor-not-allowed;
+    background: color-mix(in srgb, var(--pn-ridge) 70%, transparent);
+  }
+  .pn-button:hover {
+    background: var(--pn-line);
+  }
+  .pn-button:disabled:hover {
+    background: color-mix(in srgb, var(--pn-ridge) 70%, transparent);
+  }
+  .pn-icon-button {
+    @apply inline-flex h-6 w-6 items-center justify-center rounded border border-noir-line text-noir-subtext transition-colors disabled:opacity-35 disabled:cursor-not-allowed;
+    background: color-mix(in srgb, var(--pn-ridge) 70%, transparent);
+  }
+  .pn-icon-button:hover:not(:disabled) {
+    color: var(--pn-text);
+    border-color: color-mix(in srgb, var(--pn-line) 72%, var(--pn-accent) 28%);
+    background: color-mix(in srgb, var(--pn-ridge) 76%, var(--pn-accent) 10%);
   }
   .pn-button-accent {
     @apply px-3 py-1.5 rounded-md text-xs font-medium transition-all;
-    background: linear-gradient(180deg, #ff408a, #e51a6c);
+    background: linear-gradient(180deg, #ff3d8b, #e71e70);
     color: white;
-    box-shadow: 0 6px 16px -8px rgba(255, 45, 126, 0.6);
+    box-shadow:
+      inset 0 1px 0 rgba(255, 255, 255, 0.18),
+      0 6px 16px -12px rgba(255, 45, 126, 0.72);
   }
   .pn-button-accent:disabled {
     background: #2a2a36;
@@ -179,7 +272,7 @@
    the main reading surface. */
 .pn-md {
   color: var(--pn-text);
-  font-family: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial;
+  font-family: "Inter", ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial;
   font-size: 14px;
   line-height: 1.6;
 }
@@ -263,6 +356,34 @@
       transparent 42%);
   margin-left: 4px;
   width: 12px !important;
+}
+
+/* Debugger breakpoint glyphs. A click in Monaco's glyph/line-number
+   margin toggles these; the same breakpoint can be dragged or sent
+   into Ask / Plan / Agent as model context. */
+.pn-breakpoint-glyph {
+  position: relative;
+  width: 14px !important;
+  margin-left: 2px;
+}
+.pn-breakpoint-glyph::before {
+  content: "";
+  position: absolute;
+  left: 2px;
+  top: 50%;
+  width: 9px;
+  height: 9px;
+  border-radius: 999px;
+  transform: translateY(-50%);
+  background: linear-gradient(180deg, var(--pn-err), var(--pn-accent));
+  box-shadow:
+    0 0 0 1px rgba(255, 255, 255, 0.08),
+    0 0 12px rgba(255, 45, 126, 0.45);
+}
+.pn-breakpoint-disabled::before {
+  background: var(--pn-mute);
+  box-shadow: 0 0 0 1px rgba(255, 255, 255, 0.05);
+  opacity: 0.6;
 }
 
 /* GitLens-style trailing blame on the cursor line. Kept faint so
@@ -373,7 +494,7 @@
 .pn-mention-input,
 .pn-mention-mirror,
 .pn-mention-textarea {
-  font-family: ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont,
+  font-family: "Inter", ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont,
     "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
   font-size: 13px;
   line-height: 1.45;

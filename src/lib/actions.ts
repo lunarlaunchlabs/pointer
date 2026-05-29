@@ -70,6 +70,9 @@ export type ActionId =
   | "editor:next_problem"
   | "editor:prev_problem"
   | "diagnostics:run_project_check"
+  // debug
+  | "debug:show_panel"
+  | "debug:toggle_breakpoint"
   // tabs
   | "tabs:reopen_closed"
   | "tabs:close_others"

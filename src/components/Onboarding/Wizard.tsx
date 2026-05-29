@@ -49,12 +49,16 @@ export function Onboarding({ onDone }: { onDone: () => void }) {
         role="dialog"
         aria-modal="true"
         aria-labelledby="onboarding-title"
-        className="w-[640px] max-w-[92vw] rounded-2xl border border-noir-line bg-noir-panel shadow-soft overflow-hidden"
+        className="pn-premium-panel w-[640px] max-w-[92vw] rounded-lg shadow-soft overflow-hidden"
       >
-        <header className="px-5 py-4 border-b border-noir-line flex items-center gap-3">
-          <span className="text-noir-accent text-xl leading-none" aria-hidden="true">
-            ▸
-          </span>
+        <header className="px-5 py-4 border-b border-noir-line/70 flex items-center gap-3">
+          <img
+            src="/brand/pointer-mark.png"
+            alt=""
+            draggable={false}
+            className="pn-brand-mark h-5 w-5 rounded-md object-cover"
+            aria-hidden="true"
+          />
           <h2
             id="onboarding-title"
             className="font-sans text-[14px] text-noir-text"
@@ -85,7 +89,7 @@ export function Onboarding({ onDone }: { onDone: () => void }) {
           {step === "done" && <Done onClose={onDone} />}
         </div>
 
-        <footer className="px-5 py-3 bg-noir-chrome/60 border-t border-noir-line flex items-center justify-between gap-3">
+        <footer className="px-5 py-3 bg-noir-chrome/70 border-t border-noir-line/70 flex items-center justify-between gap-3">
           {canBack ? (
             <button
               onClick={goBack}
@@ -139,17 +143,13 @@ function Stepper({ step }: { step: Step }) {
 function Intro({ onNext }: { onNext: () => void }) {
   return (
     <div className="space-y-4">
-      <div
-        className="text-5xl"
-        style={{
-          background: "linear-gradient(135deg, #FF2D7E 0%, #FFD480 100%)",
-          WebkitBackgroundClip: "text",
-          WebkitTextFillColor: "transparent",
-          display: "inline-block",
-        }}
-      >
-        ▸
-      </div>
+      <img
+        src="/brand/pointer-logo-wide.png"
+        alt=""
+        draggable={false}
+        className="pn-brand-logo h-auto w-[min(330px,100%)] select-none"
+        aria-hidden="true"
+      />
       <h1 className="font-sans text-[20px] tracking-tight text-noir-text">
         A code editor that thinks with you.
       </h1>
@@ -522,12 +522,13 @@ function ModelsStep({
 function Done({ onClose }: { onClose: () => void }) {
   return (
     <div className="space-y-4 text-center pt-8">
-      <div className="text-4xl" style={{
-        background: "linear-gradient(135deg, #FF2D7E, #FFD480)",
-        WebkitBackgroundClip: "text",
-        WebkitTextFillColor: "transparent",
-        display: "inline-block",
-      }}>▸</div>
+      <img
+        src="/brand/pointer-mark.png"
+        alt=""
+        draggable={false}
+        className="pn-brand-mark mx-auto h-12 w-12 rounded-lg object-cover"
+        aria-hidden="true"
+      />
       <h2 className="font-sans text-[18px] text-noir-text">You&apos;re set.</h2>
       <p className="font-sans text-[12.5px] text-noir-subtext leading-relaxed max-w-md mx-auto">
         Open a folder with <span className="pn-kbd">⌘O</span>, ask in chat with{" "}

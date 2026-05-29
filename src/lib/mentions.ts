@@ -28,6 +28,8 @@ export type MentionCategory =
   | "selection"
   | "codebase"
   | "diagnostic"
+  | "breakpoint"
+  | "debug"
   | "symbol";
 
 /** Live state of the mention probe at the cursor position. */
@@ -66,13 +68,10 @@ export function probeMention(text: string, caret: number): MentionProbe {
       const prev = i === 0 ? "" : text.charAt(i - 1);
       if (i !== 0 && !/\s/.test(prev)) return { open: false };
       const query = text.slice(i + 1, caret);
+      if (!isMentionQuery(query)) return { open: false };
       return { open: true, atStart: i, atEnd: caret, query };
     }
-    // Whitespace closes any chance of an open mention.
-    if (/\s/.test(ch)) return { open: false };
-    // Disallow characters that don't appear in any meaningful mention
-    // token — keeps us from popping the picker over `foo@example.com`.
-    if (!/[\w./\-_:~]/.test(ch)) return { open: false };
+    if (ch === "\n") return { open: false };
   }
   return { open: false };
 }
@@ -125,6 +124,18 @@ export const CATEGORY_REGISTRY: {
     label: "@diagnostic",
     description: "Attach a current lint / type error.",
     aliases: ["diagnostic", "diag", "error", "lint"],
+  },
+  {
+    category: "breakpoint",
+    label: "@breakpoint",
+    description: "Attach a debugger breakpoint.",
+    aliases: ["breakpoint", "bp"],
+  },
+  {
+    category: "debug",
+    label: "@debug",
+    description: "Attach a captured debug value.",
+    aliases: ["debug", "value", "watch", "variable"],
   },
 ];
 
@@ -210,6 +221,8 @@ export function mentionToken(
     | { kind: "selection"; path: string; startLine: number; endLine: number }
     | { kind: "codebase"; query: string }
     | { kind: "symbol"; name: string }
+    | { kind: "breakpoint"; path: string; line: number }
+    | { kind: "debugValue"; name: string }
     | { kind: "diagnostic"; path: string; startLine: number; code?: string },
 ): string {
   switch (kind.kind) {
@@ -223,6 +236,10 @@ export function mentionToken(
       return `@codebase${kind.query ? `:${kind.query.replace(/\s+/g, "_")}` : ""}`;
     case "symbol":
       return `@${kind.name}`;
+    case "breakpoint":
+      return `@${shorten(kind.path)}:L${kind.line}`;
+    case "debugValue":
+      return `@debug:${kind.name.replace(/\s+/g, "_")}`;
     case "diagnostic":
       return `@${shorten(kind.path)}:L${kind.startLine}${kind.code ? `(${kind.code})` : ""}`;
   }
@@ -230,6 +247,21 @@ export function mentionToken(
 
 function shorten(p: string): string {
   return p.split(/[\\/]/).slice(-2).join("/");
+}
+
+function isMentionQuery(query: string): boolean {
+  if (query.includes("@")) return false;
+  if (!query.includes(" ")) return /^[\w./\-_:~]*$/.test(query);
+  const first = query.trimStart().split(/\s+/, 1)[0]?.toLowerCase() ?? "";
+  if (!first || !categoryForAlias(first)) return false;
+  return /^[\w./\-_:~ ][\w./\-_:~ \-]*$/.test(query);
+}
+
+function categoryForAlias(alias: string): MentionCategory | null {
+  for (const row of CATEGORY_REGISTRY) {
+    if (row.aliases.includes(alias)) return row.category;
+  }
+  return null;
 }
 
 /**

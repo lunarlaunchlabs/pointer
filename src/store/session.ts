@@ -14,7 +14,14 @@ const MAX_RECENTS = 8;
  *  legacy `"chat"` and `"agent"` views. The `init()` migration below maps
  *  old persisted values to `"assistant"` so an existing user's dock
  *  selection survives the rename. */
-export type DockView = "assistant" | "history" | "ai" | "activity" | "scm" | null;
+export type DockView =
+  | "assistant"
+  | "history"
+  | "ai"
+  | "activity"
+  | "scm"
+  | "debug"
+  | null;
 
 /** Per-file editor state we restore across sessions: where the
  *  cursor was, where the viewport was scrolled to, and any

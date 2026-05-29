@@ -400,7 +400,7 @@ describe("useAssistant mode switching + plan promotion", () => {
     expect(s.status).toBe("running");
     expect(s.messages.map((m) => m.role)).toEqual(["user", "assistant"]);
     expect(s.messages.at(-1)?.streaming).toBe(true);
-    expect(getStore().phase.kind).toBe("streaming");
+    expect(getStore().phase.kind).toBe("warming");
     expect(getStore().currentRequestId).toMatch(/^ask_/);
   });
 
@@ -477,5 +477,128 @@ describe("useAssistant mode switching + plan promotion", () => {
     const id = getStore().newSession({ mode: "plan", model: "qwen" });
     await getStore().executePlan(id);
     expect(vi.mocked(invoke)).not.toHaveBeenCalled();
+  });
+
+  it("keeps individual agent changes through the backend journal", async () => {
+    vi.mocked(invoke).mockResolvedValue(undefined);
+    const id = getStore().newSession({ mode: "agent", model: "qwen" });
+    useAssistant.setState((s) => ({
+      sessions: s.sessions.map((sess) =>
+        sess.id === id
+          ? {
+              ...sess,
+              changes: [
+                {
+                  id: "11111111-1111-1111-1111-111111111111",
+                  step: 3,
+                  kind: "modify" as const,
+                  path: "src/App.tsx",
+                  before_bytes: 10,
+                  after_bytes: 12,
+                  status: "pending" as const,
+                },
+              ],
+            }
+          : sess,
+      ),
+    }));
+
+    await getStore().keepChange(id, "11111111-1111-1111-1111-111111111111");
+
+    expect(invoke).toHaveBeenCalledWith("agent_keep_change", {
+      changeId: "11111111-1111-1111-1111-111111111111",
+    });
+    expect(
+      getStore()
+        .sessions.find((s) => s.id === id)
+        ?.changes.at(0)?.status,
+    ).toBe("kept");
+  });
+
+  it("undoes agent changes with the workspace and file metadata needed by Rust", async () => {
+    vi.mocked(invoke).mockImplementation(async (cmd) => {
+      if (cmd === "agent_undo_change") return undefined;
+      throw new Error(`unexpected ${cmd}`);
+    });
+    const id = getStore().newSession({ mode: "agent", model: "qwen" });
+    useAssistant.setState((s) => ({
+      sessions: s.sessions.map((sess) =>
+        sess.id === id
+          ? {
+              ...sess,
+              workspace: "/tmp/ws",
+              changes: [
+                {
+                  id: "22222222-2222-2222-2222-222222222222",
+                  step: 5,
+                  kind: "rename" as const,
+                  from: "src/old.ts",
+                  path: "src/new.ts",
+                  before_bytes: 0,
+                  after_bytes: 0,
+                  status: "pending" as const,
+                },
+              ],
+            }
+          : sess,
+      ),
+    }));
+
+    await getStore().undoChange(id, "22222222-2222-2222-2222-222222222222");
+
+    expect(invoke).toHaveBeenCalledWith("agent_undo_change", {
+      req: {
+        change_id: "22222222-2222-2222-2222-222222222222",
+        workspace: "/tmp/ws",
+        kind: "rename",
+        path: "src/new.ts",
+        from: "src/old.ts",
+      },
+    });
+    expect(
+      getStore()
+        .sessions.find((s) => s.id === id)
+        ?.changes.at(0)?.status,
+    ).toBe("undone");
+  });
+
+  it("purges only unresolved change snapshots when deleting a session", () => {
+    vi.mocked(invoke).mockResolvedValue(undefined);
+    const id = getStore().newSession({ mode: "agent", model: "qwen" });
+    useAssistant.setState((s) => ({
+      sessions: s.sessions.map((sess) =>
+        sess.id === id
+          ? {
+              ...sess,
+              changes: [
+                {
+                  id: "33333333-3333-3333-3333-333333333333",
+                  step: 1,
+                  kind: "modify" as const,
+                  path: "src/a.ts",
+                  before_bytes: 1,
+                  after_bytes: 2,
+                  status: "pending" as const,
+                },
+                {
+                  id: "44444444-4444-4444-4444-444444444444",
+                  step: 2,
+                  kind: "modify" as const,
+                  path: "src/b.ts",
+                  before_bytes: 2,
+                  after_bytes: 3,
+                  status: "kept" as const,
+                },
+              ],
+            }
+          : sess,
+      ),
+    }));
+
+    getStore().deleteSession(id);
+
+    expect(invoke).toHaveBeenCalledWith("agent_purge_changes", {
+      changeIds: ["33333333-3333-3333-3333-333333333333"],
+    });
   });
 });

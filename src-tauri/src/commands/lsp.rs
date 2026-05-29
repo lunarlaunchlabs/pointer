@@ -73,6 +73,20 @@ pub async fn lsp_definition(
 }
 
 #[tauri::command]
+pub async fn lsp_references(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    req: LspTextDocumentRequest,
+) -> AppResult<Vec<LspLocation>> {
+    let root = resolve_workspace_for_path(&state, &req.path)?;
+    state
+        .lsp
+        .references(app, &root, req)
+        .await
+        .map_err(AppError::Msg)
+}
+
+#[tauri::command]
 pub async fn lsp_completion(
     app: AppHandle,
     state: State<'_, AppState>,

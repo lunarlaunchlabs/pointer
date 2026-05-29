@@ -35,6 +35,7 @@ const EMPTY: GitStatus = {
   files: {},
   entries: [],
   dirty_count: 0,
+  operation: null,
   error: null,
 };
 

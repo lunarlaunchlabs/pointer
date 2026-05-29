@@ -147,23 +147,29 @@ export function Titlebar({
     <header
       data-tauri-drag-region
       onMouseDown={startDrag}
-      className="h-10 flex items-center justify-between px-4 bg-noir-chrome/80 backdrop-blur border-b border-noir-line select-none"
+      className="pn-titlebar h-11 flex items-center justify-between px-4 backdrop-blur-xl select-none"
       style={{ WebkitAppRegion: "drag" } as React.CSSProperties}
       aria-label="Title bar"
     >
       <div className="flex items-center gap-3 pl-16 min-w-0 flex-1">
-        <span className="text-noir-accent text-base leading-none shrink-0" aria-hidden="true">
-          ▸
-        </span>
-        <span className="hidden sm:inline font-sans text-[12px] text-noir-subtext shrink-0">
-          Pointer
+        <span className="inline-flex items-center gap-2 shrink-0">
+          <img
+            src="/brand/pointer-mark.png"
+            alt=""
+            draggable={false}
+            className="pn-brand-mark h-5 w-5 rounded-md object-cover"
+            aria-hidden="true"
+          />
+          <span className="hidden sm:inline font-sans text-[12px] font-medium text-noir-text">
+            Pointer
+          </span>
         </span>
         <span className="hidden sm:inline text-noir-mute shrink-0" aria-hidden="true">
           /
         </span>
         <button
           onClick={openFolder}
-          className="flex items-center gap-1.5 font-sans text-[12px] text-noir-text hover:text-noir-accent transition-colors min-w-0"
+          className="flex items-center gap-1.5 rounded-md px-1.5 py-1 font-sans text-[12px] text-noir-subtext hover:bg-noir-ridge/50 hover:text-noir-text transition-colors min-w-0"
           style={{ WebkitAppRegion: "no-drag" } as React.CSSProperties}
           title={folderName}
           aria-label={`Open folder. Current workspace: ${folderName}`}
@@ -181,8 +187,8 @@ export function Titlebar({
           onClick={onOpenAIPanel}
           className={`flex items-center gap-1.5 px-2 py-1 rounded-md border transition-colors ${
             ollamaReady
-              ? "border-noir-ok/30 bg-noir-ok/5 hover:bg-noir-ok/10"
-              : "border-noir-line bg-noir-panel hover:bg-noir-ridge"
+              ? "border-noir-ok/30 bg-noir-ok/5 hover:bg-noir-ok/10 shadow-[0_0_18px_-14px_rgba(124,240,189,0.95)]"
+              : "border-noir-line/80 bg-noir-panel/75 hover:bg-noir-ridge"
           }`}
           title={ollamaReady ? "Ollama ready — click to open AI Control Panel (⌘,)" : "Ollama offline — click to open AI Control Panel (⌘,)"}
           aria-label={`Inference runtime ${ollamaReady ? "ready" : "offline"}. Open AI Control Panel.`}
@@ -327,7 +333,7 @@ function ModelsPill({
           right: coords.right,
           maxWidth: "calc(100vw - 1rem)",
         }}
-        className="w-80 bg-noir-panel border border-noir-line rounded-md shadow-soft z-pn-titlebar-popover overflow-hidden"
+        className="pn-premium-panel w-80 rounded-md shadow-soft z-pn-titlebar-popover overflow-hidden"
       >
         <div className="px-3 py-2 border-b border-noir-line/60 flex items-center justify-between">
           <span className="text-[10.5px] text-noir-mute font-sans uppercase tracking-wider">
@@ -371,7 +377,7 @@ function ModelsPill({
         className={`flex items-center gap-1.5 px-2 py-1 rounded-md transition-colors border ${
           anyMissing || anyUnset
             ? "border-noir-warn/40 bg-noir-warn/5 hover:bg-noir-warn/10"
-            : "border-transparent hover:bg-noir-ridge"
+            : "border-noir-line/0 bg-noir-panel/40 hover:border-noir-line/70 hover:bg-noir-ridge/70"
         }`}
         title="Per-purpose model assignments"
       >
@@ -541,7 +547,7 @@ function GitBranchPill() {
     .join(" · ");
   return (
     <span
-      className="hidden md:inline-flex items-center gap-1 px-1.5 py-[1px] rounded border border-noir-line/60 bg-noir-canvas/40 text-[11px] font-mono text-noir-subtext shrink-0 min-w-0"
+      className="hidden md:inline-flex items-center gap-1 px-1.5 py-[1px] rounded border border-noir-line/70 bg-noir-canvas/40 text-[11px] font-mono text-noir-subtext shrink-0 min-w-0 shadow-[inset_0_1px_0_rgba(255,255,255,0.025)]"
       title={title}
       role="status"
       aria-label={`Git: ${title}`}

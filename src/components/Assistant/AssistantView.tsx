@@ -11,10 +11,15 @@ import { useEffect, useRef } from "react";
 import {
   AlertCircle,
   Bot,
+  Check,
   CheckCircle2,
   CircleDashed,
+  Eye,
   FileText,
+  Layers,
+  Loader2,
   Plus,
+  RotateCcw,
   Search,
   Trash2,
   Wrench,
@@ -23,6 +28,7 @@ import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import { useAssistant, type AssistantSession } from "@/store/assistant";
 import type { AssistantMode } from "@/store/assistant";
+import type { Phase } from "@/store/agentSessions";
 import {
   featureBlockReason,
   isFeatureUsable,
@@ -32,6 +38,10 @@ import {
 import { useEditorStore } from "@/store/editor";
 import { useWorkspace } from "@/store/workspace";
 import { buildContext } from "@/lib/buildContext";
+import { ipc } from "@/lib/ipc";
+import { languageFromPath } from "@/lib/lang";
+import { useDiffViewer } from "@/store/diffViewer";
+import { toast } from "@/components/Toast";
 import {
   agentActivityItems,
   visibleEventOutputs,
@@ -57,6 +67,7 @@ export function AssistantView() {
   const pendingRefs = useAssistant((s) => s.pendingRefs);
   const addRef = useAssistant((s) => s.addRef);
   const removeRef = useAssistant((s) => s.removeRef);
+  const phase = useAssistant((s) => s.phase);
 
   const chatModel = useSettings((s) => s.chatModel);
   const agentModel = useSettings((s) => s.agentModel);
@@ -90,14 +101,21 @@ export function AssistantView() {
     });
   }, [active?.messages.length, active?.events.length, active?.status]);
 
-  const buildAssistantContext = (refs: Parameters<typeof buildContext>[0]) =>
+  const buildAssistantContext = (
+    refs: Parameters<typeof buildContext>[0],
+    prompt: string,
+    mode: "ask" | "plan" | "agent",
+  ) =>
     buildContext(refs, {
-      budgetTokens: 6000,
+      budgetTokens: mode === "ask" ? 8000 : 14000,
       embedModel,
       codebaseUsable: indexUsable,
       currentFile: editor
         ? { path: editor.path, content: editor.content }
         : null,
+      userPrompt: prompt,
+      mode,
+      openTabs: useEditorStore.getState().tabs.map((t) => t.path),
     });
 
   const onSend = (text: string) => {
@@ -134,9 +152,11 @@ export function AssistantView() {
           disabled={running || !active}
         />
         {running && (
-          <span className="text-[10px] font-sans text-noir-mute ml-auto animate-pulse">
-            running…
-          </span>
+          <AssistantStatusPill
+            mode={activeMode}
+            model={active?.model ?? modelForMode(activeMode, chatModel, agentModel)}
+            phase={phase}
+          />
         )}
       </div>
       {!modeUsable && modeBlock && (
@@ -155,6 +175,14 @@ export function AssistantView() {
               <MessageRow key={m.id} role={m.role} content={m.content} />
             ))}
             <PlanCard session={active} />
+            <ChangeReviewCard session={active} />
+            {running && (
+              <AssistantActivityBanner
+                mode={active.mode}
+                model={active.model}
+                phase={phase}
+              />
+            )}
             <EventOutputs session={active} />
             <ActivityTrace session={active} />
             {active.ledger.length > 0 && <LedgerTrace session={active} />}
@@ -176,6 +204,82 @@ export function AssistantView() {
       />
     </div>
   );
+}
+
+function AssistantStatusPill({
+  mode,
+  model,
+  phase,
+}: {
+  mode: AssistantMode;
+  model: string;
+  phase: Phase;
+}) {
+  return (
+    <span
+      className="ml-auto inline-flex min-w-0 items-center gap-1.5 rounded-full border border-noir-accent/25 bg-noir-accent/10 px-2 py-0.5 text-[10px] font-sans text-noir-accent"
+      role="status"
+      aria-live="polite"
+      title={`${modeLabel(mode)} using ${model}: ${phaseLabel(phase)}`}
+    >
+      <Loader2 size={10} className="shrink-0 animate-spin" aria-hidden="true" />
+      <span className="truncate max-w-[160px]">{phaseLabel(phase)}</span>
+    </span>
+  );
+}
+
+function AssistantActivityBanner({
+  mode,
+  model,
+  phase,
+}: {
+  mode: AssistantMode;
+  model: string;
+  phase: Phase;
+}) {
+  return (
+    <div className="mx-3 my-3 rounded-md border border-noir-accent/30 bg-noir-accent/5 px-3 py-2">
+      <div className="flex items-center gap-2">
+        <span className="relative flex size-4 shrink-0 items-center justify-center">
+          <span className="absolute size-4 rounded-full bg-noir-accent/20 animate-ping" />
+          <Loader2 size={13} className="relative animate-spin text-noir-accent" aria-hidden="true" />
+        </span>
+        <div className="min-w-0">
+          <div className="text-[11px] font-sans font-medium text-noir-text">
+            {phaseLabel(phase)}
+          </div>
+          <div className="text-[10px] font-sans text-noir-mute truncate">
+            {modeLabel(mode)} · {model || "model"} is active
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function phaseLabel(phase: Phase): string {
+  switch (phase.kind) {
+    case "warming":
+      return phase.step > 0
+        ? `Starting model for step ${phase.step}`
+        : "Starting model";
+    case "streaming":
+      return phase.step > 0 ? `Writing step ${phase.step}` : "Writing response";
+    case "tool":
+      return `Running ${phase.tool}`;
+    case "awaiting_approval":
+      return `Waiting on ${phase.tool}`;
+    case "awaiting_budget_bump":
+      return "Waiting for step approval";
+    case "idle":
+      return "Ready";
+  }
+}
+
+function modeLabel(mode: AssistantMode): string {
+  if (mode === "ask") return "Ask";
+  if (mode === "plan") return "Plan";
+  return "Agent";
 }
 
 function featureForMode(mode: AssistantMode): AiFeature {
@@ -275,6 +379,138 @@ function OutputCard({ output }: { output: EventOutput }) {
       </div>
     </div>
   );
+}
+
+function ChangeReviewCard({ session }: { session: AssistantSession }) {
+  const keepChange = useAssistant((s) => s.keepChange);
+  const undoChange = useAssistant((s) => s.undoChange);
+  const keepAllChanges = useAssistant((s) => s.keepAllChanges);
+  const undoAllChanges = useAssistant((s) => s.undoAllChanges);
+  const pending = session.changes.filter((c) => c.status === "pending");
+  const resolved = session.changes.filter((c) => c.status !== "pending");
+  if (session.changes.length === 0) return null;
+
+  const busy = session.status === "running";
+  const openDiff = async (changeId: string) => {
+    const change = session.changes.find((c) => c.id === changeId);
+    if (!change) return;
+    try {
+      const diff = await ipc.agentChangeDiff(change.id);
+      if (diff.binary) {
+        toast.info("Binary diff unavailable", {
+          body: `${change.path} changed, but its snapshot is not text.`,
+        });
+        return;
+      }
+      useDiffViewer.getState().show({
+        title: `${change.path} · Agent change`,
+        language: languageFromPath(change.path),
+        original: diff.before,
+        modified: diff.after,
+        readOnly: true,
+        path: change.path,
+        source: "literal",
+      });
+    } catch (error) {
+      toast.error("Couldn't open agent diff", { body: String(error) });
+    }
+  };
+
+  return (
+    <section className="mx-3 my-3 rounded-md border border-noir-accent/35 bg-noir-accent/5 overflow-hidden">
+      <div className="px-3 py-2 border-b border-noir-accent/20 flex items-center gap-2">
+        <Layers size={12} className="text-noir-accent" aria-hidden="true" />
+        <div className="min-w-0">
+          <div className="text-[11px] font-sans font-medium text-noir-text">
+            Review agent changes
+          </div>
+          <div className="text-[10px] font-sans text-noir-mute">
+            {pending.length} pending · {resolved.length} resolved
+          </div>
+        </div>
+        <div className="ml-auto flex items-center gap-1">
+          <button
+            onClick={() => void keepAllChanges(session.id)}
+            disabled={busy || pending.length === 0}
+            className="pn-icon-button"
+            title="Keep all pending changes"
+            aria-label="Keep all pending agent changes"
+          >
+            <Check size={12} aria-hidden="true" />
+          </button>
+          <button
+            onClick={() => void undoAllChanges(session.id)}
+            disabled={busy || pending.length === 0}
+            className="pn-icon-button"
+            title="Undo all pending changes"
+            aria-label="Undo all pending agent changes"
+          >
+            <RotateCcw size={12} aria-hidden="true" />
+          </button>
+        </div>
+      </div>
+      <ul className="divide-y divide-noir-line/60">
+        {session.changes.map((change) => {
+          const pendingRow = change.status === "pending";
+          return (
+            <li key={change.id} className="px-3 py-2 flex items-center gap-2">
+              <span className={changeBadgeClass(change.status)}>
+                {change.kind}
+              </span>
+              <div className="min-w-0 flex-1">
+                <div className="font-mono text-[10.5px] text-noir-text truncate">
+                  {change.from ? `${change.from} -> ${change.path}` : change.path}
+                </div>
+                <div className="text-[10px] font-sans text-noir-mute">
+                  {formatBytes(change.before_bytes)}{" -> "}{formatBytes(change.after_bytes)}
+                  {change.status !== "pending" ? ` · ${change.status}` : ""}
+                </div>
+              </div>
+              <button
+                onClick={() => void openDiff(change.id)}
+                className="pn-icon-button"
+                title="View file diff"
+                aria-label={`View diff for ${change.path}`}
+              >
+                <Eye size={12} aria-hidden="true" />
+              </button>
+              <button
+                onClick={() => void keepChange(session.id, change.id)}
+                disabled={busy || !pendingRow}
+                className="pn-icon-button"
+                title="Keep this file change"
+                aria-label={`Keep change to ${change.path}`}
+              >
+                <Check size={12} aria-hidden="true" />
+              </button>
+              <button
+                onClick={() => void undoChange(session.id, change.id)}
+                disabled={busy || !pendingRow}
+                className="pn-icon-button"
+                title="Undo this file change"
+                aria-label={`Undo change to ${change.path}`}
+              >
+                <RotateCcw size={12} aria-hidden="true" />
+              </button>
+            </li>
+          );
+        })}
+      </ul>
+    </section>
+  );
+}
+
+function changeBadgeClass(status: "pending" | "kept" | "undone"): string {
+  const base = "shrink-0 rounded px-1.5 py-0.5 text-[9px] uppercase tracking-wide font-sans border";
+  if (status === "kept") return `${base} border-noir-ok/30 bg-noir-ok/10 text-noir-ok`;
+  if (status === "undone") return `${base} border-noir-warn/30 bg-noir-warn/10 text-noir-warn`;
+  return `${base} border-noir-accent/35 bg-noir-accent/10 text-noir-accent`;
+}
+
+function formatBytes(bytes: number): string {
+  if (bytes < 1024) return `${bytes}B`;
+  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)}KB`;
+  return `${(bytes / (1024 * 1024)).toFixed(1)}MB`;
 }
 
 function ActivityTrace({ session }: { session: AssistantSession }) {

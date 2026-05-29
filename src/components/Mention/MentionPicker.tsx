@@ -15,6 +15,7 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import {
   AlertCircle,
   Code2,
+  CircleDot,
   FileText,
   Folder,
   Search,
@@ -33,12 +34,15 @@ import { Popover } from "@/components/Popover";
 import { rankFileCandidates } from "@/lib/mentionRanker";
 import { useRecentEdits } from "@/store/recentEdits";
 import { useEditorStore } from "@/store/editor";
+import { useDebuggerStore, type Breakpoint, type DebugValue } from "@/store/debugger";
 
 export type MentionSelection =
   | { kind: "category"; category: MentionCategory; remainder: string }
   | { kind: "file"; path: string }
   | { kind: "folder"; path: string }
   | { kind: "selection" }
+  | { kind: "breakpoint"; breakpoint: Breakpoint }
+  | { kind: "debugValue"; value: DebugValue }
   | { kind: "diagnostic"; diagnostic: Diagnostic }
   | { kind: "codebase"; query: string };
 
@@ -95,6 +99,16 @@ type Row =
     }
   | {
       key: string;
+      kind: "breakpoint";
+      breakpoint: Breakpoint;
+    }
+  | {
+      key: string;
+      kind: "debugValue";
+      value: DebugValue;
+    }
+  | {
+      key: string;
       kind: "diagnostic";
       diagnostic: Diagnostic;
     }
@@ -110,6 +124,8 @@ const ICONS: Record<MentionCategory, React.ReactNode> = {
   selection: <ScrollText size={11} />,
   codebase: <Search size={11} />,
   diagnostic: <AlertCircle size={11} />,
+  breakpoint: <CircleDot size={11} />,
+  debug: <Code2 size={11} />,
   symbol: <Code2 size={11} />,
 };
 
@@ -141,6 +157,8 @@ export function MentionPicker({
     () => openTabs.map((t) => ({ path: t.path })),
     [openTabs],
   );
+  const breakpoints = useDebuggerStore((s) => s.breakpoints);
+  const debugValues = useDebuggerStore((s) => s.values);
 
   // Decide which rows to show. The query has two modes:
   //   • Empty / generic: show *all* categories (the menu state).
@@ -245,6 +263,41 @@ export function MentionPicker({
       }
     }
 
+    if (category === "breakpoint") {
+      const needle = remainder.toLowerCase();
+      const filtered = breakpoints
+        .filter((bp) => {
+          if (!needle) return true;
+          return (
+            bp.path.toLowerCase().includes(needle) ||
+            `l${bp.line}`.includes(needle) ||
+            String(bp.line).includes(needle) ||
+            (bp.condition ?? "").toLowerCase().includes(needle)
+          );
+        })
+        .slice(0, 12);
+      for (const bp of filtered) {
+        out.push({ key: `bp:${bp.id}`, kind: "breakpoint", breakpoint: bp });
+      }
+    }
+
+    if (category === "debug") {
+      const needle = remainder.toLowerCase();
+      const filtered = debugValues
+        .filter((value) => {
+          if (!needle) return true;
+          return (
+            value.name.toLowerCase().includes(needle) ||
+            value.value.toLowerCase().includes(needle) ||
+            (value.type ?? "").toLowerCase().includes(needle)
+          );
+        })
+        .slice(0, 12);
+      for (const value of filtered) {
+        out.push({ key: `dbg:${value.id}`, kind: "debugValue", value });
+      }
+    }
+
     // Codebase — when explicitly asked, surface a "search for this"
     // row that, when picked, attaches a `@codebase: …` reference.
     if (category === "codebase" && codebaseUsable) {
@@ -266,6 +319,8 @@ export function MentionPicker({
     fileCandidates,
     folderCandidates,
     diagnostics,
+    breakpoints,
+    debugValues,
     hasSelection,
     codebaseUsable,
     recentPaths,
@@ -325,6 +380,10 @@ export function MentionPicker({
     if (row.kind === "file") onPick({ kind: "file", path: row.path });
     if (row.kind === "folder") onPick({ kind: "folder", path: row.path });
     if (row.kind === "selection") onPick({ kind: "selection" });
+    if (row.kind === "breakpoint")
+      onPick({ kind: "breakpoint", breakpoint: row.breakpoint });
+    if (row.kind === "debugValue")
+      onPick({ kind: "debugValue", value: row.value });
     if (row.kind === "diagnostic")
       onPick({ kind: "diagnostic", diagnostic: row.diagnostic });
     if (row.kind === "codebase")
@@ -479,6 +538,40 @@ function RowBody({
       </>
     );
   }
+  if (row.kind === "breakpoint") {
+    const bp = row.breakpoint;
+    return (
+      <>
+        <CircleDot
+          size={11}
+          className={bp.enabled ? "text-noir-err" : "text-noir-mute"}
+        />
+        <span className="font-mono text-[11px] truncate">
+          {shorten(bp.path)}:{bp.line}
+        </span>
+        <span className="text-noir-mute text-[10.5px] truncate">
+          {bp.condition || bp.logMessage || "breakpoint"}
+        </span>
+      </>
+    );
+  }
+  if (row.kind === "debugValue") {
+    const value = row.value;
+    return (
+      <>
+        <Code2 size={11} className="text-noir-accent" />
+        <span className="font-mono text-[11px] truncate">{value.name}</span>
+        <span className="text-noir-text text-[11px] truncate flex-1">
+          {value.value}
+        </span>
+        {value.type && (
+          <span className="font-mono text-[9.5px] text-noir-mute shrink-0">
+            {value.type}
+          </span>
+        )}
+      </>
+    );
+  }
   if (row.kind === "diagnostic") {
     const d = row.diagnostic;
     return (
@@ -521,4 +614,8 @@ function RowBody({
     );
   }
   return null;
+}
+
+function shorten(p: string): string {
+  return p.split(/[\\/]/).slice(-2).join("/");
 }

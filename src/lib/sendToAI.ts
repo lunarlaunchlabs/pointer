@@ -23,6 +23,7 @@ import { useAssistant, type AssistantMode } from "@/store/assistant";
 import { useSettings } from "@/store/settings";
 import { useSession } from "@/store/session";
 import { useDiagnostics, type Diagnostic } from "@/store/diagnostics";
+import type { Breakpoint, DebugValue } from "@/store/debugger";
 import { ipc } from "@/lib/ipc";
 import { toast } from "@/components/Toast";
 
@@ -112,9 +113,47 @@ export async function sendAllDiagnosticsToAI(target: AiTarget): Promise<number> 
   return unique.length;
 }
 
+/** Stage an editor/debugger breakpoint on the chosen Assistant mode. */
+export function sendBreakpointToAI(target: AiTarget, breakpoint: Breakpoint) {
+  const ref: Reference = {
+    kind: "breakpoint",
+    path: breakpoint.path,
+    line: breakpoint.line,
+    column: breakpoint.column,
+    enabled: breakpoint.enabled,
+    condition: breakpoint.condition,
+    logMessage: breakpoint.logMessage,
+  };
+  return stage(
+    target,
+    ref,
+    `breakpoint ${shortPath(breakpoint.path)}:${breakpoint.line}`,
+  );
+}
+
+/** Stage a captured debugger/watch value on the chosen Assistant mode. */
+export function sendDebugValueToAI(target: AiTarget, value: DebugValue) {
+  const ref: Reference = {
+    kind: "debugValue",
+    name: value.name,
+    value: value.value,
+    type: value.type,
+    path: value.path,
+    line: value.line,
+    scope: value.scope,
+    frame: value.frame,
+    thread: value.thread,
+  };
+  return stage(target, ref, `debug value ${value.name}`);
+}
+
 // ──────────────────────────────────────────────────────────────────────
 // Internal: route the ref to the right store + dock view + toast.
 // ──────────────────────────────────────────────────────────────────────
+
+export function sendReferenceToAI(target: AiTarget, ref: Reference, what = ref.kind) {
+  return stage(target, ref, what);
+}
 
 function stage(target: AiTarget, ref: Reference, what: string) {
   const mode = normaliseTarget(target);
@@ -146,4 +185,8 @@ function lineRange(src: string, startLine: number, endLine: number): string {
   const from = Math.max(0, startLine - 1);
   const to = Math.min(lines.length, endLine);
   return lines.slice(from, to).join("\n");
+}
+
+function shortPath(path: string): string {
+  return path.split(/[\\/]/).slice(-2).join("/");
 }

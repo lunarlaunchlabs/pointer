@@ -144,7 +144,8 @@ function quietSuccessfulResult(tool: string): boolean {
     tool === "glob" ||
     tool === "grep" ||
     tool === "search_codebase" ||
-    tool === "list_code_definition_names"
+    tool === "list_code_definition_names" ||
+    tool === "agent_change"
   );
 }
 

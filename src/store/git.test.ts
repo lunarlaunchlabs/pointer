@@ -28,6 +28,7 @@ function reset() {
       },
       entries: [],
       dirty_count: 3,
+      operation: null,
       error: null,
     },
     workspace: "/Users/test/proj",

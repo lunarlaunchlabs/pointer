@@ -1,3 +1,5 @@
+#![recursion_limit = "512"]
+
 mod commands;
 mod error;
 mod menu;
@@ -64,6 +66,13 @@ pub fn run() {
             commands::git::git_branches,
             commands::git::git_checkout,
             commands::git::git_create_branch,
+            commands::git::git_create_branch_from,
+            commands::git::git_merge,
+            commands::git::git_merge_continue,
+            commands::git::git_merge_abort,
+            commands::git::git_rebase,
+            commands::git::git_rebase_continue,
+            commands::git::git_rebase_abort,
             commands::git::git_diff,
             commands::git::git_show_file,
             commands::git::git_blame_file,
@@ -112,6 +121,7 @@ pub fn run() {
             commands::lsp::lsp_did_change,
             commands::lsp::lsp_hover,
             commands::lsp::lsp_definition,
+            commands::lsp::lsp_references,
             commands::lsp::lsp_completion,
             commands::lsp::lsp_completion_resolve,
             commands::lsp::lsp_document_symbols,

@@ -268,6 +268,13 @@ export function CommandPalette({
                 }
               />
               <Item
+                label="Toggle Breakpoint"
+                shortcut="F9"
+                onSelect={() =>
+                  run("breakpoint", () => dispatchAction("debug:toggle_breakpoint"))
+                }
+              />
+              <Item
                 label="Replace in Files"
                 onSelect={() =>
                   run("replace", () => dispatchAction("edit:replace_in_files"))
@@ -634,6 +641,12 @@ export function CommandPalette({
                 label="Show History"
                 onSelect={() =>
                   run("history", () => dispatchAction("ai:show_history"))
+                }
+              />
+              <Item
+                label="Show Debug Panel"
+                onSelect={() =>
+                  run("debug", () => dispatchAction("debug:show_panel"))
                 }
               />
               <Item

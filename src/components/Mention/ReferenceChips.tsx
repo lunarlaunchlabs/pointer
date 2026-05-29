@@ -10,6 +10,8 @@
 import {
   AlertCircle,
   AlertTriangle,
+  CircleDot,
+  Code2,
   FileText,
   Folder,
   Image as ImageIcon,
@@ -161,6 +163,36 @@ function chipMeta(r: Reference): {
           : r.severity === "warning"
           ? "bg-noir-warn/10 text-noir-text border-noir-warn/30"
           : "bg-noir-ridge/60 text-noir-text border-noir-line",
+    };
+  }
+  if (r.kind === "breakpoint") {
+    return {
+      icon: (
+        <CircleDot
+          size={11}
+          className={r.enabled ? "text-noir-err" : "text-noir-mute"}
+        />
+      ),
+      label: shorten(r.path),
+      detail: `L${r.line}`,
+      tooltip:
+        `${r.enabled ? "Breakpoint" : "Disabled breakpoint"} in ${r.path}:${r.line}` +
+        (r.condition ? `\nCondition: ${r.condition}` : "") +
+        (r.logMessage ? `\nLog: ${r.logMessage}` : ""),
+      cls: "bg-noir-err/10 text-noir-text border-noir-err/30",
+    };
+  }
+  if (r.kind === "debugValue") {
+    return {
+      icon: <Code2 size={11} className="text-noir-accent" />,
+      label: r.name,
+      detail: r.type,
+      tooltip:
+        `Debug value: ${r.name}` +
+        (r.type ? ` (${r.type})` : "") +
+        (r.path ? `\n${r.path}${r.line ? `:${r.line}` : ""}` : "") +
+        `\n${r.value}`,
+      cls: "bg-noir-accent/10 text-noir-text border-noir-accent/30",
     };
   }
   if (r.kind === "processed") {

@@ -281,6 +281,31 @@ impl LspManager {
         Ok(parse_locations(&result))
     }
 
+    pub async fn references(
+        &self,
+        app: AppHandle,
+        root: &Path,
+        req: LspTextDocumentRequest,
+    ) -> Result<Vec<LspLocation>, String> {
+        let Some(client) = self.ensure_client(app, root, &req.language).await? else {
+            return Ok(vec![]);
+        };
+        client
+            .sync_document(&req.path, &req.language, &req.content)
+            .await?;
+        let result = client
+            .request(
+                "textDocument/references",
+                json!({
+                    "textDocument": { "uri": file_uri(Path::new(&req.path)) },
+                    "position": lsp_position(req.line, req.column),
+                    "context": { "includeDeclaration": true },
+                }),
+            )
+            .await?;
+        Ok(parse_locations(&result))
+    }
+
     pub async fn completion(
         &self,
         app: AppHandle,
@@ -641,6 +666,7 @@ impl LspClient {
                             "synchronization": { "didSave": true, "dynamicRegistration": false },
                             "hover": { "contentFormat": ["markdown", "plaintext"] },
                             "definition": { "linkSupport": true },
+                            "references": { "dynamicRegistration": false },
                             "completion": {
                                 "contextSupport": true,
                                 "completionItem": {
@@ -1093,10 +1119,10 @@ fn status_for_language(root: &Path, language: &str, running: bool) -> LanguageSe
             language: normal.into(),
             label: "Monaco worker".into(),
             status: "monaco".into(),
-            detail: "Using Monaco's built-in worker for syntax, diagnostics, hover, completion, and definitions where supported.".into(),
+            detail: "Using Monaco's built-in worker for syntax, diagnostics, hover, completion, definitions, and references where supported.".into(),
             command: None,
             source: "bundled".into(),
-            capabilities: vec!["syntax".into(), "hover".into(), "completion".into(), "definition".into(), "diagnostics".into()],
+            capabilities: vec!["syntax".into(), "hover".into(), "completion".into(), "definition".into(), "references".into(), "diagnostics".into()],
         },
         "vue" => LanguageServerStatus {
             language: normal.into(),
@@ -1151,6 +1177,7 @@ fn external_spec_for(root: &Path, language: &str) -> Option<ExternalSpec> {
             capabilities: caps(&[
                 "hover",
                 "definition",
+                "references",
                 "completion",
                 "diagnostics",
                 "symbols",
@@ -1166,6 +1193,7 @@ fn external_spec_for(root: &Path, language: &str) -> Option<ExternalSpec> {
                 capabilities: caps(&[
                     "hover",
                     "definition",
+                    "references",
                     "completion",
                     "diagnostics",
                     "symbols",
@@ -1187,6 +1215,7 @@ fn external_spec_for(root: &Path, language: &str) -> Option<ExternalSpec> {
             capabilities: caps(&[
                 "hover",
                 "definition",
+                "references",
                 "completion",
                 "diagnostics",
                 "symbols",
@@ -1241,6 +1270,7 @@ fn external_spec_for(root: &Path, language: &str) -> Option<ExternalSpec> {
             capabilities: caps(&[
                 "hover",
                 "definition",
+                "references",
                 "completion",
                 "diagnostics",
                 "symbols",
@@ -1263,6 +1293,7 @@ fn external_spec_for(root: &Path, language: &str) -> Option<ExternalSpec> {
             capabilities: caps(&[
                 "hover",
                 "definition",
+                "references",
                 "completion",
                 "diagnostics",
                 "symbols",
@@ -1277,6 +1308,7 @@ fn external_spec_for(root: &Path, language: &str) -> Option<ExternalSpec> {
             capabilities: caps(&[
                 "hover",
                 "definition",
+                "references",
                 "completion",
                 "diagnostics",
                 "symbols",
@@ -1291,6 +1323,7 @@ fn external_spec_for(root: &Path, language: &str) -> Option<ExternalSpec> {
             capabilities: caps(&[
                 "hover",
                 "definition",
+                "references",
                 "completion",
                 "diagnostics",
                 "symbols",
@@ -1306,6 +1339,7 @@ fn external_spec_for(root: &Path, language: &str) -> Option<ExternalSpec> {
                 capabilities: caps(&[
                     "hover",
                     "definition",
+                    "references",
                     "completion",
                     "diagnostics",
                     "symbols",
@@ -1321,6 +1355,7 @@ fn external_spec_for(root: &Path, language: &str) -> Option<ExternalSpec> {
                     capabilities: caps(&[
                         "hover",
                         "definition",
+                        "references",
                         "completion",
                         "diagnostics",
                         "symbols",
@@ -1336,6 +1371,7 @@ fn external_spec_for(root: &Path, language: &str) -> Option<ExternalSpec> {
             capabilities: caps(&[
                 "hover",
                 "definition",
+                "references",
                 "completion",
                 "diagnostics",
                 "symbols",
@@ -1350,6 +1386,7 @@ fn external_spec_for(root: &Path, language: &str) -> Option<ExternalSpec> {
             capabilities: caps(&[
                 "hover",
                 "definition",
+                "references",
                 "completion",
                 "diagnostics",
                 "symbols",
@@ -1364,6 +1401,7 @@ fn external_spec_for(root: &Path, language: &str) -> Option<ExternalSpec> {
             capabilities: caps(&[
                 "hover",
                 "definition",
+                "references",
                 "completion",
                 "diagnostics",
                 "symbols",
@@ -2095,6 +2133,21 @@ mod tests {
         assert_eq!(locs[0].path, "/tmp/a b.rs");
         assert_eq!(locs[0].line, 5);
         assert_eq!(locs[1].column, 4);
+    }
+
+    #[test]
+    fn semantic_servers_advertise_references() {
+        let dir = tempfile::tempdir().unwrap();
+        let bin_dir = dir.path().join("node_modules/.bin");
+        std::fs::create_dir_all(&bin_dir).unwrap();
+        std::fs::write(bin_dir.join("typescript-language-server"), "").unwrap();
+        let status = status_for_language(dir.path(), "typescript", false);
+        assert!(status.capabilities.contains(&"definition".to_string()));
+        assert!(status.capabilities.contains(&"references".to_string()));
+
+        let monaco = status_for_language(Path::new("/repo"), "javascript", false);
+        assert_eq!(monaco.status, "monaco");
+        assert!(monaco.capabilities.contains(&"references".to_string()));
     }
 
     #[test]

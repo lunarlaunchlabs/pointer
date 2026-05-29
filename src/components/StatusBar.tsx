@@ -208,7 +208,7 @@ export function StatusBar({ onOpenMonitor }: { onOpenMonitor?: () => void } = {}
   //   • The whole bar stays 24px tall regardless of content.
   return (
     <div
-      className="h-6 px-3 flex items-center justify-between gap-3 bg-noir-chrome/80 border-t border-noir-line text-[10px] font-sans text-noir-subtext select-none"
+      className="h-6 px-3 flex items-center justify-between gap-3 bg-noir-chrome/92 border-t border-noir-line/80 text-[10px] font-sans text-noir-subtext select-none"
       role="contentinfo"
       aria-label="Status bar"
     >

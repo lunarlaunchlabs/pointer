@@ -8,11 +8,12 @@
  */
 
 import { useRef } from "react";
-import { describe, expect, it, vi } from "vitest";
-import { fireEvent, render, screen } from "@testing-library/react";
+import { beforeEach, describe, expect, it, vi } from "vitest";
+import { cleanup, fireEvent, render, screen } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { MentionPicker } from "./MentionPicker";
 import type { Diagnostic } from "@/store/diagnostics";
+import { useDebuggerStore } from "@/store/debugger";
 
 const diag = (over: Partial<Diagnostic> = {}): Diagnostic => ({
   uri: "file:///src/foo.ts",
@@ -65,6 +66,14 @@ const renderPicker = (
 };
 
 describe("MentionPicker", () => {
+  beforeEach(() => {
+    useDebuggerStore.setState({
+      hydrated: true,
+      breakpoints: [],
+      values: [],
+    });
+  });
+
   it("renders all backed categories when the query is empty", () => {
     renderPicker();
     expect(screen.getByText("@file")).toBeInTheDocument();
@@ -72,6 +81,8 @@ describe("MentionPicker", () => {
     expect(screen.getByText("@selection")).toBeInTheDocument();
     expect(screen.getByText("@codebase")).toBeInTheDocument();
     expect(screen.getByText("@diagnostic")).toBeInTheDocument();
+    expect(screen.getByText("@breakpoint")).toBeInTheDocument();
+    expect(screen.getByText("@debug")).toBeInTheDocument();
     // `@symbol` is intentionally absent until we ship a real symbol
     // provider — surfacing it would lead to an empty results list.
     expect(screen.queryByText("@symbol")).not.toBeInTheDocument();
@@ -124,6 +135,44 @@ describe("MentionPicker", () => {
     await userEvent.pointer({ keys: "[MouseLeft>]", target: row });
     expect(onPick).toHaveBeenCalledWith(
       expect.objectContaining({ kind: "diagnostic" }),
+    );
+  });
+
+  it("emits breakpoint and debug value picks", () => {
+    useDebuggerStore.setState({
+      hydrated: true,
+      breakpoints: [
+        {
+          id: "bp_1",
+          path: "src/App.tsx",
+          line: 7,
+          enabled: true,
+          createdAt: 1,
+        },
+      ],
+      values: [
+        {
+          id: "dbg_1",
+          name: "user",
+          value: "{ id: 1 }",
+          type: "User",
+          createdAt: 1,
+        },
+      ],
+    });
+    const bpPick = vi.fn();
+    renderPicker({ query: "bp", onPick: bpPick });
+    fireEvent.mouseDown(screen.getByText("src/App.tsx:7"));
+    expect(bpPick).toHaveBeenCalledWith(
+      expect.objectContaining({ kind: "breakpoint" }),
+    );
+
+    cleanup();
+    const dbgPick = vi.fn();
+    renderPicker({ query: "debug", onPick: dbgPick });
+    fireEvent.mouseDown(screen.getByText("user"));
+    expect(dbgPick).toHaveBeenCalledWith(
+      expect.objectContaining({ kind: "debugValue" }),
     );
   });
 

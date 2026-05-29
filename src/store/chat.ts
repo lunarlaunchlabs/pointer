@@ -21,7 +21,9 @@ export type ReferenceKind =
   | "codebase"
   | "symbol"
   | "diagnostic"
-  | "processed";
+  | "processed"
+  | "breakpoint"
+  | "debugValue";
 
 export type Reference =
   | { kind: "file"; path: string }
@@ -36,6 +38,26 @@ export type Reference =
     }
   | { kind: "codebase"; query: string }
   | { kind: "symbol"; path: string; name: string }
+  | {
+      kind: "breakpoint";
+      path: string;
+      line: number;
+      column?: number;
+      enabled: boolean;
+      condition?: string;
+      logMessage?: string;
+    }
+  | {
+      kind: "debugValue";
+      name: string;
+      value: string;
+      type?: string;
+      path?: string;
+      line?: number;
+      scope?: string;
+      frame?: string;
+      thread?: string;
+    }
   /**
    * A diagnostic (lint / type / parse error) lifted from Monaco markers.
    * The exact code snippet at the reported range is included so the model

@@ -2,6 +2,7 @@ import { lazy, Suspense, useEffect, useState } from "react";
 import {
   Activity,
   Bot,
+  Bug,
   ChevronLeft,
   ChevronRight,
   GitBranch,
@@ -12,6 +13,7 @@ import { useSession, type DockView } from "@/store/session";
 import { useSettings, isFeatureUsable } from "@/store/settings";
 import { useGit } from "@/store/git";
 import { useAssistant } from "@/store/assistant";
+import { useDebuggerStore } from "@/store/debugger";
 import { ipc, listenEvent, type InferenceSnapshot } from "@/lib/ipc";
 
 const AssistantView = lazy(() =>
@@ -33,6 +35,11 @@ const HistoryView = lazy(() =>
 const SourceControlPanel = lazy(() =>
   import("@/components/Git/SourceControlPanel").then((m) => ({
     default: m.SourceControlPanel,
+  })),
+);
+const DebugPanel = lazy(() =>
+  import("@/components/Debug/DebugPanel").then((m) => ({
+    default: m.DebugPanel,
   })),
 );
 
@@ -68,7 +75,7 @@ export function RightDock() {
   const chatUsable = useSettings((s) => isFeatureUsable("chat", s));
 
   return (
-    <div className="h-full flex shrink-0 border-l border-noir-line bg-noir-panel/80 backdrop-blur-xs">
+    <div className="h-full flex shrink-0 border-l border-noir-line/80 bg-noir-panel/92 backdrop-blur-xl shadow-[-1px_0_0_rgba(255,255,255,0.02)]">
       {panelOpen && (
         <PanelContainer width={chatWidth ?? 420} onResize={noteChatWidth}>
           <Suspense fallback={<DockLoading />}>
@@ -79,11 +86,12 @@ export function RightDock() {
             {dockView === "ai" && <AIPanelView />}
             {dockView === "activity" && <ModelActivityPanel />}
             {dockView === "scm" && <SourceControlPanel />}
+            {dockView === "debug" && <DebugPanel />}
           </Suspense>
         </PanelContainer>
       )}
       <nav
-        className="w-10 shrink-0 border-l border-noir-line bg-noir-panel/40 flex flex-col items-center py-2 gap-1"
+        className="w-11 shrink-0 border-l border-noir-line/70 bg-noir-canvas/45 flex flex-col items-center py-2 gap-1"
         aria-label="Right dock"
         role="tablist"
         aria-orientation="vertical"
@@ -115,6 +123,13 @@ export function RightDock() {
           badge={<DirtyBadge />}
         />
         <RailButton
+          icon={<Bug size={14} aria-hidden="true" />}
+          label="Debug"
+          active={dockView === "debug"}
+          onClick={() => select("debug")}
+          badge={<BreakpointBadge />}
+        />
+        <RailButton
           icon={<History size={14} aria-hidden="true" />}
           label="History"
           active={dockView === "history"}
@@ -129,7 +144,7 @@ export function RightDock() {
         <div className="flex-1" />
         <button
           onClick={() => setDockView(panelOpen ? null : dockView ?? "assistant")}
-          className="w-7 h-7 rounded-md text-noir-mute hover:text-noir-text hover:bg-noir-ridge/50 inline-flex items-center justify-center"
+          className="w-7 h-7 rounded-md text-noir-mute hover:text-noir-text hover:bg-noir-ridge/60 inline-flex items-center justify-center transition-colors"
           title={panelOpen ? "Collapse panel (⌘L / ⌘,)" : "Expand panel"}
           aria-label={panelOpen ? "Collapse right dock panel" : "Expand right dock panel"}
           aria-expanded={panelOpen}
@@ -143,7 +158,7 @@ export function RightDock() {
 
 function DockLoading() {
   return (
-    <div className="h-full flex items-center justify-center bg-noir-bg text-[11px] font-sans text-noir-mute">
+    <div className="h-full flex items-center justify-center bg-noir-canvas text-[11px] font-sans text-noir-mute">
       Loading…
     </div>
   );
@@ -210,10 +225,16 @@ function RailButton({
       aria-selected={active}
       className={`relative w-7 h-7 rounded-md inline-flex items-center justify-center transition-colors ${
         active
-          ? "bg-noir-accent/20 text-noir-accent"
-          : "text-noir-mute hover:text-noir-text hover:bg-noir-ridge/50"
+          ? "bg-noir-accent/16 text-noir-accent shadow-[inset_0_0_0_1px_rgba(255,45,126,0.24)]"
+          : "text-noir-mute hover:text-noir-text hover:bg-noir-ridge/60"
       } ${dim ? "opacity-45" : ""}`}
     >
+      {active && (
+        <span
+          className="absolute -left-2 top-1/2 h-4 w-0.5 -translate-y-1/2 rounded-full bg-noir-accent"
+          aria-hidden="true"
+        />
+      )}
       {icon}
       {badge}
     </button>
@@ -293,6 +314,19 @@ function DirtyBadge() {
       role="status"
     >
       {dirty > 9 ? "9+" : dirty}
+    </span>
+  );
+}
+
+function BreakpointBadge() {
+  const count = useDebuggerStore((s) => s.breakpoints.length);
+  if (count === 0) return null;
+  return (
+    <span
+      className="absolute -top-1 -right-1 min-w-[12px] h-[12px] px-1 rounded-full bg-noir-err text-[8px] font-mono text-white flex items-center justify-center"
+      aria-label={`${count} breakpoint${count === 1 ? "" : "s"}`}
+    >
+      {count > 9 ? "9+" : count}
     </span>
   );
 }

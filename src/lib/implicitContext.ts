@@ -207,6 +207,12 @@ function referenceKey(ref: Reference): string {
   if (ref.kind === "diagnostic") {
     return `diagnostic:${normalizePath(ref.path).toLowerCase()}:${ref.startLine}:${ref.startCol}:${ref.message}`;
   }
+  if (ref.kind === "breakpoint") {
+    return `breakpoint:${normalizePath(ref.path).toLowerCase()}:${ref.line}:${ref.condition ?? ""}:${ref.logMessage ?? ""}`;
+  }
+  if (ref.kind === "debugValue") {
+    return `debugValue:${ref.name}:${ref.type ?? ""}:${ref.path ? normalizePath(ref.path).toLowerCase() : ""}:${ref.line ?? ""}`;
+  }
   if (ref.kind === "codebase") return `codebase:${ref.query}`;
   return `processed:${normalizePath(ref.path).toLowerCase()}:${ref.label}`;
 }

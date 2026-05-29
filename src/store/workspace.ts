@@ -110,7 +110,18 @@ export const useWorkspace = create<State>((set, get) => ({
     const r = get().root;
     if (!r) return;
     const entries = await ipc.readWorkspaceTree(r);
-    set({ entries, childrenCache: {} });
+    const expanded = Array.from(get().expanded);
+    const nextChildren: Record<string, FsEntry[]> = {};
+    await Promise.all(
+      expanded.map(async (path) => {
+        try {
+          nextChildren[path] = await ipc.readWorkspaceTree(path);
+        } catch {
+          /* directory may have been removed while refreshing */
+        }
+      }),
+    );
+    set({ entries, childrenCache: nextChildren });
   },
   refreshDir: async (path) => {
     const r = get().root;

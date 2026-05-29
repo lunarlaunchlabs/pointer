@@ -73,6 +73,31 @@ describe("buildContext", () => {
     expect(out).toContain("console.log(foo);");
   });
 
+  it("renders breakpoint and debug-value references", async () => {
+    const out = await buildContext([
+      {
+        kind: "breakpoint",
+        path: "src/foo.ts",
+        line: 12,
+        enabled: true,
+        condition: "user == null",
+      },
+      {
+        kind: "debugValue",
+        name: "user",
+        value: "{ id: 1, name: 'Sameer' }",
+        type: "User",
+        path: "src/foo.ts",
+        line: 12,
+        scope: "locals",
+      },
+    ]);
+    expect(out).toContain('<breakpoint path="src/foo.ts" line="12" enabled="true">');
+    expect(out).toContain("condition: user == null");
+    expect(out).toContain('<debug-value name="user" type="User" path="src/foo.ts" line="12" scope="locals">');
+    expect(out).toContain("{ id: 1, name: 'Sameer' }");
+  });
+
   it("skips codebase refs when indexing is not usable", async () => {
     const out = await buildContext([{ kind: "codebase", query: "lookup" }], {
       codebaseUsable: false,
@@ -92,6 +117,161 @@ describe("buildContext", () => {
     });
     expect(out).toContain('<file path="src/x.ts">');
     expect(out).toContain("let x = 0;");
+  });
+
+  it("includes direct relative imports from the current file as neighbor context", async () => {
+    vi.mocked(invoke).mockImplementation(async (cmd, args) => {
+      if (cmd !== "read_text_file") throw new Error(`unexpected ${cmd}`);
+      if ((args as { path: string }).path === "/repo/src/Nav.jsx") {
+        return "export function Nav() { return null; }";
+      }
+      throw new Error("missing");
+    });
+
+    const out = await buildContext([], {
+      currentFile: {
+        path: "/repo/src/App.jsx",
+        content: "import { Nav } from './Nav';\nexport default function App() { return <Nav />; }",
+      },
+    });
+
+    expect(out).toContain('<file path="/repo/src/App.jsx">');
+    expect(out).toContain('<file path="/repo/src/Nav.jsx">');
+    expect(out).toContain("export function Nav()");
+    expect(out).toContain("<context-memory>");
+    expect(out).toContain("/repo/src/Nav.jsx (direct import from /repo/src/App.jsx)");
+  });
+
+  it("builds a prompt-guided context brain for plan and agent turns", async () => {
+    vi.mocked(invoke).mockImplementation(async (cmd, args) => {
+      const path = (args as { path?: string }).path;
+      if (cmd === "search_files") {
+        const query = (args as { query: string }).query;
+        if (query === "package.json") {
+          return [{ path: "/repo/package.json", name: "package.json" }];
+        }
+        if (query.includes("query.test")) {
+          return [{ path: "/repo/test/query.test.js", name: "query.test.js" }];
+        }
+        return [];
+      }
+      if (cmd === "search_text") {
+        const query = (args as { query: string }).query;
+        if (query === "query parser") {
+          return [
+            { path: "/repo/lib/query.js", line: 3, text: "exports.compile = function compileQueryParser(val) {" },
+          ];
+        }
+        if (query.includes("from './query'")) {
+          return [{ path: "/repo/lib/app.js", line: 7, text: "var compileQueryParser = require('./query');" }];
+        }
+        return [];
+      }
+      if (cmd === "read_text_file") {
+        if (path === "/repo/package.json") {
+          return JSON.stringify({ scripts: { test: "mocha --reporter spec" } });
+        }
+        if (path === "/repo/lib/query.js") {
+          return "exports.compile = function compileQueryParser(val) { return val; }";
+        }
+        if (path === "/repo/test/query.test.js") {
+          return "describe('query parser', function () { it('compiles', function () {}); });";
+        }
+      }
+      throw new Error(`unexpected ${cmd} ${path ?? ""}`);
+    });
+
+    const out = await buildContext([], {
+      mode: "plan",
+      userPrompt: "Plan how to improve the query parser validation",
+    });
+
+    expect(out).toContain('<file path="/repo/package.json">');
+    expect(out).toContain('<file path="/repo/lib/query.js">');
+    expect(out).toContain('<file path="/repo/test/query.test.js">');
+    expect(out).toContain("<brain-frontier>");
+    expect(out).toContain("intent: read-only executable planning");
+    expect(out).toContain("verification/specification candidate");
+    expect(out).toContain("<context-memory>");
+    expect(out).toContain("project manifest / verification config");
+    expect(out).toContain("prompt-guided workspace search");
+  });
+
+  it("builds an ask-mode research frontier before the model answers", async () => {
+    vi.mocked(invoke).mockImplementation(async (cmd, args) => {
+      const query = (args as { query?: string }).query ?? "";
+      const path = (args as { path?: string }).path;
+      if (cmd === "search_text") {
+        if (query === "oauth callback") {
+          return [
+            {
+              path: "/repo/server/auth/routes.py",
+              line: 12,
+              text: "def oauth_callback(request):",
+            },
+          ];
+        }
+        return [];
+      }
+      if (cmd === "read_text_file" && path === "/repo/server/auth/routes.py") {
+        return "def oauth_callback(request):\n    return exchange_code(request)\n";
+      }
+      throw new Error(`unexpected ${cmd} ${query || path || ""}`);
+    });
+
+    const out = await buildContext([], {
+      mode: "ask",
+      userPrompt: "Where is the `oauth callback` handled?",
+    });
+
+    expect(out).toContain("<brain-frontier>");
+    expect(out).toContain("intent: codebase research");
+    expect(out).toContain('<file path="/repo/server/auth/routes.py">');
+    expect(out).toContain("oauth_callback");
+  });
+
+  it("discovers verification candidates without assuming a language stack", async () => {
+    vi.mocked(invoke).mockImplementation(async (cmd, args) => {
+      const query = (args as { query?: string }).query ?? "";
+      const path = (args as { path?: string }).path;
+      if (cmd === "search_files") {
+        if (query === "Cargo.toml") {
+          return [{ path: "/repo/Cargo.toml", name: "Cargo.toml" }];
+        }
+        if (query === "tokenizer_test") {
+          return [{ path: "/repo/tests/tokenizer_test.rs", name: "tokenizer_test.rs" }];
+        }
+        return [];
+      }
+      if (cmd === "search_text") {
+        if (query === "tokenizer regression") {
+          return [{ path: "/repo/src/tokenizer.rs", line: 8, text: "pub fn tokenize(input: &str)" }];
+        }
+        return [];
+      }
+      if (cmd === "read_text_file") {
+        if (path === "/repo/Cargo.toml") {
+          return "[package]\nname = \"parser\"\n";
+        }
+        if (path === "/repo/src/tokenizer.rs") {
+          return "pub fn tokenize(input: &str) -> Vec<&str> { input.split_whitespace().collect() }";
+        }
+        if (path === "/repo/tests/tokenizer_test.rs") {
+          return "#[test]\nfn tokenizer_regression() {}";
+        }
+      }
+      throw new Error(`unexpected ${cmd} ${query || path || ""}`);
+    });
+
+    const out = await buildContext([], {
+      mode: "agent",
+      userPrompt: "Fix the tokenizer regression and verify it",
+    });
+
+    expect(out).toContain('<file path="/repo/Cargo.toml">');
+    expect(out).toContain('<file path="/repo/src/tokenizer.rs">');
+    expect(out).toContain('<file path="/repo/tests/tokenizer_test.rs">');
+    expect(out).toContain("intent: implementation with verification");
   });
 
   it("does NOT duplicate the current file when explicitly referenced", async () => {

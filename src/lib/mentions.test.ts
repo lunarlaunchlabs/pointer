@@ -37,6 +37,12 @@ describe("probeMention", () => {
     expect(r.open).toBe(false);
   });
 
+  it("stays open for category-targeted queries with spaces", () => {
+    const r = probeMention("@file App", 9);
+    expect(r.open).toBe(true);
+    if (r.open) expect(r.query).toBe("file App");
+  });
+
   it("opens for path-y queries", () => {
     const r = probeMention("see @src/foo.ts", 15);
     expect(r.open).toBe(true);
@@ -69,6 +75,17 @@ describe("intentFromQuery", () => {
     expect(intentFromQuery("diag:TS2304")).toEqual({
       category: "diagnostic",
       remainder: "TS2304",
+    });
+  });
+
+  it("recognizes debugger aliases", () => {
+    expect(intentFromQuery("bp app:12")).toEqual({
+      category: "breakpoint",
+      remainder: "app:12",
+    });
+    expect(intentFromQuery("watch user")).toEqual({
+      category: "debug",
+      remainder: "user",
     });
   });
 
@@ -153,6 +170,15 @@ describe("mentionToken", () => {
   it("encodes codebase queries by underscoring whitespace", () => {
     const t = mentionToken({ kind: "codebase", query: "rgb to hsl" });
     expect(t).toBe("@codebase:rgb_to_hsl");
+  });
+
+  it("encodes debugger references", () => {
+    expect(
+      mentionToken({ kind: "breakpoint", path: "src/foo.ts", line: 42 }),
+    ).toBe("@src/foo.ts:L42");
+    expect(mentionToken({ kind: "debugValue", name: "current user" })).toBe(
+      "@debug:current_user",
+    );
   });
 });
 

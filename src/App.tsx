@@ -116,6 +116,7 @@ import { useSession } from "@/store/session";
 import { useAssistant } from "@/store/assistant";
 import { dispatchAction, onAction, type ActionId } from "@/lib/actions";
 import { ipc, listenEvent } from "@/lib/ipc";
+import { markE2EAppReady } from "@/lib/e2eHooks";
 import { choose, useConfirm, ConfirmModalHost } from "@/components/Confirm";
 import { open as openDialog } from "@tauri-apps/plugin-dialog";
 import { open as shellOpen } from "@tauri-apps/plugin-shell";
@@ -235,6 +236,14 @@ export default function App() {
           /* persistence missing — ignore */
         }
       })();
+      void (async () => {
+        try {
+          const { useDebuggerStore } = await import("@/store/debugger");
+          await useDebuggerStore.getState().init();
+        } catch {
+          /* persistence missing — ignore */
+        }
+      })();
       // Honour the user's autostart preference: only fire the daemon when
       // they've opted in. The Ollama status poll will reflect either way.
       try {
@@ -269,6 +278,7 @@ export default function App() {
         }
       }
       if (!useSettings.getState().onboarded) setShowOnboarding(true);
+      markE2EAppReady();
     });
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
@@ -722,6 +732,23 @@ export default function App() {
           if (event.payload.type !== "drop") return;
           const paths = event.payload.paths;
           if (!paths || paths.length === 0) return;
+          if (
+            (window as unknown as { __pointerDropContext?: string })
+              .__pointerDropContext === "assistant"
+          ) {
+            const { stat } = await import("@tauri-apps/plugin-fs");
+            const assistant = useAssistant.getState();
+            for (const p of paths) {
+              try {
+                const meta = await stat(p);
+                assistant.addRef({ kind: meta.isDirectory ? "folder" : "file", path: p });
+              } catch {
+                assistant.addRef({ kind: "file", path: p });
+              }
+            }
+            noteDockView("assistant");
+            return;
+          }
           if (paths.length === 1) {
             // If it's a folder, treat as "open workspace". We
             // dynamic-import the FS plugin so this is cost-free for
@@ -864,6 +891,7 @@ export default function App() {
       }),
       onAction("ai:show_history", () => showDockView("history")),
       onAction("ai:show_ai", () => showDockView("ai")),
+      onAction("debug:show_panel", () => noteDockView("debug")),
       onAction("ai:toggle_fim", () => {
         const next = !useSettings.getState().fimEnabled;
         setFimEnabled(next);
@@ -1187,6 +1215,11 @@ export default function App() {
           `Indent: ${!s.editorInsertSpaces ? "Spaces" : "Tabs"} (${s.editorTabSize})`,
         );
       }),
+      onAction("debug:toggle_breakpoint", () => {
+        window.dispatchEvent(new CustomEvent("pointer:editor_command", {
+          detail: { id: "pointer.toggleBreakpoint" },
+        }));
+      }),
       onAction("editor:change_language", () => setShowLanguagePicker(true)),
       onAction("editor:change_eol", async () => {
         // Toggle between LF and CRLF for the active buffer. We do
@@ -1433,33 +1466,33 @@ export default function App() {
   const ready = settingsHydrated && sessionHydrated;
 
   return (
-    <div className="h-screen w-screen flex flex-col bg-noir-canvas text-noir-text overflow-hidden">
+    <div className="pn-app-shell h-screen w-screen flex flex-col bg-noir-canvas text-noir-text overflow-hidden">
       {!zenMode && <Titlebar onOpenAIPanel={() => noteDockView("ai")} />}
       <div className="flex-1 min-h-0 flex">
         {!treeCollapsed && !zenMode && (
           <aside
-            className="shrink-0 relative border-r border-noir-line bg-noir-panel/80 backdrop-blur-xs flex flex-col"
+            className="shrink-0 relative border-r border-noir-line/80 bg-noir-panel/92 backdrop-blur-xl flex flex-col shadow-[1px_0_0_rgba(255,255,255,0.02)]"
             style={{ width: fileTreeWidth ?? 256 }}
           >
             {/* Sidebar view selector — Files vs Outline. Lightweight
                 tab strip; clicking switches the pane in-place. */}
-            <div className="flex shrink-0 border-b border-noir-line/60 text-[10px] uppercase tracking-wider">
+            <div className="flex shrink-0 gap-1 border-b border-noir-line/60 bg-noir-canvas/25 p-1 text-[10px] uppercase tracking-wider">
               <button
                 onClick={() => setSidebarView("files")}
-                className={`flex-1 h-7 ${
+                className={`flex-1 h-7 rounded-md transition-colors ${
                   sidebarView === "files"
-                    ? "text-noir-text bg-noir-chrome/40"
-                    : "text-noir-mute hover:text-noir-text"
+                    ? "text-noir-text bg-noir-ridge/80 shadow-[inset_0_0_0_1px_rgba(255,255,255,0.035)]"
+                    : "text-noir-mute hover:text-noir-text hover:bg-noir-ridge/40"
                 }`}
               >
                 Files
               </button>
               <button
                 onClick={() => setSidebarView("outline")}
-                className={`flex-1 h-7 border-l border-noir-line/60 ${
+                className={`flex-1 h-7 rounded-md transition-colors ${
                   sidebarView === "outline"
-                    ? "text-noir-text bg-noir-chrome/40"
-                    : "text-noir-mute hover:text-noir-text"
+                    ? "text-noir-text bg-noir-ridge/80 shadow-[inset_0_0_0_1px_rgba(255,255,255,0.035)]"
+                    : "text-noir-mute hover:text-noir-text hover:bg-noir-ridge/40"
                 }`}
               >
                 Outline
@@ -1493,11 +1526,11 @@ export default function App() {
             />
           </aside>
         )}
-        <main className="flex-1 min-w-0 flex flex-col">
+        <main className="flex-1 min-w-0 flex flex-col bg-noir-canvas">
           {!zenMode && <Tabs />}
           {!zenMode && <Breadcrumbs />}
           <div className="flex-1 min-h-0 flex flex-col">
-            <div className="flex-1 min-h-0 relative">
+            <div className="flex-1 min-h-0 relative bg-noir-canvas">
               {root ? (
                 <Editor />
               ) : (
@@ -1637,126 +1670,126 @@ function Welcome({
 
   return (
     <main
-      className="h-full w-full flex items-center justify-center pn-noise relative"
+      className="pn-welcome-surface h-full w-full overflow-hidden relative"
       aria-label="Welcome screen"
     >
-      <div className="text-center max-w-lg px-8 w-full">
-        <div className="text-[64px] leading-none mb-5 select-none" aria-hidden="true">
-          <span
-            className="bg-clip-text text-transparent"
-            style={{
-              backgroundImage:
-                "linear-gradient(135deg, #FF2D7E 0%, #FFB3CE 60%, #FFD480 100%)",
-            }}
-          >
-            ▸
-          </span>
-        </div>
-        <h1 className="font-sans text-2xl font-medium tracking-tight text-noir-text mb-1.5">
-          Pointer
-        </h1>
-        <p className="text-[12.5px] text-noir-subtext mb-7 font-sans">
-          An AI-first code editor powered by open-source models running locally.
-        </p>
+      <div className="relative z-10 flex h-full items-center justify-center px-6 py-8">
+        <div className="pn-welcome-grid w-full max-w-5xl gap-6 items-center">
+          <section className="min-w-0 text-center xl:text-left">
+            <img
+              src="/brand/pointer-logo-wide.png"
+              alt="Pointer"
+              draggable={false}
+              className="pn-brand-logo mx-auto mb-5 h-auto w-[min(430px,100%)] select-none xl:mx-0"
+            />
+            <h1 className="sr-only">Pointer</h1>
+            <p className="mx-auto mb-7 max-w-xl font-sans text-[13px] leading-6 text-noir-subtext xl:mx-0">
+              A local-first IDE for moving quickly through real code with your editor, terminal, and AI assistant in one workspace.
+            </p>
 
-        <div className="flex gap-2 justify-center font-sans mb-6">
-          <button
-            onClick={onOpen}
-            className="pn-button-accent flex items-center gap-1.5"
-            aria-label="Open folder (Command O)"
-          >
-            <Folder size={11} aria-hidden="true" /> Open Folder
-            <kbd className="opacity-70 ml-1.5">⌘O</kbd>
-          </button>
-          <button
-            onClick={onShowAIPanel}
-            className="pn-button flex items-center gap-1.5"
-            aria-label="Open AI setup (Command Shift Comma)"
-          >
-            <Sparkles size={11} aria-hidden="true" /> AI Setup
-            <kbd className="opacity-70 ml-1.5">⌘⇧,</kbd>
-          </button>
-        </div>
-
-        {/* Setup status card. Only useful once initial onboarding ran — before
-            that, the wizard is already on screen anyway. */}
-        {ready && onboarded && (
-          <button
-            onClick={onShowAIPanel}
-            className="w-full mb-8 rounded-lg border border-noir-line bg-noir-panel/60 hover:bg-noir-panel/80 transition-colors text-left p-3 font-sans"
-            title="Open AI Control Panel"
-          >
-            <div className="flex items-center justify-between mb-2">
-              <div className="text-[10px] uppercase tracking-wider text-noir-mute">
-                Setup status
-              </div>
-              <div
-                className={`text-[10px] ${setupComplete ? "text-noir-ok" : "text-noir-warn"}`}
+            <div className="flex flex-wrap justify-center gap-2 font-sans xl:justify-start">
+              <button
+                onClick={onOpen}
+                className="pn-button-accent flex items-center gap-1.5"
+                aria-label="Open folder (Command O)"
               >
-                {setupComplete ? "Ready" : "Action needed"}
-              </div>
+                <Folder size={11} aria-hidden="true" /> Open Folder
+                <kbd className="opacity-70 ml-1.5">⌘O</kbd>
+              </button>
+              <button
+                onClick={onShowAIPanel}
+                className="pn-button flex items-center gap-1.5"
+                aria-label="Open AI setup (Command Shift Comma)"
+              >
+                <Sparkles size={11} aria-hidden="true" /> AI Setup
+                <kbd className="opacity-70 ml-1.5">⌘⇧,</kbd>
+              </button>
             </div>
-            <div className="grid grid-cols-2 gap-2 text-[11px]">
-              <SetupChip on={ollamaReady} label="Ollama" />
-              <SetupChip on={!!effectiveChat} label="Models" />
-            </div>
-          </button>
-        )}
-
-        {ready && recents.length > 0 && (
-          <section className="text-left" aria-labelledby="welcome-recents-heading">
-            <h2
-              id="welcome-recents-heading"
-              className="font-sans text-[10px] uppercase tracking-wider text-noir-mute mb-2 flex items-center gap-1.5 font-normal"
-            >
-              <Clock size={10} aria-hidden="true" /> Recent
-            </h2>
-            <ul className="rounded-md border border-noir-line bg-noir-panel/60 divide-y divide-noir-line/40">
-              {recents.map((p) => {
-                const name = p.split(/[\\/]/).pop() ?? p;
-                const parent = p.slice(0, p.length - name.length).replace(/\/+$/, "");
-                return (
-                  <li
-                    key={p}
-                    className="flex items-center justify-between group hover:bg-noir-ridge/40 transition-colors"
-                  >
-                    <button
-                      onClick={() => onOpenRecent(p)}
-                      className="flex-1 flex items-center gap-2 px-3 py-2 text-left min-w-0"
-                      title={p}
-                      aria-label={`Open ${name} at ${parent}`}
-                    >
-                      <Folder
-                        size={11}
-                        aria-hidden="true"
-                        className="text-noir-subtext shrink-0"
-                      />
-                      <div className="min-w-0">
-                        <div className="font-sans text-[12px] text-noir-text truncate">
-                          {name}
-                        </div>
-                        <div className="font-mono text-[10.5px] text-noir-mute truncate">
-                          {parent}
-                        </div>
-                      </div>
-                    </button>
-                    <button
-                      onClick={(e) => {
-                        e.stopPropagation();
-                        onRemoveRecent(p);
-                      }}
-                      className="p-2 opacity-0 group-hover:opacity-100 text-noir-mute hover:text-noir-err transition-opacity"
-                      title="Remove from recents"
-                      aria-label={`Remove ${name} from recents`}
-                    >
-                      <X size={11} aria-hidden="true" />
-                    </button>
-                  </li>
-                );
-              })}
-            </ul>
           </section>
-        )}
+
+          <section className="pn-premium-panel mx-auto w-full max-w-[380px] rounded-lg p-4 font-sans">
+            {ready && onboarded && (
+              <button
+                onClick={onShowAIPanel}
+                className="pn-soft-panel w-full rounded-md border p-3 text-left transition-colors hover:border-noir-accent/40"
+                title="Open AI Control Panel"
+              >
+                <div className="mb-2 flex items-center justify-between">
+                  <div className="text-[10px] uppercase tracking-wider text-noir-mute">
+                    Setup status
+                  </div>
+                  <div
+                    className={`text-[10px] ${setupComplete ? "text-noir-ok" : "text-noir-warn"}`}
+                  >
+                    {setupComplete ? "Ready" : "Action needed"}
+                  </div>
+                </div>
+                <div className="grid grid-cols-2 gap-2 text-[11px]">
+                  <SetupChip on={ollamaReady} label="Ollama" />
+                  <SetupChip on={!!effectiveChat} label="Models" />
+                </div>
+              </button>
+            )}
+
+            {ready && recents.length > 0 && (
+              <section
+                className={ready && onboarded ? "mt-4 text-left" : "text-left"}
+                aria-labelledby="welcome-recents-heading"
+              >
+                <h2
+                  id="welcome-recents-heading"
+                  className="mb-2 flex items-center gap-1.5 font-sans text-[10px] font-normal uppercase tracking-wider text-noir-mute"
+                >
+                  <Clock size={10} aria-hidden="true" /> Recent
+                </h2>
+                <ul className="divide-y divide-noir-line/40 overflow-hidden rounded-md border border-noir-line/80 bg-noir-canvas/40">
+                  {recents.map((p) => {
+                    const name = p.split(/[\\/]/).pop() ?? p;
+                    const parent = p.slice(0, p.length - name.length).replace(/\/+$/, "");
+                    return (
+                      <li
+                        key={p}
+                        className="group flex items-center justify-between transition-colors hover:bg-noir-ridge/40"
+                      >
+                        <button
+                          onClick={() => onOpenRecent(p)}
+                          className="flex min-w-0 flex-1 items-center gap-2 px-3 py-2 text-left"
+                          title={p}
+                          aria-label={`Open ${name} at ${parent}`}
+                        >
+                          <Folder
+                            size={11}
+                            aria-hidden="true"
+                            className="shrink-0 text-noir-subtext"
+                          />
+                          <div className="min-w-0">
+                            <div className="truncate font-sans text-[12px] text-noir-text">
+                              {name}
+                            </div>
+                            <div className="truncate font-mono text-[10.5px] text-noir-mute">
+                              {parent}
+                            </div>
+                          </div>
+                        </button>
+                        <button
+                          onClick={(e) => {
+                            e.stopPropagation();
+                            onRemoveRecent(p);
+                          }}
+                          className="p-2 text-noir-mute opacity-0 transition-opacity hover:text-noir-err group-hover:opacity-100"
+                          title="Remove from recents"
+                          aria-label={`Remove ${name} from recents`}
+                        >
+                          <X size={11} aria-hidden="true" />
+                        </button>
+                      </li>
+                    );
+                  })}
+                </ul>
+              </section>
+            )}
+          </section>
+        </div>
       </div>
     </main>
   );
@@ -1764,7 +1797,7 @@ function Welcome({
 
 function OverlayLoading({ label }: { label: string }) {
   return (
-    <div className="fixed inset-0 z-pn-modal flex items-center justify-center bg-black/45 backdrop-blur-md">
+    <div className="fixed inset-0 z-pn-modal flex items-center justify-center bg-black/40 backdrop-blur-md">
       <div className="rounded-md border border-noir-line bg-noir-panel px-3 py-2 text-[11px] font-sans text-noir-subtext shadow-soft">
         {label}…
       </div>

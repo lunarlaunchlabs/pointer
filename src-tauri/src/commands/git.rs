@@ -18,8 +18,12 @@
 
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::fs;
 use std::path::Path;
+use std::path::PathBuf;
 use std::process::Command;
+use std::thread;
+use std::time::Duration;
 
 /// One status letter per file. Mirrors `git status --porcelain` semantics
 /// distilled to the categories the UI cares about. We *don't* try to
@@ -79,10 +83,34 @@ pub struct GitStatus {
     pub entries: Vec<GitFileEntry>,
     /// Total dirty file count — saves the frontend from re-summing.
     pub dirty_count: u32,
+    /// Active repository operation, if any. Rebase/merge state lives
+    /// in `.git`, so we compute it beside status rather than asking the
+    /// frontend to scrape command output.
+    pub operation: Option<GitOperationState>,
     /// Truthy when we couldn't run git at all (binary missing, etc.).
     /// The UI uses this to silently degrade instead of showing scary
     /// errors on machines without git.
     pub error: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum GitOperationKind {
+    Rebase,
+    Merge,
+    CherryPick,
+    Revert,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct GitOperationState {
+    pub kind: GitOperationKind,
+    pub title: String,
+    pub head: Option<String>,
+    pub target: Option<String>,
+    pub current: Option<u32>,
+    pub total: Option<u32>,
+    pub conflicts: Vec<String>,
 }
 
 /// Return git status for `workspace`. Always returns a value — failure
@@ -171,6 +199,7 @@ fn compute_status(workspace: &str) -> GitStatus {
         // for an extra NUL block here.
     }
 
+    status.operation = detect_operation(workspace, &status);
     status.dirty_count = status.files.len() as u32;
     status
 }
@@ -204,11 +233,13 @@ fn parse_porcelain_line(line: &str, status: &mut GitStatus, toplevel: &str, work
         }
         '1' => {
             // Ordinary change: "1 XY <sub> <m> <m> <m> <h> <h> <path>"
-            // We just need XY and the path (last whitespace-separated token).
+            // We just need XY and the path. Split from the left only up
+            // to the documented fields so paths containing spaces stay
+            // intact in the final field.
             if let Some(rest) = line.get(2..) {
-                let mut parts = rest.splitn(9, ' ');
+                let mut parts = rest.splitn(8, ' ');
                 let xy = parts.next().unwrap_or("");
-                let path = parts.nth(7).unwrap_or("");
+                let path = parts.nth(6).unwrap_or("");
                 if !path.is_empty() {
                     insert_status(status, xy, path, toplevel, workspace);
                 }
@@ -217,11 +248,11 @@ fn parse_porcelain_line(line: &str, status: &mut GitStatus, toplevel: &str, work
         '2' => {
             // Renamed/copied: "2 XY <sub> ... <path>\t<orig>"
             if let Some(rest) = line.get(2..) {
-                let mut parts = rest.splitn(10, ' ');
+                let mut parts = rest.splitn(9, ' ');
                 let xy = parts.next().unwrap_or("");
-                // Skip 7 fields, the 9th is "<X><score>", the 10th is the
-                // path tuple separated by TAB.
-                let path_tuple = parts.nth(8).unwrap_or("");
+                // Skip through "<X><score>"; the final field is the path
+                // tuple separated by TAB. The bounded split preserves spaces.
+                let path_tuple = parts.nth(7).unwrap_or("");
                 let new_path = path_tuple.split('\t').next().unwrap_or("");
                 if !new_path.is_empty() {
                     let path = relative_to_workspace(new_path, toplevel, workspace);
@@ -309,9 +340,134 @@ fn relative_to_workspace(repo_path: &str, toplevel: &str, workspace: &str) -> St
     }
 }
 
+fn detect_operation(workspace: &str, status: &GitStatus) -> Option<GitOperationState> {
+    let conflicts: Vec<String> = status
+        .entries
+        .iter()
+        .filter(|entry| entry.status == GitFileStatus::Conflicted)
+        .map(|entry| entry.path.clone())
+        .collect();
+
+    if let Some(path) = git_path(workspace, "rebase-merge").filter(|p| p.is_dir()) {
+        return Some(read_rebase_state(&path, conflicts));
+    }
+    if let Some(path) = git_path(workspace, "rebase-apply").filter(|p| p.is_dir()) {
+        return Some(read_rebase_state(&path, conflicts));
+    }
+    if let Some(path) = git_path(workspace, "MERGE_HEAD").filter(|p| p.exists()) {
+        let target = read_first_line(&path).map(short_hash);
+        let head = git_run(workspace, &["branch", "--show-current"])
+            .ok()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty());
+        return Some(GitOperationState {
+            kind: GitOperationKind::Merge,
+            title: target
+                .as_ref()
+                .map(|t| format!("Merging {t}"))
+                .unwrap_or_else(|| "Merge in progress".into()),
+            head,
+            target,
+            current: None,
+            total: None,
+            conflicts,
+        });
+    }
+    if let Some(path) = git_path(workspace, "CHERRY_PICK_HEAD").filter(|p| p.exists()) {
+        let target = read_first_line(&path).map(short_hash);
+        return Some(GitOperationState {
+            kind: GitOperationKind::CherryPick,
+            title: target
+                .as_ref()
+                .map(|t| format!("Cherry-picking {t}"))
+                .unwrap_or_else(|| "Cherry-pick in progress".into()),
+            head: None,
+            target,
+            current: None,
+            total: None,
+            conflicts,
+        });
+    }
+    if let Some(path) = git_path(workspace, "REVERT_HEAD").filter(|p| p.exists()) {
+        let target = read_first_line(&path).map(short_hash);
+        return Some(GitOperationState {
+            kind: GitOperationKind::Revert,
+            title: target
+                .as_ref()
+                .map(|t| format!("Reverting {t}"))
+                .unwrap_or_else(|| "Revert in progress".into()),
+            head: None,
+            target,
+            current: None,
+            total: None,
+            conflicts,
+        });
+    }
+
+    None
+}
+
+fn read_rebase_state(path: &Path, conflicts: Vec<String>) -> GitOperationState {
+    let current = read_first_line(&path.join("msgnum")).and_then(|s| s.parse::<u32>().ok());
+    let total = read_first_line(&path.join("end")).and_then(|s| s.parse::<u32>().ok());
+    let head = read_first_line(&path.join("head-name")).map(clean_ref_name);
+    let target = read_first_line(&path.join("onto")).map(short_hash);
+    let progress = match (current, total) {
+        (Some(c), Some(t)) => format!("Rebase {c} of {t}"),
+        _ => "Rebase in progress".into(),
+    };
+    GitOperationState {
+        kind: GitOperationKind::Rebase,
+        title: progress,
+        head,
+        target,
+        current,
+        total,
+        conflicts,
+    }
+}
+
+fn git_path(workspace: &str, name: &str) -> Option<PathBuf> {
+    let out = git_run(workspace, &["rev-parse", "--git-path", name]).ok()?;
+    let trimmed = out.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let path = PathBuf::from(trimmed);
+    if path.is_absolute() {
+        Some(path)
+    } else {
+        Some(Path::new(workspace).join(path))
+    }
+}
+
+fn read_first_line(path: &Path) -> Option<String> {
+    fs::read_to_string(path)
+        .ok()
+        .and_then(|s| s.lines().next().map(|line| line.trim().to_string()))
+        .filter(|s| !s.is_empty())
+}
+
+fn clean_ref_name(s: String) -> String {
+    s.trim()
+        .strip_prefix("refs/heads/")
+        .unwrap_or_else(|| s.trim())
+        .to_string()
+}
+
+fn short_hash(s: String) -> String {
+    let trimmed = s.trim();
+    if trimmed.len() > 12 && trimmed.chars().all(|c| c.is_ascii_hexdigit()) {
+        trimmed.chars().take(12).collect()
+    } else {
+        trimmed.to_string()
+    }
+}
+
 fn git_run(workspace: &str, args: &[&str]) -> Result<String, String> {
     let out = Command::new("git")
         .current_dir(workspace)
+        .env("GIT_OPTIONAL_LOCKS", "0")
         .args(args)
         .output()
         .map_err(|e| format!("{e}"))?;
@@ -397,8 +553,9 @@ pub async fn git_fetch(workspace: String) -> Result<String, String> {
 #[tauri::command]
 pub async fn git_branches(workspace: String) -> Result<Vec<GitBranch>, String> {
     let out = tokio::task::spawn_blocking(move || {
-        // Format: "%(HEAD) %(refname:short) %(committerdate:relative)"
-        // %(HEAD) is "*" for the current branch.
+        // %(HEAD) is "*" for the current branch. We keep the full ref
+        // name too so the UI can distinguish local branches from
+        // remotes while still showing the short label.
         git_run(
             &workspace,
             &[
@@ -406,7 +563,7 @@ pub async fn git_branches(workspace: String) -> Result<Vec<GitBranch>, String> {
                 "--list",
                 "--all",
                 "--sort=-committerdate",
-                "--format=%(HEAD)\x1f%(refname:short)\x1f%(committerdate:relative)\x1f%(upstream:short)",
+                "--format=%(HEAD)\x1f%(refname:short)\x1f%(refname)\x1f%(committerdate:relative)\x1f%(upstream:short)",
             ],
         )
     })
@@ -418,15 +575,17 @@ pub async fn git_branches(workspace: String) -> Result<Vec<GitBranch>, String> {
         let mut parts = line.split('\x1f');
         let head = parts.next().unwrap_or("").trim();
         let name = parts.next().unwrap_or("").trim().to_string();
+        let full_ref = parts.next().unwrap_or("").trim().to_string();
         let last_commit = parts.next().unwrap_or("").trim().to_string();
         let upstream = parts.next().unwrap_or("").trim().to_string();
-        if name.is_empty() {
+        if name.is_empty() || name.ends_with("/HEAD") {
             continue;
         }
+        let remote = full_ref.starts_with("refs/remotes/");
         branches.push(GitBranch {
             name,
             current: head == "*",
-            remote: false,
+            remote,
             last_commit,
             upstream: if upstream.is_empty() {
                 None
@@ -458,6 +617,93 @@ pub async fn git_create_branch(workspace: String, branch: String) -> Result<Stri
 }
 
 #[tauri::command]
+pub async fn git_create_branch_from(
+    workspace: String,
+    branch: String,
+    base: String,
+    checkout: Option<bool>,
+) -> Result<String, String> {
+    if branch.trim().is_empty() {
+        return Err("branch name can't be empty".into());
+    }
+    if base.trim().is_empty() {
+        return Err("base branch can't be empty".into());
+    }
+    if checkout.unwrap_or(true) {
+        git_blocking(
+            workspace,
+            vec![
+                "checkout".into(),
+                "-b".into(),
+                branch.trim().into(),
+                base.trim().into(),
+            ],
+        )
+        .await
+    } else {
+        git_blocking(
+            workspace,
+            vec!["branch".into(), branch.trim().into(), base.trim().into()],
+        )
+        .await
+    }
+}
+
+#[tauri::command]
+pub async fn git_merge(workspace: String, target: String) -> Result<String, String> {
+    if target.trim().is_empty() {
+        return Err("merge target can't be empty".into());
+    }
+    git_blocking(workspace, vec!["merge".into(), target.trim().into()]).await
+}
+
+#[tauri::command]
+pub async fn git_merge_continue(workspace: String) -> Result<String, String> {
+    git_blocking(
+        workspace,
+        vec![
+            "-c".into(),
+            "core.editor=true".into(),
+            "merge".into(),
+            "--continue".into(),
+        ],
+    )
+    .await
+}
+
+#[tauri::command]
+pub async fn git_merge_abort(workspace: String) -> Result<String, String> {
+    git_blocking(workspace, vec!["merge".into(), "--abort".into()]).await
+}
+
+#[tauri::command]
+pub async fn git_rebase(workspace: String, target: String) -> Result<String, String> {
+    if target.trim().is_empty() {
+        return Err("rebase target can't be empty".into());
+    }
+    git_blocking(workspace, vec!["rebase".into(), target.trim().into()]).await
+}
+
+#[tauri::command]
+pub async fn git_rebase_continue(workspace: String) -> Result<String, String> {
+    git_blocking(
+        workspace,
+        vec![
+            "-c".into(),
+            "core.editor=true".into(),
+            "rebase".into(),
+            "--continue".into(),
+        ],
+    )
+    .await
+}
+
+#[tauri::command]
+pub async fn git_rebase_abort(workspace: String) -> Result<String, String> {
+    git_blocking(workspace, vec!["rebase".into(), "--abort".into()]).await
+}
+
+#[tauri::command]
 pub async fn git_diff(workspace: String, path: String, staged: bool) -> Result<String, String> {
     let mut args = vec!["diff".to_string(), "--no-color".to_string()];
     if staged {
@@ -465,7 +711,7 @@ pub async fn git_diff(workspace: String, path: String, staged: bool) -> Result<S
     }
     args.push("--".to_string());
     args.push(path);
-    git_blocking(workspace, args).await
+    git_blocking_readonly(workspace, args).await
 }
 
 /// Return the full contents of `path` as it exists at HEAD (the last
@@ -492,6 +738,7 @@ pub async fn git_show_file(
     let res = tokio::task::spawn_blocking(move || {
         let out = Command::new("git")
             .current_dir(&workspace_clone)
+            .env("GIT_OPTIONAL_LOCKS", "0")
             .args(["show", &spec])
             .output()
             .map_err(|e| format!("{e}"))?;
@@ -556,6 +803,7 @@ pub async fn git_blame_file(workspace: String, path: String) -> Result<Vec<GitBl
     tokio::task::spawn_blocking(move || {
         let out = Command::new("git")
             .current_dir(&workspace_clone)
+            .env("GIT_OPTIONAL_LOCKS", "0")
             .args(["blame", "--porcelain", "--", &path_clone])
             .output()
             .map_err(|e| format!("{e}"))?;
@@ -747,40 +995,163 @@ pub struct GitLogEntry {
 /// details on stderr and we don't want to swallow them.
 async fn git_blocking(workspace: String, args: Vec<String>) -> Result<String, String> {
     tokio::task::spawn_blocking(move || {
-        let out = Command::new("git")
-            .current_dir(&workspace)
-            .args(&args)
-            .output()
-            .map_err(|e| format!("{e}"))?;
-        let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
-        let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
-        if out.status.success() {
-            let mut combined = stdout;
-            if !stderr.is_empty() {
-                if !combined.is_empty() {
-                    combined.push('\n');
+        let mut last_err = String::new();
+        for attempt in 0..8 {
+            match run_git_collect(&workspace, &args, true) {
+                Ok(out) => return Ok(out),
+                Err(err) if is_git_lock_error(&err) => {
+                    if attempt >= 7 {
+                        return Err(lock_error_message(&err));
+                    }
+                    last_err = err;
+                    thread::sleep(Duration::from_millis(120 + attempt as u64 * 80));
                 }
-                combined.push_str(&stderr);
+                Err(err) => return Err(err),
             }
-            Ok(combined)
-        } else {
-            let mut msg = stderr.trim().to_string();
-            if msg.is_empty() {
-                msg = stdout.trim().to_string();
-            }
-            if msg.is_empty() {
-                msg = format!("git {:?} exited with {}", args, out.status);
-            }
-            Err(msg)
         }
+        Err(lock_error_message(&last_err))
     })
     .await
     .map_err(|e| e.to_string())?
 }
 
+/// Read-only Git calls must never contend with user writes. `git status`
+/// can otherwise refresh the index and briefly create `.git/index.lock`,
+/// which is exactly the kind of invisible IDE interference that makes
+/// command-line `git add` feel haunted.
+async fn git_blocking_readonly(workspace: String, args: Vec<String>) -> Result<String, String> {
+    tokio::task::spawn_blocking(move || run_git_collect(&workspace, &args, false))
+        .await
+        .map_err(|e| e.to_string())?
+}
+
+fn run_git_collect(
+    workspace: &str,
+    args: &[String],
+    allow_optional_locks: bool,
+) -> Result<String, String> {
+    let mut cmd = Command::new("git");
+    cmd.current_dir(workspace).args(args);
+    if !allow_optional_locks {
+        cmd.env("GIT_OPTIONAL_LOCKS", "0");
+    }
+    let out = cmd.output().map_err(|e| format!("{e}"))?;
+    let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
+    let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
+    if out.status.success() {
+        let mut combined = stdout;
+        if !stderr.is_empty() {
+            if !combined.is_empty() {
+                combined.push('\n');
+            }
+            combined.push_str(&stderr);
+        }
+        Ok(combined)
+    } else {
+        let mut msg = stderr.trim().to_string();
+        if msg.is_empty() {
+            msg = stdout.trim().to_string();
+        }
+        if msg.is_empty() {
+            msg = format!("git {:?} exited with {}", args, out.status);
+        }
+        Err(msg)
+    }
+}
+
+fn is_git_lock_error(message: &str) -> bool {
+    let lower = message.to_lowercase();
+    lower.contains("index.lock")
+        || (lower.contains("unable to create") && lower.contains(".lock"))
+        || lower.contains("another git process seems to be running")
+}
+
+fn lock_error_message(message: &str) -> String {
+    if message.trim().is_empty() {
+        "Another Git operation is still holding the repository lock. Try again once it finishes."
+            .into()
+    } else {
+        format!(
+            "{message}\n\nPointer retried because Git reported a lock. If no Git command is running, remove the stale .git/index.lock file and try again."
+        )
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parses_porcelain_v2_staged_ordinary_entries() {
+        let mut status = GitStatus {
+            is_repo: true,
+            ..Default::default()
+        };
+
+        parse_porcelain_line(
+            "1 A. N... 000000 100644 100644 0000000000000000000000000000000000000000 db417a291329c14cf46aad741635fab0ce616933 e2e/debug-and-context.spec.ts",
+            &mut status,
+            "/repo",
+            "/repo",
+        );
+        parse_porcelain_line(
+            "1 M. N... 100644 100644 100644 2156d8d6fe74a74b985475d8a5dcf5ce10ffc128 f4b610d82594685f8800abf294c1eb3f17353977 src/file with spaces.ts",
+            &mut status,
+            "/repo",
+            "/repo",
+        );
+
+        assert_eq!(status.entries.len(), 2);
+        assert_eq!(status.entries[0].path, "e2e/debug-and-context.spec.ts");
+        assert_eq!(status.entries[0].status, GitFileStatus::Added);
+        assert!(status.entries[0].staged);
+        assert!(!status.entries[0].unstaged);
+
+        assert_eq!(status.entries[1].path, "src/file with spaces.ts");
+        assert_eq!(status.entries[1].status, GitFileStatus::Modified);
+        assert!(status.entries[1].staged);
+        assert!(!status.entries[1].unstaged);
+    }
+
+    #[test]
+    fn parses_porcelain_v2_renamed_entries() {
+        let mut status = GitStatus {
+            is_repo: true,
+            ..Default::default()
+        };
+
+        parse_porcelain_line(
+            "2 R. N... 100644 100644 100644 aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb R100 src/new name.ts\tsrc/old name.ts",
+            &mut status,
+            "/repo",
+            "/repo",
+        );
+
+        assert_eq!(status.entries.len(), 1);
+        assert_eq!(status.entries[0].path, "src/new name.ts");
+        assert_eq!(status.entries[0].status, GitFileStatus::Renamed);
+        assert!(status.entries[0].staged);
+        assert!(!status.entries[0].unstaged);
+    }
+
+    #[test]
+    fn recognizes_git_lock_failures_for_retry() {
+        assert!(is_git_lock_error(
+            "fatal: Unable to create '/repo/.git/index.lock': File exists."
+        ));
+        assert!(is_git_lock_error(
+            "Another git process seems to be running in this repository"
+        ));
+        assert!(!is_git_lock_error("fatal: not a git repository"));
+    }
+
+    #[test]
+    fn lock_retry_message_explains_stale_lock_recovery() {
+        let msg =
+            lock_error_message("fatal: Unable to create '/repo/.git/index.lock': File exists.");
+        assert!(msg.contains("Pointer retried"));
+        assert!(msg.contains(".git/index.lock"));
+    }
 
     #[test]
     fn parses_porcelain_blame_with_repeated_commits() {
@@ -833,5 +1204,84 @@ filename src/lib.rs\n\
         assert!(relative_from_epoch(now - 86_400 * 3).contains("d ago"));
         assert!(relative_from_epoch(now - 86_400 * 200).contains("mo ago"));
         assert!(relative_from_epoch(now - 86_400 * 700).contains("y ago"));
+    }
+
+    #[test]
+    fn detects_rebase_operation_from_git_state() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let init = Command::new("git")
+            .current_dir(dir.path())
+            .args(["init"])
+            .status()
+            .expect("git init");
+        assert!(init.success());
+
+        let git_dir = dir.path().join(".git").join("rebase-merge");
+        fs::create_dir_all(&git_dir).expect("rebase dir");
+        fs::write(git_dir.join("msgnum"), "2\n").expect("msgnum");
+        fs::write(git_dir.join("end"), "5\n").expect("end");
+        fs::write(git_dir.join("head-name"), "refs/heads/feature\n").expect("head");
+        fs::write(git_dir.join("onto"), "abc123abc123abc123\n").expect("onto");
+
+        let status = GitStatus {
+            is_repo: true,
+            entries: vec![GitFileEntry {
+                path: "src/lib.rs".into(),
+                status: GitFileStatus::Conflicted,
+                staged: false,
+                unstaged: true,
+            }],
+            ..Default::default()
+        };
+        let op =
+            detect_operation(dir.path().to_string_lossy().as_ref(), &status).expect("operation");
+        assert_eq!(op.kind, GitOperationKind::Rebase);
+        assert_eq!(op.current, Some(2));
+        assert_eq!(op.total, Some(5));
+        assert_eq!(op.head.as_deref(), Some("feature"));
+        assert_eq!(op.target.as_deref(), Some("abc123abc123"));
+        assert_eq!(op.conflicts, vec!["src/lib.rs"]);
+    }
+
+    #[tokio::test]
+    async fn creates_branch_from_base_inside_temp_repo() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path().to_string_lossy().to_string();
+        run_git_for_test(dir.path(), &["init", "-b", "main"]);
+        fs::write(dir.path().join("README.md"), "hello\n").expect("readme");
+        run_git_for_test(dir.path(), &["add", "README.md"]);
+        run_git_for_test(
+            dir.path(),
+            &[
+                "-c",
+                "user.name=Pointer Test",
+                "-c",
+                "user.email=pointer@example.test",
+                "commit",
+                "-m",
+                "initial",
+            ],
+        );
+
+        let out = git_create_branch_from(
+            root.clone(),
+            "feature/git-workflow".into(),
+            "main".into(),
+            Some(true),
+        )
+        .await
+        .expect("create branch");
+        assert!(out.contains("feature/git-workflow") || out.is_empty());
+        let branch = git_run(&root, &["branch", "--show-current"]).expect("branch");
+        assert_eq!(branch.trim(), "feature/git-workflow");
+    }
+
+    fn run_git_for_test(path: &Path, args: &[&str]) {
+        let status = Command::new("git")
+            .current_dir(path)
+            .args(args)
+            .status()
+            .expect("git command");
+        assert!(status.success(), "git {:?} failed", args);
     }
 }

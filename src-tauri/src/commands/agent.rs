@@ -1,7 +1,11 @@
-//! Pointer Agent Harness — a Cursor-grade tool-calling loop on top of local LLMs.
+//! Legacy native agent harness.
 //!
 //! Design goals
 //! ============
+//! The active Pointer Ask / Plan / Agent runtime is OpenCode (see
+//! `use_opencode_agent_runtime`). This native loop remains compiled for
+//! migration and rollback while older session stores drain out.
+//!
 //! * Model-agnostic: we drive vanilla chat completions and ask the model to
 //!   emit XML-ish tool blocks. This works reliably with Qwen2.5-Coder /
 //!   DeepSeek-Coder-V2 / Llama 3 / Mistral without requiring native tool calls.
@@ -15,9 +19,6 @@
 //! * Self-correcting: after a mutation we run a deterministic verifier
 //!   (re-read the file, optional `lint_command`) and feed the report back into
 //!   the next turn so the model can fix what it broke.
-//! * Bounded: hard caps on steps, tokens, runtime, and identical-tool-call
-//!   repetition. The agent can also call `<final>` or `<clarify>` to terminate
-//!   cleanly.
 //! * Observable: every transition (`step_start`, `request_sent`,
 //!   `first_token`, `tool_call`, `tool_result`, `approval_request`,
 //!   `verifier`, `plan`, `clarify`, `final`, `error`, `done`) emits a typed
@@ -128,10 +129,14 @@ pub struct AgentRequest {
     pub goal: String,
     #[serde(default)]
     pub workspace: Option<String>,
+    /// Legacy native-loop budget. Ignored by the OpenCode runtime.
     #[serde(default)]
     pub max_steps: Option<u32>,
+    /// Legacy native-loop runtime cap. Ignored by the OpenCode runtime.
     #[serde(default)]
     pub max_runtime_secs: Option<u64>,
+    #[serde(default)]
+    pub opencode_session_id: Option<String>,
     #[serde(default)]
     pub context: Option<String>,
     #[serde(default)]
@@ -170,10 +175,14 @@ pub struct AgentContinueRequest {
     pub transcript: Vec<AgentMessage>,
     #[serde(default)]
     pub workspace: Option<String>,
+    /// Legacy native-loop budget. Ignored by the OpenCode runtime.
     #[serde(default)]
     pub max_steps: Option<u32>,
+    /// Legacy native-loop runtime cap. Ignored by the OpenCode runtime.
     #[serde(default)]
     pub max_runtime_secs: Option<u64>,
+    #[serde(default)]
+    pub opencode_session_id: Option<String>,
     #[serde(default)]
     pub context: Option<String>,
     #[serde(default)]
@@ -280,13 +289,6 @@ pub async fn agent_run(
     // transcript here and hand the loop the result. Follow-up turns
     // go through `agent_continue`, which reuses the same loop helper
     // with the prior transcript instead.
-    let max_steps = request.max_steps.unwrap_or(DEFAULT_MAX_STEPS).max(1);
-    let max_runtime = Duration::from_secs(
-        request
-            .max_runtime_secs
-            .unwrap_or(DEFAULT_MAX_RUNTIME_S)
-            .max(15),
-    );
     let mode = request.mode.unwrap_or_default();
     let depth = request.depth.unwrap_or(0);
     let lint_command = request.lint_command.clone();
@@ -301,18 +303,8 @@ pub async fn agent_run(
                 .map(|p| p.display().to_string())
         })
         .unwrap_or_default();
+    let workspace = canonical_workspace_string(workspace);
     let evt = format!("agent:event:{}", request_id);
-
-    let _ = app.emit(
-        &evt,
-        json!({
-            "kind": "started",
-            "mode": mode,
-            "max_steps": max_steps,
-            "depth": depth,
-            "workspace": workspace,
-        }),
-    );
 
     let open_tabs = request.open_tabs.clone().unwrap_or_default();
     let active_file = request.active_file.clone();
@@ -331,6 +323,16 @@ pub async fn agent_run(
         active_file.as_deref(),
     );
     if use_opencode_agent_runtime() {
+        let _ = app.emit(
+            &evt,
+            json!({
+                "kind": "started",
+                "mode": mode,
+                "depth": depth,
+                "workspace": workspace,
+                "runtime": "opencode",
+            }),
+        );
         return run_opencode(
             app.clone(),
             &state,
@@ -345,13 +347,32 @@ pub async fn agent_run(
                     OpenCodeMode::Agent => "Agent mode".into(),
                     OpenCodeMode::Ask => "Ask mode".into(),
                 },
-                max_steps,
                 files: attached_files,
+                opencode_session_id: request.opencode_session_id.clone(),
             },
         )
         .await
         .map(|_| ());
     }
+
+    let max_steps = request.max_steps.unwrap_or(DEFAULT_MAX_STEPS).max(1);
+    let max_runtime = Duration::from_secs(
+        request
+            .max_runtime_secs
+            .unwrap_or(DEFAULT_MAX_RUNTIME_S)
+            .max(15),
+    );
+    let _ = app.emit(
+        &evt,
+        json!({
+            "kind": "started",
+            "mode": mode,
+            "max_steps": max_steps,
+            "depth": depth,
+            "workspace": workspace,
+            "runtime": "native",
+        }),
+    );
 
     // Compose the system prompt:
     //   - the static AGENT_SYSTEM contract,
@@ -368,9 +389,6 @@ pub async fn agent_run(
     if !mcp_tools.is_empty() {
         system_prompt.push_str(&render_mcp_section(&mcp_tools));
     }
-
-    let open_tabs = request.open_tabs.clone().unwrap_or_default();
-    let active_file = request.active_file.clone();
 
     let transcript: Vec<Value> = vec![
         json!({"role": "system", "content": system_prompt}),
@@ -412,13 +430,6 @@ pub async fn agent_continue(
     request_id: String,
     request: AgentContinueRequest,
 ) -> AppResult<()> {
-    let max_steps = request.max_steps.unwrap_or(DEFAULT_MAX_STEPS).max(1);
-    let max_runtime = Duration::from_secs(
-        request
-            .max_runtime_secs
-            .unwrap_or(DEFAULT_MAX_RUNTIME_S)
-            .max(15),
-    );
     let mode = request.mode.unwrap_or_default();
     let lint_command = request.lint_command.clone();
 
@@ -432,40 +443,56 @@ pub async fn agent_continue(
                 .map(|p| p.display().to_string())
         })
         .unwrap_or_default();
+    let workspace = canonical_workspace_string(workspace);
     let evt = format!("agent:event:{}", request_id);
-
-    let _ = app.emit(
-        &evt,
-        json!({
-            "kind": "started",
-            "mode": mode,
-            "max_steps": max_steps,
-            // `depth` is meaningful only on the original run; subtasks
-            // don't currently support continuation. Pass 0 so the UI
-            // doesn't show a misleading sub-agent indicator.
-            "depth": 0,
-            "workspace": workspace,
-        }),
-    );
 
     let open_tabs = request.open_tabs.clone().unwrap_or_default();
     let active_file = request.active_file.clone();
     let attached_files = request.attached_files.clone().unwrap_or_default();
+    let opencode_session_id = request.opencode_session_id.clone();
     let opencode_mode = if mode == ExecutionMode::Plan {
         OpenCodeMode::Plan
     } else {
         OpenCodeMode::Agent
     };
-    let prompt = render_opencode_continue_prompt(
-        &workspace,
-        mode,
-        &request.transcript,
-        request.context.as_deref(),
-        &request.user_message,
-        &open_tabs,
-        active_file.as_deref(),
-    );
+    let prompt = if opencode_session_id
+        .as_deref()
+        .map(str::trim)
+        .is_some_and(|s| !s.is_empty())
+    {
+        render_opencode_agent_prompt(
+            &workspace,
+            mode,
+            request.context.as_deref(),
+            &request.user_message,
+            &open_tabs,
+            active_file.as_deref(),
+        )
+    } else {
+        render_opencode_continue_prompt(
+            &workspace,
+            mode,
+            &request.transcript,
+            request.context.as_deref(),
+            &request.user_message,
+            &open_tabs,
+            active_file.as_deref(),
+        )
+    };
     if use_opencode_agent_runtime() {
+        let _ = app.emit(
+            &evt,
+            json!({
+                "kind": "started",
+                "mode": mode,
+                // `depth` is meaningful only on the original run; subtasks
+                // don't currently support continuation. Pass 0 so the UI
+                // doesn't show a misleading sub-agent indicator.
+                "depth": 0,
+                "workspace": workspace,
+                "runtime": "opencode",
+            }),
+        );
         return run_opencode(
             app.clone(),
             &state,
@@ -480,16 +507,32 @@ pub async fn agent_continue(
                     OpenCodeMode::Agent => "Agent mode".into(),
                     OpenCodeMode::Ask => "Ask mode".into(),
                 },
-                max_steps,
                 files: attached_files,
+                opencode_session_id,
             },
         )
         .await
         .map(|_| ());
     }
 
-    let open_tabs = request.open_tabs.clone().unwrap_or_default();
-    let active_file = request.active_file.clone();
+    let max_steps = request.max_steps.unwrap_or(DEFAULT_MAX_STEPS).max(1);
+    let max_runtime = Duration::from_secs(
+        request
+            .max_runtime_secs
+            .unwrap_or(DEFAULT_MAX_RUNTIME_S)
+            .max(15),
+    );
+    let _ = app.emit(
+        &evt,
+        json!({
+            "kind": "started",
+            "mode": mode,
+            "max_steps": max_steps,
+            "depth": 0,
+            "workspace": workspace,
+            "runtime": "native",
+        }),
+    );
 
     // Reuse the transcript the BE handed back to the FE last turn.
     // We also re-attach an `<environment_details>` block via the
@@ -581,12 +624,24 @@ fn render_opencode_agent_prompt(
             out.push_str("Attached context:\n");
             out.push_str(context);
             out.push_str("\n\n");
+            out.push_str("Attached context may include <brain-frontier> and <context-memory>, Pointer's deterministic external memory. Use included evidence first, use frontier candidates to choose the next missing file/spec/config to inspect, and avoid rediscovering facts already supplied. Treat it as navigation memory and evidence, not as permission to invent unseen code.\n\n");
         }
     }
     out.push_str("User goal:\n");
     out.push_str(goal.trim());
     if mode == ExecutionMode::Plan {
-        out.push_str("\n\nFinal response: provide a concrete executable plan with exact files and verification. If investigation shows no code change is warranted, say that directly and include the exact files/tests that prove it.");
+        out.push_str("\n\nPlan mode contract: gather bounded context, then stop searching and answer. Required reads before final: the active file when relevant; the directly related implementation file; directly related existing verification or specification context when it can be found; and project configuration needed to name the verification command. For interface work, include both the state/logic file and the file that renders the affected UI. Use the repository's own structure and naming conventions to discover tests, specs, examples, snapshots, fixtures, or validation commands; do not assume a language, framework, package manager, or test runner. Do not finalize until relevant verification context has been read or you explicitly state what you checked and that none exists. Do not propose framework or router API migrations unless package/config context proves the installed major version supports the target API; preserve current dependency major versions for behavior-preserving refactors. For theme/refactor plans, distinguish styled-components ThemeProvider from a custom React context. Do not claim components consume a custom context unless the code shows a hook/provider; if props are used, say props are used. Do not assume a reported bug exists: compare the proposed fix to the code you read. If the code already contains the proposed source change, do not claim it is missing; produce a no-source-change or regression-test-only plan and cite the exact existing behavior. If the user asks for a refactor, cleanup, feature, or creative change, do not no-op merely because the current behavior works; produce a behavior-preserving implementation plan. If the evidence disproves the suspected bug, do not restate that suspected bug as true anywhere in the final answer. If the final plan is no-source-change, the Assessment must not say the reported bug exists, remains visible, does not re-render, or still needs a source fix. When naming files or implementation areas, cite exact symbols visible in context instead of generic descriptions. Final response format: Context read: exact paths; Assessment: what the code proves; Plan: exact changes or no-source-change rationale; Verification: exact narrow command. Final output must be under 180 words and contain no internal debate, self-correction, or discarded hypotheses. Verification must name an actual project command from repository configuration when available. Prefer the narrowest existing verification that covers the touched behavior. Plan verification commands must be executable by Agent mode without package executors: never use npx, npm exec, pnpm dlx, yarn dlx, or bunx in a plan. Prefer package scripts such as npm test, npm run test:run, npm run build, cargo test, go test, pytest, or the repository's configured equivalent.");
+        if goal.to_ascii_lowercase().contains("refactor")
+            || goal.to_ascii_lowercase().contains("cleanup")
+            || goal.to_ascii_lowercase().contains("clean up")
+            || goal.to_ascii_lowercase().contains("feature")
+            || goal.to_ascii_lowercase().contains("implement")
+            || goal.to_ascii_lowercase().contains("improve")
+        {
+            out.push_str("\nThis is a change-planning request: the final Plan must include source changes and must not answer no source changes needed merely because current behavior works. If no focused verification exists for a refactor, prefer the repository's configured build or validation command.");
+        }
+    } else if mode == ExecutionMode::AgentApprove || mode == ExecutionMode::AgentAuto {
+        out.push_str("\n\nAgent implementation constraints: make the minimal correct change for the goal, preserve unrelated structure and assets, and verify with the repository's own commands when available even if the user did not explicitly ask to run tests. If package scripts or equivalent project commands exist, attempt the narrowest relevant command after editing unless a command is explicitly forbidden. After any successful edit, a final answer with zero bash verification attempts is invalid; run a verification command or attempt one and report the real blocker before finalizing. If the user asks to add or update tests, you must edit or create the relevant test/spec file even when verification cannot run. Do not install, add, remove, or update dependencies unless the user explicitly asks; if verification is blocked by missing dependencies, report the blocked command instead of changing dependency state. Never run or even attempt package executors: npx, npm exec, pnpm dlx, yarn dlx, or bunx are forbidden even for eslint, vitest, mocha, or one-off probing. Use scripts already present in package.json such as npm test, npm run test:run, npm run build, npm run lint, or npm run typecheck. If no relevant script exists, use the closest existing script or report that verification is blocked; do not invent an npx command. If package.json, Cargo.toml, pyproject.toml, or similar config defines verification scripts, do not claim verification commands are unavailable; missing dependencies mean verification was blocked or failed, not absent. Final answer: one concise non-repetitive summary under 140 words with changed files plus a Verification: sentence naming the exact command attempted or the exact blocked command. Never say verification was skipped because the user did not ask, because the change was minimal, or because of user constraints.");
     }
     out
 }
@@ -628,11 +683,19 @@ fn use_opencode_agent_runtime() -> bool {
     true
 }
 
-/// Cheap preflight planner: a single tool-free model call that returns
-/// `{steps, summary}`. The UI uses this to pre-fill the Max-steps
-/// input with a model-suggested budget for the current goal. We clamp
-/// `steps` to 1-100 because that's what the main loop accepts via
-/// `max_steps`.
+fn canonical_workspace_string(workspace: String) -> String {
+    let trimmed = workspace.trim();
+    if trimmed.is_empty() {
+        return workspace;
+    }
+    std::fs::canonicalize(trimmed)
+        .map(|p| p.display().to_string())
+        .unwrap_or(workspace)
+}
+
+/// Legacy native-loop preflight planner. The OpenCode-backed Assistant
+/// no longer uses a Pointer-side step budget; this command remains for
+/// migration/rollback compatibility with the deprecated agent store.
 #[tauri::command]
 pub async fn agent_estimate(
     app: AppHandle,
@@ -1056,25 +1119,6 @@ async fn run_agent_loop(
                 .as_deref()
                 .map(plan_looks_like_discovery_checklist)
                 .unwrap_or(false);
-        let needs_command_rewrite = mode == ExecutionMode::Plan
-            && plan_block
-                .as_deref()
-                .map(|plan| {
-                    plan_uses_npm_test_forwarding(plan)
-                        || plan_uses_npm_run_script_without_dash_dash(plan)
-                        || plan_uses_bare_js_test_runner(plan)
-                })
-                .unwrap_or(false);
-        let needs_generic_test_rewrite = mode == ExecutionMode::Plan
-            && plan_block
-                .as_deref()
-                .map(plan_uses_generic_npm_test_despite_named_test)
-                .unwrap_or(false);
-        let needs_broad_test_rewrite = mode == ExecutionMode::Plan
-            && plan_block
-                .as_deref()
-                .map(plan_uses_broad_npm_test)
-                .unwrap_or(false);
         let needs_ui_render_context_rewrite = mode == ExecutionMode::Plan
             && plan_block
                 .as_deref()
@@ -1086,12 +1130,7 @@ async fn run_agent_loop(
                 .map(plan_edits_existing_test)
                 .unwrap_or(false);
         if plan_quality_redirect_count < 8
-            && (needs_plan_rewrite
-                || needs_command_rewrite
-                || needs_generic_test_rewrite
-                || needs_broad_test_rewrite
-                || needs_ui_render_context_rewrite
-                || needs_test_edit_rewrite)
+            && (needs_plan_rewrite || needs_ui_render_context_rewrite || needs_test_edit_rewrite)
         {
             plan_quality_redirect_count += 1;
             let mut violations = Vec::new();
@@ -1099,37 +1138,23 @@ async fn run_agent_loop(
                 violations
                     .push("it still contains discovery steps instead of implementation steps");
             }
-            if needs_command_rewrite {
-                violations.push("it uses an npm script argument form that will not reliably pass the target test file to the runner");
-            }
-            if needs_generic_test_rewrite {
-                violations.push("it names a specific test file but verifies with broad `npm test`");
-            }
-            if needs_broad_test_rewrite {
-                violations.push("it falls back to broad `npm test` instead of naming the narrowest relevant one-shot verification");
-            }
             if needs_ui_render_context_rewrite {
-                violations.push("it plans a UI state fix without naming the component/style that renders the affected UI");
+                violations.push("it plans an interface state fix without naming the file that renders the affected UI");
             }
             if needs_test_edit_rewrite {
                 violations.push("it proposes editing a test file even though the existing test should be used as the specification");
             }
-            let command_hint = plan_block
-                .as_deref()
-                .and_then(|plan| narrow_verification_command_hint(&workspace, plan))
-                .map(|cmd| format!("Use this exact verification command in the plan: `{cmd}`. "))
-                .unwrap_or_default();
             let redirect = format!(
                 "Your <plan> is not ready to execute. Fix these violations: {}. \
-                 The corrected plan must name exact source file(s), the exact source change, the existing test/spec context, and the narrowest one-shot verification command. \
-                 For UI work, preserve all gathered evidence categories in the final plan: source file/change, render site, test/spec file, and command. Do not trade one category away when adding another. \
+                 The corrected plan must name exact source file(s), the exact source change, existing verification/specification context when available, and the narrowest one-shot verification command. \
+                 For interface work, preserve all gathered evidence categories in the final plan: source file/change, render site, verification/specification file, and command. Do not trade one category away when adding another. \
                  Do not include discovery steps. Do not edit tests when an existing test already covers the behavior. {}{}",
                 violations.join("; "),
-                command_hint,
+                "",
                 if manifest_read_for_plan {
-                    "Use the underlying test runner from package.json, preserving required flags and replacing broad test globs with the target test file. If no relevant test/spec file is in context yet, emit exactly one read-only tool call now to find it (for example <glob>src/**/__tests__/*drag*.test.js</glob> or <grep glob=\"src/**/__tests__/*.js\">symbolName</grep>). If a UI state/render site is not in context yet, emit exactly one read-only tool call now to find it (for example <grep>showDropOverlay|drop-overlay</grep>). Otherwise emit only <plan>...</plan> followed by <final>...</final>."
+                    "Use the repository's configured verification command, preserving required flags and narrowing it to the relevant verification target when the project supports that. If no relevant verification/specification file is in context yet, emit exactly one read-only tool call now to find it using repository naming conventions. If an interface render site is not in context yet, emit exactly one read-only tool call now to find it from the state or symbol name. Otherwise emit only <plan>...</plan> followed by <final>...</final>."
                 } else {
-                    "If package.json is not in context, emit exactly one read-only tool call now: <read_file path=\"package.json\" />. Otherwise emit only <plan>...</plan> followed by <final>...</final>."
+                    "If project verification configuration is not in context, emit exactly one read-only tool call now to inspect likely repository configuration files. Otherwise emit only <plan>...</plan> followed by <final>...</final>."
                 }
             );
             let _ = app.emit(
@@ -1602,7 +1627,7 @@ async fn run_agent_loop(
             transcript.push(json!({
                 "role": "user",
                 "content": format!(
-                    "This is PLAN MODE — <{}> is forbidden and was not executed. Do NOT call run_shell, run_check, task, or mutating tools in Plan mode. If you already have the source file, test/spec file, and package.json context, emit a <plan> block with the exact source change and narrow verification command, followed by <final>.",
+                    "This is PLAN MODE — <{}> is forbidden and was not executed. Do NOT call run_shell, run_check, task, or mutating tools in Plan mode. If you already have the source file, relevant verification/specification context, and project verification configuration, emit a <plan> block with the exact source change and narrow verification command, followed by <final>.",
                     call.tool
                 ),
             }));
@@ -5204,64 +5229,6 @@ fn plan_looks_like_discovery_checklist(plan: &str) -> bool {
             && (implementation_lines <= discovery_lines || !has_concrete_verification))
 }
 
-fn plan_uses_npm_test_forwarding(plan: &str) -> bool {
-    let lower = plan.to_ascii_lowercase();
-    lower.contains("npm test -- ") || lower.contains("npm run test -- ")
-}
-
-fn plan_uses_npm_run_script_without_dash_dash(plan: &str) -> bool {
-    let lower = plan.to_ascii_lowercase();
-    lower
-        .split_whitespace()
-        .collect::<Vec<_>>()
-        .windows(4)
-        .any(|w| w[0] == "npm" && w[1] == "run" && w[2].starts_with("test:") && w[3] != "--")
-}
-
-fn plan_uses_bare_js_test_runner(plan: &str) -> bool {
-    let lower = plan.to_ascii_lowercase();
-    let uses_bare_runner = ["vitest ", "jest ", "mocha "]
-        .iter()
-        .any(|needle| lower.contains(needle));
-    let has_launcher = lower.contains("npx vitest")
-        || lower.contains("npx jest")
-        || lower.contains("npx mocha")
-        || lower.contains("npm exec")
-        || lower.contains("npm run");
-    uses_bare_runner && !has_launcher
-}
-
-fn plan_uses_generic_npm_test_despite_named_test(plan: &str) -> bool {
-    let lower = plan.to_ascii_lowercase();
-    let mentions_test_file = lower
-        .split_whitespace()
-        .map(|token| {
-            token.trim_matches(|c: char| {
-                !(c.is_ascii_alphanumeric() || matches!(c, '/' | '.' | '_' | '-'))
-            })
-        })
-        .any(|token| {
-            (token.starts_with("test/") || token.contains(".test."))
-                && (token.ends_with(".js")
-                    || token.ends_with(".jsx")
-                    || token.ends_with(".ts")
-                    || token.ends_with(".tsx")
-                    || token.ends_with(".mjs")
-                    || token.ends_with(".cjs"))
-        });
-    let uses_generic_npm_test = (lower.contains("npm test") || lower.contains("npm run test"))
-        && !plan_uses_npm_test_forwarding(plan);
-    mentions_test_file && uses_generic_npm_test
-}
-
-fn plan_uses_broad_npm_test(plan: &str) -> bool {
-    let lower = plan.to_ascii_lowercase();
-    let uses_npm_test = lower.contains("npm test") || lower.contains("npm run test");
-    let uses_specific_npm_script =
-        lower.contains("npm run test:") || lower.contains("npm run test -- ");
-    uses_npm_test && !uses_specific_npm_script
-}
-
 fn plan_mentions_ui_state_without_render_site(plan: &str) -> bool {
     let lower = plan.to_ascii_lowercase();
     let mentions_ui_state = lower.contains("ui")
@@ -5293,43 +5260,6 @@ fn plan_edits_existing_test(plan: &str) -> bool {
                 || line.contains(".mjs")
                 || line.contains(".cjs"))
     })
-}
-
-fn extract_specific_test_file(text: &str) -> Option<String> {
-    text.split_whitespace()
-        .map(|token| {
-            token
-                .trim_matches(|c: char| {
-                    !(c.is_ascii_alphanumeric() || matches!(c, '/' | '.' | '_' | '-'))
-                })
-                .to_string()
-        })
-        .find(|token| {
-            let lower = token.to_ascii_lowercase();
-            let has_test_shape =
-                lower.starts_with("test/") || lower.contains(".test.") || lower.contains(".spec.");
-            has_test_shape
-                && [".js", ".jsx", ".ts", ".tsx", ".mjs", ".cjs"]
-                    .iter()
-                    .any(|ext| lower.ends_with(ext))
-        })
-}
-
-fn narrow_verification_command_hint(workspace: &str, plan: &str) -> Option<String> {
-    let file = extract_specific_test_file(plan)?;
-    let package_json = std::fs::read_to_string(resolve(workspace, "package.json")).ok()?;
-    let lower = package_json.to_ascii_lowercase();
-    if lower.contains("vitest") {
-        Some(format!("npx vitest run {file}"))
-    } else if lower.contains("mocha") {
-        Some(format!("npx mocha {file}"))
-    } else if lower.contains("jest") {
-        Some(format!("npx jest {file}"))
-    } else if lower.contains("node --test") {
-        Some(format!("node --test {file}"))
-    } else {
-        None
-    }
 }
 
 fn parse_tool_call(s: &str) -> Option<ToolCall> {
@@ -7216,32 +7146,6 @@ mod tests {
         assert!(PLAN_FORBIDDEN_TOOLS.contains(&"task"));
         assert!(!PLAN_FORBIDDEN_TOOLS.contains(&"read_file"));
         assert!(!PLAN_FORBIDDEN_TOOLS.contains(&"discover"));
-    }
-
-    #[test]
-    fn plan_quality_rejects_generic_npm_test_even_when_runner_is_named() {
-        let plan = "Use src/utils/__tests__/i18n-helper.test.js as the spec. Verify with `npm test` (which runs `vitest`).";
-        assert!(plan_uses_generic_npm_test_despite_named_test(plan));
-        assert!(plan_uses_broad_npm_test(plan));
-
-        let targeted = "Verify with `npx vitest run src/utils/__tests__/i18n-helper.test.js`.";
-        assert!(!plan_uses_generic_npm_test_despite_named_test(targeted));
-        assert!(!plan_uses_broad_npm_test(targeted));
-    }
-
-    #[test]
-    fn narrow_verification_command_hint_uses_package_runner() {
-        let dir = tempdir().unwrap();
-        fs::write(
-            dir.path().join("package.json"),
-            r#"{"scripts":{"test":"mocha --require test/support/env.js --reporter spec"}}"#,
-        )
-        .unwrap();
-        let plan = "Use test/res.links.js as the spec. Verify with `npm test`.";
-        let hint = narrow_verification_command_hint(dir.path().to_str().unwrap(), plan)
-            .expect("expected mocha hint");
-
-        assert_eq!(hint, "npx mocha test/res.links.js");
     }
 
     #[test]

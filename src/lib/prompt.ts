@@ -103,6 +103,51 @@ export function diagnosticBlock(opts: {
   ].join("\n");
 }
 
+export function breakpointBlock(opts: {
+  path: string;
+  line: number;
+  column?: number;
+  enabled: boolean;
+  condition?: string;
+  logMessage?: string;
+}) {
+  const columnAttr = opts.column ? ` column="${opts.column}"` : "";
+  const condition = opts.condition ? `condition: ${opts.condition}` : "";
+  const log = opts.logMessage ? `log: ${opts.logMessage}` : "";
+  return [
+    `<breakpoint path="${opts.path}" line="${opts.line}"${columnAttr} enabled="${opts.enabled}">`,
+    condition,
+    log,
+    `</breakpoint>`,
+  ]
+    .filter(Boolean)
+    .join("\n");
+}
+
+export function debugValueBlock(opts: {
+  name: string;
+  value: string;
+  type?: string;
+  path?: string;
+  line?: number;
+  scope?: string;
+  frame?: string;
+  thread?: string;
+}) {
+  const attrs = [
+    `name="${escapeAttr(opts.name)}"`,
+    opts.type ? `type="${escapeAttr(opts.type)}"` : "",
+    opts.path ? `path="${escapeAttr(opts.path)}"` : "",
+    opts.line ? `line="${opts.line}"` : "",
+    opts.scope ? `scope="${escapeAttr(opts.scope)}"` : "",
+    opts.frame ? `frame="${escapeAttr(opts.frame)}"` : "",
+    opts.thread ? `thread="${escapeAttr(opts.thread)}"` : "",
+  ]
+    .filter(Boolean)
+    .join(" ");
+  return `<debug-value ${attrs}>\n${opts.value}\n</debug-value>`;
+}
+
 /** Compact folder listing — just the immediate children. The agent / chat
  *  model can ask for deeper subtrees explicitly if it needs them. */
 export function folderBlock(path: string, entries: string[]): string {
@@ -110,4 +155,8 @@ export function folderBlock(path: string, entries: string[]): string {
     return `<folder path="${path}">(empty)</folder>`;
   }
   return `<folder path="${path}">\n${entries.join("\n")}\n</folder>`;
+}
+
+function escapeAttr(value: string): string {
+  return value.replace(/&/g, "&amp;").replace(/"/g, "&quot;");
 }

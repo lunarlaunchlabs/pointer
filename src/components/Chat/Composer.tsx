@@ -19,6 +19,7 @@ import { open as openDialog } from "@tauri-apps/plugin-dialog";
 import type { Reference } from "@/store/chat";
 import { useEditorStore } from "@/store/editor";
 import { useDiagnostics, type Diagnostic } from "@/store/diagnostics";
+import type { Breakpoint, DebugValue } from "@/store/debugger";
 import {
   useSettings,
   isFeatureUsable,
@@ -71,6 +72,7 @@ export function Composer({
   const [text, setText] = useState("");
   const [processing, setProcessing] =
     useState<{ path: string; label: string } | null>(null);
+  const [dragActive, setDragActive] = useState(false);
   const taRef = useRef<HTMLTextAreaElement | null>(null);
 
   // Editor-level state the composer reads through to surface options
@@ -185,11 +187,18 @@ export function Composer({
     // the category-specific query.
     if (sel.kind === "category") {
       // Selecting a category just confirms the alias and keeps typing.
-      // We splice `@<alias>` (no trailing space) so the picker stays
-      // open with the alias as the new query — the user can type
-      // their refinement immediately.
+      // Search-like categories get a trailing space so `@file App`,
+      // `@folder src`, and `@codebase route flow` stay live.
       const alias = CATEGORY_ALIASES[sel.category];
-      const insertion = `@${alias}`;
+      const wantsRemainder = [
+        "file",
+        "folder",
+        "codebase",
+        "diagnostic",
+        "breakpoint",
+        "debug",
+      ].includes(sel.category);
+      const insertion = `@${alias}${wantsRemainder ? " " : ""}`;
       const { text: nextText, caret } = applyMention(text, probe, insertion);
       setText(nextText);
       requestAnimationFrame(() => {
@@ -234,6 +243,38 @@ export function Composer({
           endLine: selection.endLine,
         }),
       );
+      return;
+    }
+    if (sel.kind === "breakpoint") {
+      const bp = sel.breakpoint;
+      onAddReference({
+        kind: "breakpoint",
+        path: bp.path,
+        line: bp.line,
+        column: bp.column,
+        enabled: bp.enabled,
+        condition: bp.condition,
+        logMessage: bp.logMessage,
+      });
+      replaceMention(
+        mentionToken({ kind: "breakpoint", path: bp.path, line: bp.line }),
+      );
+      return;
+    }
+    if (sel.kind === "debugValue") {
+      const value = sel.value;
+      onAddReference({
+        kind: "debugValue",
+        name: value.name,
+        value: value.value,
+        type: value.type,
+        path: value.path,
+        line: value.line,
+        scope: value.scope,
+        frame: value.frame,
+        thread: value.thread,
+      });
+      replaceMention(mentionToken({ kind: "debugValue", name: value.name }));
       return;
     }
     if (sel.kind === "diagnostic") {
@@ -414,8 +455,53 @@ export function Composer({
     }
   };
 
+  const addPathReference = async (path: string) => {
+    const clean = path.trim();
+    if (!clean) return;
+    try {
+      await ipc.readWorkspaceTree(clean);
+      onAddReference({ kind: "folder", path: clean });
+    } catch {
+      onAddReference({ kind: "file", path: clean });
+    }
+  };
+
+  const onDrop: React.DragEventHandler<HTMLDivElement> = async (e) => {
+    if (!hasContextDrop(e.dataTransfer)) return;
+    e.preventDefault();
+    e.stopPropagation();
+    setDragActive(false);
+    markAssistantDropTarget(false);
+    const refs = referencesFromDrop(e.dataTransfer);
+    for (const ref of refs.breakpoints) onAddReference(ref);
+    for (const ref of refs.debugValues) onAddReference(ref);
+    for (const path of refs.paths) await addPathReference(path);
+    if (!refs.paths.length && !refs.breakpoints.length && !refs.debugValues.length) {
+      toast.warn("Drop did not include a usable path or debugger value");
+    }
+  };
+
+  const onDragOver: React.DragEventHandler<HTMLDivElement> = (e) => {
+    if (!hasContextDrop(e.dataTransfer)) return;
+    e.preventDefault();
+    markAssistantDropTarget(true);
+    e.dataTransfer.dropEffect = "copy";
+    setDragActive(true);
+  };
+
   return (
-    <div className="border-t border-noir-line bg-noir-chrome/60 p-3 space-y-2">
+    <div
+      data-pointer-drop-context="assistant"
+      onDrop={onDrop}
+      onDragOver={onDragOver}
+      onDragLeave={() => {
+        setDragActive(false);
+        markAssistantDropTarget(false);
+      }}
+      className={`border-t border-noir-line bg-noir-chrome/60 p-3 space-y-2 transition-colors ${
+        dragActive ? "ring-1 ring-inset ring-noir-accent/60 bg-noir-accent/5" : ""
+      }`}
+    >
       {processing && (
         <div className="rounded-md border border-noir-accent/30 bg-noir-accent/5 px-2.5 py-1.5 text-[11px] font-sans text-noir-accent flex items-center gap-2 min-w-0">
           <Loader2 size={11} className="animate-spin shrink-0" />
@@ -559,14 +645,23 @@ export function Composer({
  *  open with a category-targeted query is more discoverable than
  *  closing it immediately. */
 const CATEGORY_ALIASES: Record<
-  "file" | "folder" | "selection" | "codebase" | "diagnostic" | "symbol",
+  | "file"
+  | "folder"
+  | "selection"
+  | "codebase"
+  | "diagnostic"
+  | "breakpoint"
+  | "debug"
+  | "symbol",
   string
 > = {
-  file: "",
+  file: "file",
   folder: "folder",
   selection: "selection",
   codebase: "codebase",
   diagnostic: "diagnostic",
+  breakpoint: "breakpoint",
+  debug: "debug",
   symbol: "symbol",
 };
 
@@ -587,6 +682,10 @@ function mentionTokenFor(r: Reference): string {
       return mentionToken({ kind: "codebase", query: r.query });
     case "symbol":
       return mentionToken({ kind: "symbol", name: r.name });
+    case "breakpoint":
+      return mentionToken({ kind: "breakpoint", path: r.path, line: r.line });
+    case "debugValue":
+      return mentionToken({ kind: "debugValue", name: r.name });
     case "diagnostic":
       return mentionToken({
         kind: "diagnostic",
@@ -614,6 +713,113 @@ function lineRange(src: string, startLine: number, endLine: number): string {
   const from = Math.max(0, startLine - 1);
   const to = Math.min(lines.length, endLine);
   return lines.slice(from, to).join("\n");
+}
+
+function hasContextDrop(dt: DataTransfer): boolean {
+  return (
+    dt.types.includes("application/x-pointer-paths") ||
+    dt.types.includes("application/x-pointer-breakpoint") ||
+    dt.types.includes("application/x-pointer-debug-value") ||
+    dt.types.includes("text/uri-list") ||
+    dt.types.includes("text/plain") ||
+    dt.files.length > 0
+  );
+}
+
+function referencesFromDrop(dt: DataTransfer): {
+  paths: string[];
+  breakpoints: Reference[];
+  debugValues: Reference[];
+} {
+  const paths = new Set<string>();
+  const breakpoints: Reference[] = [];
+  const debugValues: Reference[] = [];
+
+  const pointerPaths = parseJson<string[]>(
+    dt.getData("application/x-pointer-paths"),
+  );
+  if (Array.isArray(pointerPaths)) {
+    for (const path of pointerPaths) {
+      if (typeof path === "string" && path.trim()) paths.add(path.trim());
+    }
+  }
+
+  const breakpoint = parseJson<Breakpoint>(
+    dt.getData("application/x-pointer-breakpoint"),
+  );
+  if (breakpoint?.path && breakpoint.line) {
+    breakpoints.push({
+      kind: "breakpoint",
+      path: breakpoint.path,
+      line: breakpoint.line,
+      column: breakpoint.column,
+      enabled: breakpoint.enabled,
+      condition: breakpoint.condition,
+      logMessage: breakpoint.logMessage,
+    });
+  }
+
+  const debugValue = parseJson<DebugValue>(
+    dt.getData("application/x-pointer-debug-value"),
+  );
+  if (debugValue?.name && typeof debugValue.value === "string") {
+    debugValues.push({
+      kind: "debugValue",
+      name: debugValue.name,
+      value: debugValue.value,
+      type: debugValue.type,
+      path: debugValue.path,
+      line: debugValue.line,
+      scope: debugValue.scope,
+      frame: debugValue.frame,
+      thread: debugValue.thread,
+    });
+  }
+
+  for (const file of Array.from(dt.files)) {
+    const path = (file as File & { path?: string }).path;
+    if (path) paths.add(path);
+  }
+  for (const uri of dt.getData("text/uri-list").split(/\r?\n/)) {
+    if (!uri.startsWith("file://")) continue;
+    paths.add(decodeURIComponent(uri.replace(/^file:\/\//, "")));
+  }
+  const plain = dt.getData("text/plain").trim();
+  if (looksLikePath(plain)) {
+    paths.add(decodeURIComponent(plain.replace(/^file:\/\//, "")));
+  }
+
+  return {
+    paths: Array.from(paths),
+    breakpoints,
+    debugValues,
+  };
+}
+
+function parseJson<T>(text: string): T | null {
+  if (!text.trim()) return null;
+  try {
+    return JSON.parse(text) as T;
+  } catch {
+    return null;
+  }
+}
+
+function looksLikePath(text: string): boolean {
+  return /^file:\/\//.test(text) || text.startsWith("/") || /^[A-Za-z]:[\\/]/.test(text);
+}
+
+function markAssistantDropTarget(active: boolean) {
+  const holder = window as unknown as { __pointerDropContext?: string };
+  if (active) {
+    holder.__pointerDropContext = "assistant";
+  } else {
+    window.setTimeout(() => {
+      if (holder.__pointerDropContext === "assistant") {
+        delete holder.__pointerDropContext;
+      }
+    }, 800);
+  }
 }
 
 function sevRank(s: Diagnostic["severity"]): number {

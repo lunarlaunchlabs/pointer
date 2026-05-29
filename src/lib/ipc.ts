@@ -144,6 +144,18 @@ export type GitFileEntry = {
   unstaged: boolean;
 };
 
+export type GitOperationKind = "rebase" | "merge" | "cherry_pick" | "revert";
+
+export type GitOperationState = {
+  kind: GitOperationKind;
+  title: string;
+  head: string | null;
+  target: string | null;
+  current: number | null;
+  total: number | null;
+  conflicts: string[];
+};
+
 export type GitStatus = {
   is_repo: boolean;
   branch: string | null;
@@ -155,6 +167,7 @@ export type GitStatus = {
   /** Per-file detail for the SCM panel — staged vs unstaged. */
   entries: GitFileEntry[];
   dirty_count: number;
+  operation: GitOperationState | null;
   error: string | null;
 };
 
@@ -408,6 +421,7 @@ export type LedgerEntry = {
 export type AssistantLedgerEvent = {
   session_id: string;
   entry: LedgerEntry;
+  opencode_session_id?: string | null;
 };
 
 /** Stored per-server spec — mirrors the Cursor / Claude Desktop format. */
@@ -500,6 +514,8 @@ export const ipc = {
     invoke<LspHover | null>("lsp_hover", { req }),
   lspDefinition: (req: LspTextDocumentRequest) =>
     invoke<LspLocation[]>("lsp_definition", { req }),
+  lspReferences: (req: LspTextDocumentRequest) =>
+    invoke<LspLocation[]>("lsp_references", { req }),
   lspCompletion: (req: LspTextDocumentRequest) =>
     invoke<LspCompletionItem[]>("lsp_completion", { req }),
   lspCompletionResolve: (
@@ -529,6 +545,30 @@ export const ipc = {
     invoke<string>("git_checkout", { workspace, branch }),
   gitCreateBranch: (workspace: string, branch: string) =>
     invoke<string>("git_create_branch", { workspace, branch }),
+  gitCreateBranchFrom: (
+    workspace: string,
+    branch: string,
+    base: string,
+    checkout = true,
+  ) =>
+    invoke<string>("git_create_branch_from", {
+      workspace,
+      branch,
+      base,
+      checkout,
+    }),
+  gitMerge: (workspace: string, target: string) =>
+    invoke<string>("git_merge", { workspace, target }),
+  gitMergeContinue: (workspace: string) =>
+    invoke<string>("git_merge_continue", { workspace }),
+  gitMergeAbort: (workspace: string) =>
+    invoke<string>("git_merge_abort", { workspace }),
+  gitRebase: (workspace: string, target: string) =>
+    invoke<string>("git_rebase", { workspace, target }),
+  gitRebaseContinue: (workspace: string) =>
+    invoke<string>("git_rebase_continue", { workspace }),
+  gitRebaseAbort: (workspace: string) =>
+    invoke<string>("git_rebase_abort", { workspace }),
   gitDiff: (workspace: string, path: string, staged: boolean) =>
     invoke<string>("git_diff", { workspace, path, staged }),
   /** Return the full contents of a path as it exists at HEAD or in the
@@ -642,6 +682,7 @@ export const ipc = {
       workspace?: string;
       max_steps?: number;
       max_runtime_secs?: number;
+      opencode_session_id?: string | null;
       context?: string;
       mode?: "plan" | "ask" | "auto";
       lint_command?: string;
@@ -669,6 +710,7 @@ export const ipc = {
       workspace?: string;
       max_steps?: number;
       max_runtime_secs?: number;
+      opencode_session_id?: string | null;
       context?: string;
       mode?: "plan" | "ask" | "auto";
       lint_command?: string;
@@ -686,9 +728,8 @@ export const ipc = {
     },
   ) => invoke<void>("agent_continue", { requestId, request }),
   /**
-   * Preflight planner. Runs a quick, tool-free model call that
-   * returns `{ steps, summary }` for the given goal so the UI can
-   * pre-fill the Max-steps input with a model-suggested budget.
+   * Legacy native-loop preflight planner. The OpenCode-backed Assistant
+   * does not use Pointer-side step budgets.
    */
   agentEstimate: (
     requestId: string,
@@ -776,6 +817,7 @@ export const ipc = {
       messages: { role: "system" | "user" | "assistant"; content: string }[];
       system?: string;
       system_extras?: string;
+      opencode_session_id?: string | null;
       temperature?: number;
       num_ctx?: number;
       attached_files?: string[];
@@ -787,6 +829,7 @@ export const ipc = {
       session_id: string;
       plan_text: string;
       model: string;
+      opencode_session_id?: string | null;
       workspace?: string;
       max_steps?: number;
       max_runtime_secs?: number;
