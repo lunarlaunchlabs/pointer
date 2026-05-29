@@ -3,6 +3,7 @@ import { render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { ModelActivityPanel } from "./ModelActivityPanel";
 import { ipc, type InferenceSnapshot, type SystemSnapshot } from "@/lib/ipc";
+import { useModelWorkflows } from "@/store/modelWorkflows";
 
 const idle: InferenceSnapshot = {
   active: [],
@@ -41,6 +42,7 @@ vi.mock("@/components/Toast", () => ({
 
 beforeEach(() => {
   vi.clearAllMocks();
+  useModelWorkflows.setState({ workflows: [] });
   vi.mocked(ipc.inferenceStatus).mockResolvedValue(idle);
   vi.mocked(ipc.inferenceCancel).mockResolvedValue(true);
   vi.mocked(ipc.systemSnapshot).mockResolvedValue(system);
@@ -84,5 +86,29 @@ describe("<ModelActivityPanel>", () => {
     await waitFor(() =>
       expect(ipc.inferenceCancel).toHaveBeenCalledWith("agent_123"),
     );
+  });
+
+  it("shows frontend workflows and cancels the whole run", async () => {
+    const store = useModelWorkflows.getState();
+    store.startWorkflow({
+      id: "commit_run",
+      kind: "git_commit",
+      title: "Draft commit message",
+      currentStep: "Summarize src/App.tsx",
+    });
+    store.attachRequest("commit_run", "git_commit_1");
+
+    const user = userEvent.setup();
+    render(<ModelActivityPanel />);
+
+    expect(await screen.findByText("Active workflows")).toBeInTheDocument();
+    expect(screen.getByText("Draft commit message")).toBeInTheDocument();
+    expect(screen.getByText("Summarize src/App.tsx")).toBeInTheDocument();
+
+    await user.click(screen.getByLabelText("Cancel whole run Draft commit message"));
+    await waitFor(() =>
+      expect(ipc.inferenceCancel).toHaveBeenCalledWith("git_commit_1"),
+    );
+    expect(useModelWorkflows.getState().isCancelling("commit_run")).toBe(true);
   });
 });

@@ -131,7 +131,7 @@ test.describe("workspace tree and assistant flows", () => {
         "git_push",
         Array.from({ length: 80 }, (_, i) => `remote line ${i + 1}`).join("\n"),
       );
-      window.__POINTER_E2E__?.git?.setGenerateDelay?.(60);
+      window.__POINTER_E2E__?.git?.setGenerateDelay?.(180);
       window.dispatchEvent(new Event("focus"));
     });
 
@@ -152,6 +152,10 @@ test.describe("workspace tree and assistant flows", () => {
     await expect(page.getByRole("button", { name: /Generate commit message/ })).toBeEnabled();
 
     await page.getByRole("button", { name: /Generate commit message/ }).click();
+    await page.getByRole("tab", { name: "Model Activity" }).click();
+    await expect(page.getByText("Active workflows")).toBeVisible();
+    await expect(page.getByText("Draft commit message")).toBeVisible();
+    await page.getByRole("tab", { name: "Source Control" }).click();
     await expect(page.getByRole("textbox", { name: "Commit message" })).toHaveJSProperty(
       "readOnly",
       true,

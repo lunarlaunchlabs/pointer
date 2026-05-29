@@ -8,6 +8,10 @@ import {
   Zap,
 } from "lucide-react";
 import {
+  useModelWorkflows,
+  type ModelWorkflow,
+} from "@/store/modelWorkflows";
+import {
   ipc,
   listenEvent,
   type InferenceJob,
@@ -25,6 +29,11 @@ export function ModelActivityPanel() {
   const [loaded, setLoaded] = useState<LoadedModel[]>([]);
   const [samples, setSamples] = useState<Sample[]>([]);
   const [cancelling, setCancelling] = useState<string | null>(null);
+  const [cancellingWorkflow, setCancellingWorkflow] = useState<string | null>(
+    null,
+  );
+  const workflows = useModelWorkflows((s) => s.workflows);
+  const cancelWorkflowById = useModelWorkflows((s) => s.cancelWorkflow);
 
   useEffect(() => {
     let alive = true;
@@ -85,6 +94,25 @@ export function ModelActivityPanel() {
     }
   };
 
+  const cancelWorkflow = async (workflow: ModelWorkflow) => {
+    setCancellingWorkflow(workflow.id);
+    try {
+      const count = await cancelWorkflowById(workflow.id);
+      toast.info(`Cancelling ${workflow.title}`, {
+        body:
+          count > 0
+            ? `Stopped ${count} active model request${count === 1 ? "" : "s"} and marked the whole run cancelled.`
+            : "Marked the whole run cancelled before its next model request.",
+      });
+    } catch (e) {
+      toast.error("Cancel run failed", {
+        body: e instanceof Error ? e.message : String(e),
+      });
+    } finally {
+      setCancellingWorkflow(null);
+    }
+  };
+
   return (
     <div className="h-full flex flex-col bg-noir-canvas/40">
       <header className="px-4 py-3 border-b border-noir-line bg-noir-chrome/40 flex items-center gap-3">
@@ -124,6 +152,24 @@ export function ModelActivityPanel() {
         </div>
 
         <LoadGraph samples={samples} />
+
+        {workflows.length > 0 && (
+          <Section title="Active workflows">
+            <div className="space-y-2">
+              {workflows.map((workflow) => (
+                <WorkflowRow
+                  key={workflow.id}
+                  workflow={workflow}
+                  onCancel={() => cancelWorkflow(workflow)}
+                  cancelling={
+                    cancellingWorkflow === workflow.id ||
+                    workflow.status === "cancelling"
+                  }
+                />
+              ))}
+            </div>
+          </Section>
+        )}
 
         <Section title="Active inference">
           {jobs.length === 0 ? (
@@ -205,6 +251,70 @@ function Metric({
         {label}
       </div>
       <div className="font-mono text-[13px] text-noir-text truncate">{value}</div>
+    </div>
+  );
+}
+
+function WorkflowRow({
+  workflow,
+  onCancel,
+  cancelling,
+}: {
+  workflow: ModelWorkflow;
+  onCancel: () => void;
+  cancelling: boolean;
+}) {
+  const elapsed = Math.max(0, Date.now() - workflow.startedAtMs);
+  const progress =
+    workflow.totalSteps && workflow.totalSteps > 0
+      ? (workflow.completedSteps / workflow.totalSteps) * 100
+      : Math.min(100, elapsed / 600);
+  return (
+    <div className="rounded-md border border-noir-accent/25 bg-noir-accent/10 px-3 py-2.5">
+      <div className="flex items-start gap-2">
+        <Activity size={13} className="mt-0.5 shrink-0 text-noir-accent" aria-hidden="true" />
+        <div className="min-w-0 flex-1">
+          <div className="flex items-center gap-2 min-w-0">
+            <span className="shrink-0 rounded bg-noir-accent/15 px-1.5 py-0.5 text-[9.5px] text-noir-accent">
+              {workflow.kind.replace(/_/g, " ")}
+            </span>
+            <div className="font-sans text-[11.5px] text-noir-text truncate">
+              {workflow.title}
+            </div>
+          </div>
+          <div className="mt-1 text-[11px] text-noir-subtext truncate" title={workflow.currentStep}>
+            {workflow.currentStep}
+          </div>
+          <div className="mt-2 flex items-center gap-3 font-mono text-[10px] text-noir-mute">
+            <span>{duration(elapsed)}</span>
+            <span>
+              {workflow.activeRequestIds.length} active request
+              {workflow.activeRequestIds.length === 1 ? "" : "s"}
+            </span>
+            {workflow.totalSteps ? (
+              <span>
+                {Math.min(workflow.completedSteps, workflow.totalSteps)}/
+                {workflow.totalSteps} steps
+              </span>
+            ) : null}
+          </div>
+        </div>
+        <button
+          onClick={onCancel}
+          disabled={cancelling}
+          className="h-7 w-7 rounded-md inline-flex items-center justify-center text-noir-mute hover:text-noir-err hover:bg-noir-err/10 disabled:opacity-35 disabled:hover:text-noir-mute disabled:hover:bg-transparent"
+          title="Cancel whole run"
+          aria-label={`Cancel whole run ${workflow.title}`}
+        >
+          <Square size={11} aria-hidden="true" />
+        </button>
+      </div>
+      <div className="mt-2 h-1 rounded-full bg-noir-line/70 overflow-hidden">
+        <div
+          className="h-full bg-noir-accent"
+          style={{ width: `${Math.min(100, Math.max(8, progress))}%` }}
+        />
+      </div>
     </div>
   );
 }

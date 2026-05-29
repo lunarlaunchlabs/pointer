@@ -58,8 +58,11 @@ import {
 } from "@/lib/gitWorkflow";
 import { GitCommitHarness, type CommitFileCandidate } from "@/lib/gitCommitHarness";
 import { isFeatureUsable, useSettings } from "@/store/settings";
+import { useModelWorkflows } from "@/store/modelWorkflows";
 import { toast } from "@/components/Toast";
 import { confirm } from "@/components/Confirm";
+
+const COMMIT_DRAFT_CANCELLED = "__POINTER_COMMIT_DRAFT_CANCELLED__";
 
 /**
  * Source Control panel — Pointer's git workspace.
@@ -82,6 +85,10 @@ export function SourceControlPanel() {
   const showDiff = useDiffViewer((s) => s.show);
   const chatModel = useSettings((s) => s.chatModel);
   const chatUsable = useSettings((s) => isFeatureUsable("chat", s));
+  const activeCommitWorkflow = useModelWorkflows((s) =>
+    s.workflows.find((workflow) => workflow.kind === "git_commit"),
+  );
+  const cancelWorkflow = useModelWorkflows((s) => s.cancelWorkflow);
 
   /** Read a file from the working tree. Returns "" if the file no
    *  longer exists (deleted entries) so the diff renders as
@@ -142,6 +149,7 @@ export function SourceControlPanel() {
   const [busy, setBusy] = useState(false);
   const [activeCommand, setActiveCommand] = useState<string | null>(null);
   const [commitGenerating, setCommitGenerating] = useState(false);
+  const [commitNow, setCommitNow] = useState(Date.now());
   const [commitDraft, setCommitDraft] = useState<CommitGenerationMemory | null>(null);
   const [showStaged, setShowStaged] = useState(true);
   const [showUnstaged, setShowUnstaged] = useState(true);
@@ -157,6 +165,16 @@ export function SourceControlPanel() {
     () => status.entries.filter((e) => e.unstaged),
     [status.entries],
   );
+  const commitElapsedMs = activeCommitWorkflow
+    ? Math.max(0, commitNow - activeCommitWorkflow.startedAtMs)
+    : 0;
+
+  useEffect(() => {
+    if (!commitGenerating && !activeCommitWorkflow) return;
+    setCommitNow(Date.now());
+    const id = window.setInterval(() => setCommitNow(Date.now()), 1000);
+    return () => window.clearInterval(id);
+  }, [commitGenerating, activeCommitWorkflow?.id]);
 
   // Click-outside for branch dropdown.
   useEffect(() => {
@@ -282,6 +300,14 @@ export function SourceControlPanel() {
     }
 
     setCommitGenerating(true);
+    const workflowId = newRequestId("git_commit_run");
+    useModelWorkflows.getState().startWorkflow({
+      id: workflowId,
+      kind: "git_commit",
+      title: "Draft commit message",
+      currentStep: `Preparing ${files.length} changed file${files.length === 1 ? "" : "s"}`,
+      totalSteps: files.length + 3,
+    });
     setOutput({
       kind: "info",
       body: `Summarizing ${files.length} file${files.length === 1 ? "" : "s"}…`,
@@ -343,12 +369,15 @@ export function SourceControlPanel() {
       const memories: CommitGenerationMemory["files"] = [];
       const warnings: string[] = [];
       for (const file of files) {
+        assertCommitDraftNotCancelled(workflowId);
+        updateCommitWorkflowStep(workflowId, `Reading ${file.path}`);
         const diff = await commitDiffFor(file);
         const fallback = fallbackSummaryFromDiff(file.path, file.status, diff);
         const chunks = chunkDiffForSummary(file.path, diff || `${file.path} changed.`);
         const chunkSummaries: CommitChunkSummary[] = [];
         const chunkMemoryIds: string[] = [];
         for (const chunk of chunks) {
+          assertCommitDraftNotCancelled(workflowId);
           const diffMemory = harness.rememberDiffChunk(
             {
               path: file.path,
@@ -368,12 +397,14 @@ export function SourceControlPanel() {
             buildDiffChunkSummaryPrompt(chunk),
             `Summarize ${file.path} ${chunk.index}/${chunk.total}`,
             72,
+            workflowId,
           );
           const chunkSummary = await maybeRetryShortSummary(
             rawChunk,
             `Compress ${file.path} ${chunk.index}/${chunk.total}`,
             24,
             1,
+            workflowId,
           );
           chunkSummaries.push({
             index: chunk.index,
@@ -407,12 +438,14 @@ export function SourceControlPanel() {
                 buildFileConsolidationPrompt(file.path, chunkSummaries),
                 `Consolidate ${file.path}`,
                 96,
+                workflowId,
               );
         const fileSummary = await maybeRetryShortSummary(
           rawFileSummary,
           `Shorten ${file.path}`,
           35,
           2,
+          workflowId,
         );
         const normalizedFileSummary = normalizeFileSummary(
           fileSummary,
@@ -450,12 +483,14 @@ export function SourceControlPanel() {
         buildChangeConsolidationPrompt(summaries),
         "Consolidate commit memory",
         180,
+        workflowId,
       );
       const shortenedConsolidated = await maybeRetryShortSummary(
         rawConsolidated,
         "Shorten commit memory",
         65,
         3,
+        workflowId,
       );
       const consolidatedSummary = normalizeChangeSummary(
         shortenedConsolidated,
@@ -477,6 +512,7 @@ export function SourceControlPanel() {
         buildCommitMessagePrompt(summaries, consolidatedSummary),
         "Draft commit message",
         180,
+        workflowId,
       );
       const rawDraft = harness.rememberDraft(
         "message_drafter",
@@ -525,10 +561,16 @@ export function SourceControlPanel() {
         body: `Generated a commit message from ${memories.length} file memor${memories.length === 1 ? "y" : "ies"} across ${chunkTotal} bounded diff chunk${chunkTotal === 1 ? "" : "s"}.`,
       });
     } catch (e) {
+      if (e instanceof Error && e.message === COMMIT_DRAFT_CANCELLED) {
+        setOutput({ kind: "info", body: "Commit draft cancelled." });
+        toast.info("Commit draft stopped");
+        return;
+      }
       const body = e instanceof Error ? e.message : String(e);
       setOutput({ kind: "error", body });
       toast.error("Commit generation failed", { body });
     } finally {
+      useModelWorkflows.getState().finishWorkflow(workflowId);
       setCommitGenerating(false);
     }
   };
@@ -551,7 +593,9 @@ export function SourceControlPanel() {
     prompt: string,
     title: string,
     numPredict: number,
+    workflowId: string,
   ): Promise<string> => {
+    assertCommitDraftNotCancelled(workflowId);
     const requestId = newRequestId("git_commit");
     const chunks: string[] = [];
     let streamError: string | null = null;
@@ -560,10 +604,12 @@ export function SourceControlPanel() {
     const done = new Promise<void>((resolve) => {
       markDone = resolve;
     });
+    useModelWorkflows.getState().attachRequest(workflowId, requestId, title);
     const off = await listenEvent<ChatToken>(`ollama:gen:${requestId}`, (event) => {
       sawStreamEvent = true;
       if ("token" in event) chunks.push(event.token);
       if ("error" in event) streamError = event.error;
+      if ("cancelled" in event) streamError = COMMIT_DRAFT_CANCELLED;
       if ("done" in event && event.done) markDone();
     });
     try {
@@ -583,10 +629,15 @@ export function SourceControlPanel() {
           new Promise<void>((resolve) => window.setTimeout(resolve, 250)),
         ]);
       }
+      assertCommitDraftNotCancelled(workflowId);
+      if (streamError === COMMIT_DRAFT_CANCELLED) {
+        throw new Error(COMMIT_DRAFT_CANCELLED);
+      }
       if (streamError) throw new Error(streamError);
       return chunks.join("").trim();
     } finally {
       off();
+      useModelWorkflows.getState().detachRequest(workflowId, requestId);
     }
   };
 
@@ -595,6 +646,7 @@ export function SourceControlPanel() {
     title: string,
     maxWords: number,
     maxSentences: number,
+    workflowId: string,
   ): Promise<string> => {
     if (sentenceCount(raw) <= maxSentences && wordCount(raw) <= maxWords + 6) {
       return raw;
@@ -609,7 +661,14 @@ export function SourceControlPanel() {
       ].join("\n"),
       title,
       Math.max(48, Math.min(120, maxWords * 3)),
+      workflowId,
     );
+  };
+
+  const cancelCommitGeneration = async () => {
+    if (!activeCommitWorkflow) return;
+    setOutput({ kind: "info", body: "Stopping commit draft run…" });
+    await cancelWorkflow(activeCommitWorkflow.id);
   };
 
   if (!root) {
@@ -817,19 +876,35 @@ export function SourceControlPanel() {
             }`}
           />
           {commitGenerating && (
-            <div
-              className="pointer-events-none absolute right-2 top-2 flex h-8 w-8 items-center justify-center"
-              role="status"
-              aria-live="polite"
-              aria-label="Generating commit message"
+            <button
+              type="button"
+              onClick={cancelCommitGeneration}
+              className="absolute right-2 top-2 flex h-8 w-8 items-center justify-center rounded-md text-noir-accent hover:bg-noir-accent/10 focus:outline-none focus:ring-1 focus:ring-noir-accent/60"
+              aria-label="Stop commit draft run"
+              title={
+                commitElapsedMs >= 45_000
+                  ? "Stop this commit draft run"
+                  : "Commit draft is running"
+              }
             >
               <span className="sr-only">Generating commit message</span>
               <span className="pn-commit-agent-orbit" aria-hidden="true">
                 <Bot size={16} strokeWidth={2.2} />
               </span>
-            </div>
+            </button>
           )}
         </div>
+        {commitGenerating && commitElapsedMs >= 30_000 && (
+          <div
+            className="rounded border border-noir-accent/25 bg-noir-accent/10 px-2 py-1 text-[10.5px] text-noir-subtext"
+            role="status"
+            aria-live="polite"
+          >
+            {commitElapsedMs >= 45_000
+              ? "Still thinking. You can stop this run by clicking the robot icon."
+              : "Thinking through the changed files. Pointer is still building commit memory."}
+          </div>
+        )}
         {commitDraft && (
           <details
             className="rounded border border-noir-line/60 bg-noir-canvas/20"
@@ -1049,6 +1124,24 @@ export function SourceControlPanel() {
       )}
     </div>
   );
+}
+
+function assertCommitDraftNotCancelled(workflowId: string) {
+  if (useModelWorkflows.getState().isCancelling(workflowId)) {
+    throw new Error(COMMIT_DRAFT_CANCELLED);
+  }
+}
+
+function updateCommitWorkflowStep(workflowId: string, currentStep: string) {
+  const store = useModelWorkflows.getState();
+  const workflow = store.workflows.find((item) => item.id === workflowId);
+  store.updateWorkflow(workflowId, {
+    currentStep,
+    completedSteps: Math.min(
+      workflow?.totalSteps ?? Number.MAX_SAFE_INTEGER,
+      (workflow?.completedSteps ?? 0) + 1,
+    ),
+  });
 }
 
 function CommitDraftOption({

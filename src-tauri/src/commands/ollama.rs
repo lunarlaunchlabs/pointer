@@ -935,6 +935,73 @@ pub struct FimRequest {
     pub stop: Option<Vec<String>>,
 }
 
+struct FimPrompt {
+    prompt: String,
+    stop: Vec<String>,
+}
+
+fn fim_prompt_for_model(model: &str, prefix: &str, suffix: &str) -> FimPrompt {
+    let id = model.to_ascii_lowercase();
+    let mut stop = vec![
+        "<|endoftext|>".to_string(),
+        "<|file_sep|>".to_string(),
+        "<|im_end|>".to_string(),
+    ];
+
+    if id.contains("deepseek-coder") {
+        stop.extend([
+            "<｜fim▁begin｜>".to_string(),
+            "<｜fim▁hole｜>".to_string(),
+            "<｜fim▁end｜>".to_string(),
+        ]);
+        return FimPrompt {
+            prompt: format!(
+                "<｜fim▁begin｜>{}<｜fim▁hole｜>{}<｜fim▁end｜>",
+                prefix, suffix
+            ),
+            stop,
+        };
+    }
+
+    if id.contains("starcoder") {
+        stop.extend([
+            "<fim_prefix>".to_string(),
+            "<fim_suffix>".to_string(),
+            "<fim_middle>".to_string(),
+        ]);
+        return FimPrompt {
+            prompt: format!("<fim_prefix>{}<fim_suffix>{}<fim_middle>", prefix, suffix),
+            stop,
+        };
+    }
+
+    if id.contains("codellama") || id.contains("code-llama") {
+        stop.extend([
+            "<PRE>".to_string(),
+            "<SUF>".to_string(),
+            "<MID>".to_string(),
+            "<EOT>".to_string(),
+        ]);
+        return FimPrompt {
+            prompt: format!("<PRE> {} <SUF>{} <MID>", prefix, suffix),
+            stop,
+        };
+    }
+
+    stop.extend([
+        "<|fim_prefix|>".to_string(),
+        "<|fim_suffix|>".to_string(),
+        "<|fim_middle|>".to_string(),
+    ]);
+    FimPrompt {
+        prompt: format!(
+            "<|fim_prefix|>{}<|fim_suffix|>{}<|fim_middle|>",
+            prefix, suffix
+        ),
+        stop,
+    }
+}
+
 #[tauri::command]
 pub async fn ollama_fim(
     app: AppHandle,
@@ -956,19 +1023,9 @@ pub async fn ollama_fim(
     )
     .await?;
     let mut cancel = state.cancels.lock().issue(&request_id);
-    // Qwen2.5-Coder FIM template.
-    let prompt = format!(
-        "<|fim_prefix|>{}<|fim_suffix|>{}<|fim_middle|>",
-        request.prefix, request.suffix
-    );
-    let mut stop = vec![
-        "<|fim_prefix|>".to_string(),
-        "<|fim_suffix|>".to_string(),
-        "<|fim_middle|>".to_string(),
-        "<|endoftext|>".to_string(),
-        "<|file_sep|>".to_string(),
-        "<|im_end|>".to_string(),
-    ];
+    let fim = fim_prompt_for_model(&request.model, &request.prefix, &request.suffix);
+    let prompt = fim.prompt;
+    let mut stop = fim.stop;
     if let Some(extra) = request.stop {
         stop.extend(extra);
     }
@@ -1078,4 +1135,43 @@ pub async fn ollama_embed(
 #[tauri::command]
 pub async fn ollama_cancel(state: State<'_, AppState>, request_id: String) -> AppResult<bool> {
     Ok(state.cancels.lock().cancel(&request_id))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::fim_prompt_for_model;
+
+    #[test]
+    fn uses_deepseek_fim_template_for_deepseek_coder() {
+        let prompt = fim_prompt_for_model("deepseek-coder:6.7b-base", "pre", "suf");
+        assert_eq!(
+            prompt.prompt,
+            "<｜fim▁begin｜>pre<｜fim▁hole｜>suf<｜fim▁end｜>"
+        );
+        assert!(prompt.stop.iter().any(|s| s == "<｜fim▁hole｜>"));
+    }
+
+    #[test]
+    fn uses_starcoder_fim_template_for_starcoder_models() {
+        let prompt = fim_prompt_for_model("starcoder2:7b", "pre", "suf");
+        assert_eq!(prompt.prompt, "<fim_prefix>pre<fim_suffix>suf<fim_middle>");
+        assert!(prompt.stop.iter().any(|s| s == "<fim_middle>"));
+    }
+
+    #[test]
+    fn uses_codellama_fim_template_for_codellama_models() {
+        let prompt = fim_prompt_for_model("codellama:7b-code", "pre", "suf");
+        assert_eq!(prompt.prompt, "<PRE> pre <SUF>suf <MID>");
+        assert!(prompt.stop.iter().any(|s| s == "<MID>"));
+    }
+
+    #[test]
+    fn defaults_to_qwen_fim_template() {
+        let prompt = fim_prompt_for_model("qwen2.5-coder:7b-base", "pre", "suf");
+        assert_eq!(
+            prompt.prompt,
+            "<|fim_prefix|>pre<|fim_suffix|>suf<|fim_middle|>"
+        );
+        assert!(prompt.stop.iter().any(|s| s == "<|fim_middle|>"));
+    }
 }

@@ -56,6 +56,9 @@ export function RightDock() {
   const setDockView = useSession((s) => s.noteDockView);
   const chatWidth = useSession((s) => s.chatWidth);
   const noteChatWidth = useSession((s) => s.noteChatWidth);
+  const [mountedViews, setMountedViews] = useState<
+    Set<Exclude<DockView, null>>
+  >(() => (dockView ? new Set([dockView]) : new Set()));
 
   // Hydrate the unified assistant store once. Migration from the
   // legacy chat/agent stores runs inside `init()` if needed.
@@ -69,6 +72,15 @@ export function RightDock() {
   const select = (v: Exclude<DockView, null>) => {
     setDockView(dockView === v ? null : v);
   };
+  useEffect(() => {
+    if (!dockView) return;
+    setMountedViews((current) => {
+      if (current.has(dockView)) return current;
+      const next = new Set(current);
+      next.add(dockView);
+      return next;
+    });
+  }, [dockView]);
   // Feature gates: the rail icon stays visible (so the user can see
   // it exists) but dims when chat isn't usable. Clicking still
   // opens the view, which renders a precise banner with the reason.
@@ -76,17 +88,43 @@ export function RightDock() {
 
   return (
     <div className="h-full flex shrink-0 border-l border-noir-line/80 bg-noir-panel/92 backdrop-blur-xl shadow-[-1px_0_0_rgba(255,255,255,0.02)]">
-      {panelOpen && (
-        <PanelContainer width={chatWidth ?? 420} onResize={noteChatWidth}>
+      {mountedViews.size > 0 && (
+        <PanelContainer
+          width={chatWidth ?? 420}
+          onResize={noteChatWidth}
+          hidden={!panelOpen}
+        >
           <Suspense fallback={<DockLoading />}>
-            {dockView === "assistant" && <AssistantView />}
-            {dockView === "history" && (
-              <HistoryView onNavigate={(v) => setDockView(v)} />
+            {mountedViews.has("assistant") && (
+              <DockPane active={dockView === "assistant"}>
+                <AssistantView />
+              </DockPane>
             )}
-            {dockView === "ai" && <AIPanelView />}
-            {dockView === "activity" && <ModelActivityPanel />}
-            {dockView === "scm" && <SourceControlPanel />}
-            {dockView === "debug" && <DebugPanel />}
+            {mountedViews.has("history") && (
+              <DockPane active={dockView === "history"}>
+                <HistoryView onNavigate={(v) => setDockView(v)} />
+              </DockPane>
+            )}
+            {mountedViews.has("ai") && (
+              <DockPane active={dockView === "ai"}>
+                <AIPanelView />
+              </DockPane>
+            )}
+            {mountedViews.has("activity") && (
+              <DockPane active={dockView === "activity"}>
+                <ModelActivityPanel />
+              </DockPane>
+            )}
+            {mountedViews.has("scm") && (
+              <DockPane active={dockView === "scm"}>
+                <SourceControlPanel />
+              </DockPane>
+            )}
+            {mountedViews.has("debug") && (
+              <DockPane active={dockView === "debug"}>
+                <DebugPanel />
+              </DockPane>
+            )}
           </Suspense>
         </PanelContainer>
       )}
@@ -167,10 +205,12 @@ function DockLoading() {
 function PanelContainer({
   width,
   onResize,
+  hidden,
   children,
 }: {
   width: number;
   onResize: (w: number) => void;
+  hidden?: boolean;
   children: React.ReactNode;
 }) {
   const startDrag = (e: React.MouseEvent) => {
@@ -190,13 +230,30 @@ function PanelContainer({
   };
 
   return (
-    <div className="relative h-full" style={{ width }}>
+    <div
+      className={`relative h-full ${hidden ? "hidden" : ""}`}
+      style={{ width }}
+    >
       <div
         onMouseDown={startDrag}
         className="absolute left-0 top-0 bottom-0 w-1 cursor-col-resize hover:bg-noir-accent/40 z-pn-dock-handle"
         title="Resize"
       />
       <div className="h-full overflow-hidden">{children}</div>
+    </div>
+  );
+}
+
+function DockPane({
+  active,
+  children,
+}: {
+  active: boolean;
+  children: React.ReactNode;
+}) {
+  return (
+    <div className={active ? "h-full" : "hidden"} aria-hidden={!active}>
+      {children}
     </div>
   );
 }

@@ -80,13 +80,27 @@ test.describe("editor language intelligence", () => {
     await expect(suggestWidget).toContainText("Button");
   });
 
-  test("shows and accepts FIM inline tab completion", async ({ appPage: page }) => {
+  test("continues FIM inline tab completion after repeated accepts", async ({ appPage: page }) => {
     await openE2EFile(page, paths.completion);
+    await page.evaluate(() => {
+      window.__POINTER_E2E__?.ai?.setFimDelay?.(220);
+    });
     await page.evaluate(async () => {
       await window.__POINTER_E2E__?.editor?.triggerInlineSuggest?.(4, 16);
     });
 
     await expect(page.getByRole("alert").filter({ hasText: "Greeting" })).toBeVisible();
+    await expect
+      .poll(() =>
+        page.evaluate(
+          () =>
+            window.__POINTER_E2E__?.editor
+              ?.visibleGhostText?.()
+              ?.map((item) => `${item.text}|${item.color}|${item.visibility}`)
+              .join("\n") ?? "",
+        ),
+      )
+      .toContain("Greeting");
     await page.keyboard.press("Tab");
     await expect
       .poll(() =>
@@ -96,6 +110,25 @@ test.describe("editor language intelligence", () => {
         }),
       )
       .toBe(true);
+
+    await expect(page.getByRole("alert").filter({ hasText: ";" })).toBeVisible();
+    await page.keyboard.press("Tab");
+    await expect
+      .poll(() => page.evaluate(() => String(window.__POINTER_E2E__?.editor?.content?.())))
+      .toContain("renderGreeting('Pointer');");
+
+    await expect(page.getByRole("alert").filter({ hasText: "completed by FIM" })).toBeVisible();
+    await page.keyboard.press("Tab");
+    await expect
+      .poll(() => page.evaluate(() => String(window.__POINTER_E2E__?.editor?.content?.())))
+      .toContain("// completed by FIM");
+    const fimCalls = await page.evaluate(
+      () =>
+        window.__POINTER_E2E__?.commandLog?.filter((entry) => entry.command === "ollama_fim")
+          .length ?? 0,
+    );
+    expect(fimCalls).toBeGreaterThanOrEqual(3);
+    expect(fimCalls).toBeLessThanOrEqual(6);
   });
 
   test("follows definitions across imported files and framework entrypoints", async ({

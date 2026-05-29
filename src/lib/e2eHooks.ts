@@ -71,6 +71,23 @@ export function installEditorE2EHooks(
         root?.querySelectorAll<HTMLElement>(".view-line span[class*='mtk']") ?? [],
       ).map((node) => node.className);
     },
+    visibleGhostText: () => {
+      const root = editorInstance.getDomNode();
+      return Array.from(
+        root?.querySelectorAll<HTMLElement>(
+          ".ghost-text-decoration, .ghost-text-decoration-preview",
+        ) ?? [],
+      ).map((node) => {
+        const style = window.getComputedStyle(node);
+        return {
+          text: node.textContent ?? "",
+          color: style.color,
+          backgroundColor: style.backgroundColor,
+          display: style.display,
+          visibility: style.visibility,
+        };
+      });
+    },
     triggerSuggest: async (line: number, column: number) => {
       editorInstance.setPosition({ lineNumber: line, column });
       editorInstance.focus();
@@ -78,6 +95,10 @@ export function installEditorE2EHooks(
     },
     triggerInlineSuggest: async (line: number, column: number) => {
       editorInstance.setPosition({ lineNumber: line, column });
+      editorInstance.focus();
+      await editorInstance.getAction("editor.action.inlineSuggest.trigger")?.run();
+    },
+    triggerInlineSuggestAtCursor: async () => {
       editorInstance.focus();
       await editorInstance.getAction("editor.action.inlineSuggest.trigger")?.run();
     },

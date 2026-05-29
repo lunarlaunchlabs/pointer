@@ -39,6 +39,7 @@ import { useRecentEdits } from "@/store/recentEdits";
 import { aiStageDecorationsFor } from "@/lib/aiStageDecorations";
 import { buildFimContext } from "@/lib/fimContext";
 import { FimRequestCoordinator } from "@/lib/fimRequestCoordinator";
+import { normalizeFimSuggestion } from "@/lib/fimSuggestion";
 import {
   extractPathTarget,
   resolvePathTarget,
@@ -371,6 +372,42 @@ export function Editor() {
       setCursor({ line: e.position.lineNumber, column: e.position.column });
     });
 
+    let fimRetriggerTimer: number | null = null;
+    let lastFimRetriggerAt = 0;
+    const fimRetriggerGap = () =>
+      Math.max(260, useSettings.getState().fimDebounceMs + 180);
+    const triggerFimInlineSuggestion = () => {
+      if (!isFeatureUsable("fim")) return;
+      const now = Date.now();
+      if (now - lastFimRetriggerAt < fimRetriggerGap()) return;
+      const model = ed.getModel();
+      const position = ed.getPosition();
+      if (!model || !position) return;
+      const line = model.getLineContent(position.lineNumber);
+      if (position.column <= 1 && line.trim() === "") return;
+      lastFimRetriggerAt = now;
+      ed.trigger("pointer", "editor.action.inlineSuggest.trigger", undefined);
+    };
+    const scheduleFimRetrigger = (
+      delay = Math.max(40, useSettings.getState().fimDebounceMs + 20),
+    ) => {
+      if (!isFeatureUsable("fim")) return;
+      const elapsed = Date.now() - lastFimRetriggerAt;
+      const nextDelay = Math.max(delay, fimRetriggerGap() - elapsed, 0);
+      if (fimRetriggerTimer) window.clearTimeout(fimRetriggerTimer);
+      fimRetriggerTimer = window.setTimeout(() => {
+        fimRetriggerTimer = null;
+        triggerFimInlineSuggestion();
+      }, nextDelay);
+    };
+    const fimRetriggerDisposable = ed.onDidChangeModelContent(() =>
+      scheduleFimRetrigger(),
+    );
+    const fimTabDisposable = ed.onKeyUp((event) => {
+      if (event.keyCode !== monaco.KeyCode.Tab) return;
+      scheduleFimRetrigger(Math.max(80, useSettings.getState().fimDebounceMs + 80));
+    });
+
     // Pointer-grade file navigation: Monaco can handle rich definitions
     // for TS/JS open models, but developers also expect Cmd/Ctrl-click
     // on import strings, markdown links, and stack-trace paths to open
@@ -446,6 +483,9 @@ export function Editor() {
 
     // Cleanup on dispose — Monaco unmount handles other listeners.
     ed.onDidDispose(() => {
+      if (fimRetriggerTimer) window.clearTimeout(fimRetriggerTimer);
+      fimRetriggerDisposable.dispose();
+      fimTabDisposable.dispose();
       window.removeEventListener("pointer:editor_command", onExternalCommand);
       window.removeEventListener("pointer:editor_insert", onInsert);
       window.removeEventListener("pointer:set_language", onSetLanguage);
@@ -1350,6 +1390,13 @@ export function registerGlobalAiProviders(monaco: Monaco) {
 
         const text = await fimCoordinator.request({
           debounceMs: useSettings.getState().fimDebounceMs,
+          fingerprint: [
+            useSettings.getState().fimModel,
+            textModel.uri.toString(),
+            textModel.getVersionId(),
+            position.lineNumber,
+            position.column,
+          ].join("\u0000"),
           token: cancelToken,
           createRequestId: () => newRequestId("fim"),
           cancelRequest: (id) => {
@@ -1407,17 +1454,22 @@ export function registerGlobalAiProviders(monaco: Monaco) {
               // tight.
               budgetChars: 6_000,
             });
-            return ipc.ollamaFim(id, {
+            const raw = await ipc.ollamaFim(id, {
               model: useSettings.getState().fimModel,
               prefix: ctx.prefix,
               suffix: ctx.suffix,
               num_predict: 96,
               stop: ctx.stop,
             });
+            return normalizeFimSuggestion({
+              raw,
+              prefix: rawPrefix,
+              suffix: rawSuffix,
+            });
           },
         });
 
-        if (!text.trim()) return { items: [] };
+        if (!text) return { items: [] };
         return {
           items: [
             {

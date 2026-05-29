@@ -7,6 +7,7 @@ export type FimCancellationToken = {
 
 export type FimRequestCoordinatorOptions = {
   debounceMs: number;
+  fingerprint?: string;
   token?: FimCancellationToken;
   createRequestId: () => string;
   cancelRequest: (requestId: string) => void | Promise<void>;
@@ -18,28 +19,39 @@ export type FimRequestCoordinatorOptions = {
 type PendingFimRequest = {
   id: string;
   cancel: () => void;
-  disposeCancellation: () => void;
+};
+
+type SharedFimRequest = {
+  fingerprint: string;
+  promise: Promise<string>;
 };
 
 export class FimRequestCoordinator {
   private debounceTimer: TimerHandle | null = null;
   private debounceResolve: ((value: string) => void) | null = null;
-  private debounceCancel: (() => void) | null = null;
   private debounceClearTimeout: (handle: TimerHandle) => void = clearTimeout;
   private pending: PendingFimRequest | null = null;
+  private shared: SharedFimRequest | null = null;
   private sequence = 0;
 
   async request(options: FimRequestCoordinatorOptions): Promise<string> {
+    if (
+      options.fingerprint &&
+      this.shared?.fingerprint === options.fingerprint
+    ) {
+      return this.shared.promise;
+    }
+
     this.cancelDebounce();
     this.cancelPending();
+    this.shared = null;
 
     const sequence = ++this.sequence;
     const setTimeoutFn = options.setTimeoutFn ?? setTimeout;
     const clearTimeoutFn = options.clearTimeoutFn ?? clearTimeout;
-    const token = options.token;
     this.debounceClearTimeout = clearTimeoutFn;
 
-    return new Promise<string>((resolve) => {
+    const promise = new Promise<string>((resolve) => {
       let settled = false;
       const settle = (value: string) => {
         if (settled) return;
@@ -51,24 +63,12 @@ export class FimRequestCoordinator {
       this.debounceResolve = settle;
 
       let timer: TimerHandle | null = null;
-      const cancelBeforeRun = registerFimCancellation(token, () => {
-        if (sequence !== this.sequence) return;
-        if (timer) {
-          if (this.debounceTimer === timer) this.debounceTimer = null;
-          clearTimeoutFn(timer);
-          timer = null;
-        }
-        settle("");
-      });
-      this.debounceCancel = cancelBeforeRun;
 
       timer = setTimeoutFn(() => {
         this.debounceTimer = null;
         if (this.debounceResolve === settle) this.debounceResolve = null;
-        if (this.debounceCancel === cancelBeforeRun) this.debounceCancel = null;
-        cancelBeforeRun();
 
-        if (token?.isCancellationRequested || sequence !== this.sequence) {
+        if (sequence !== this.sequence) {
           settle("");
           return;
         }
@@ -79,42 +79,48 @@ export class FimRequestCoordinator {
           cancel: () => {
             void options.cancelRequest(id);
           },
-          disposeCancellation: () => {},
         };
         this.pending = current;
-
-        current.disposeCancellation = registerFimCancellation(token, () => {
-          current.cancel();
-        });
 
         options
           .generate(id)
           .then((text) => {
-            const stillCurrent = this.pending?.id === id && sequence === this.sequence;
-            settle(stillCurrent && !token?.isCancellationRequested ? text : "");
+            const stillCurrent =
+              this.pending?.id === id && sequence === this.sequence;
+            settle(stillCurrent ? text : "");
           })
           .catch(() => {
             settle("");
           })
           .finally(() => {
-            current.disposeCancellation();
             if (this.pending?.id === id) this.pending = null;
           });
       }, Math.max(0, options.debounceMs));
       this.debounceTimer = timer;
     });
+
+    if (options.fingerprint) {
+      const shared = {
+        fingerprint: options.fingerprint,
+        promise,
+      };
+      this.shared = shared;
+      void promise.finally(() => {
+        if (this.shared === shared) this.shared = null;
+      });
+    }
+
+    return promise;
   }
 
   cancelAll(): void {
     this.sequence += 1;
+    this.shared = null;
     this.cancelDebounce();
     this.cancelPending();
   }
 
   private cancelDebounce(): void {
-    const cancel = this.debounceCancel;
-    this.debounceCancel = null;
-    cancel?.();
     if (this.debounceTimer) {
       this.debounceClearTimeout(this.debounceTimer);
       this.debounceTimer = null;
@@ -128,17 +134,6 @@ export class FimRequestCoordinator {
     if (!this.pending) return;
     const pending = this.pending;
     this.pending = null;
-    pending.disposeCancellation();
     pending.cancel();
   }
-}
-
-function registerFimCancellation(
-  token: FimCancellationToken | undefined,
-  listener: () => void,
-): () => void {
-  const disposable = token?.onCancellationRequested?.(listener);
-  return () => {
-    disposable?.dispose?.();
-  };
 }

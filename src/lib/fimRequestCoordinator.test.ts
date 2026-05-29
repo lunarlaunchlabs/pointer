@@ -117,21 +117,60 @@ describe("FimRequestCoordinator", () => {
     await expect(newPromise).resolves.toBe("new suggestion");
   });
 
-  it("cancels before debounce without running the model call", async () => {
+  it("shares duplicate fingerprint requests even if Monaco cancels the first token", async () => {
     vi.useFakeTimers();
     const coordinator = new FimRequestCoordinator();
-    const cancellation = cancellableToken();
+    const cancelled: string[] = [];
+    const oldToken = cancellableToken();
+    const newToken = cancellableToken();
+    let resolveGenerate: ((text: string) => void) | undefined;
+
+    const first = coordinator.request({
+      debounceMs: 0,
+      fingerprint: "same-buffer-position",
+      token: oldToken.token,
+      createRequestId: () => "first",
+      cancelRequest: (id) => {
+        cancelled.push(id);
+      },
+      generate: () =>
+        new Promise<string>((resolve) => {
+          resolveGenerate = resolve;
+        }),
+    });
+    await vi.runOnlyPendingTimersAsync();
+
+    oldToken.cancel();
+    const second = coordinator.request({
+      debounceMs: 0,
+      fingerprint: "same-buffer-position",
+      token: newToken.token,
+      createRequestId: () => "second",
+      cancelRequest: (id) => {
+        cancelled.push(id);
+      },
+      generate: async () => "duplicate suggestion",
+    });
+
+    resolveGenerate?.("shared suggestion");
+    await expect(first).resolves.toBe("shared suggestion");
+    await expect(second).resolves.toBe("shared suggestion");
+    expect(cancelled).toEqual([]);
+  });
+
+  it("cancelAll cancels before debounce without running the model call", async () => {
+    vi.useFakeTimers();
+    const coordinator = new FimRequestCoordinator();
     const generate = vi.fn(async () => "suggestion");
 
     const promise = coordinator.request({
       debounceMs: 100,
-      token: cancellation.token,
       createRequestId: () => "request",
       cancelRequest: () => {},
       generate,
     });
 
-    cancellation.cancel();
+    coordinator.cancelAll();
     await expect(promise).resolves.toBe("");
     await vi.advanceTimersByTimeAsync(100);
     expect(generate).not.toHaveBeenCalled();

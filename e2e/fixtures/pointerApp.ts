@@ -415,6 +415,7 @@ function mockPointerDesktop(fixture: {
   let gitStatusOverride: Record<string, unknown> | null = null;
   const gitCommandOutputs = new Map<string, string>();
   let ollamaGenerateDelay = 10;
+  let ollamaFimDelay = 20;
   let ollamaGenerateOverrides: Record<string, string> = {};
   let nextCallback = 1;
   let nextRid = 1;
@@ -454,6 +455,11 @@ function mockPointerDesktop(fixture: {
       },
       setGenerateOverrides: (overrides: Record<string, string> | null) => {
         ollamaGenerateOverrides = overrides ?? {};
+      },
+    },
+    ai: {
+      setFimDelay: (delay: number) => {
+        ollamaFimDelay = delay;
       },
     },
   };
@@ -1165,8 +1171,14 @@ function mockPointerDesktop(fixture: {
     return new Promise((resolve) => {
       window.setTimeout(() => {
         const prefix = String(request?.prefix ?? "");
-        resolve(prefix.endsWith("render") ? "Greeting('Pointer')" : "Completion");
-      }, 20);
+        if (prefix.endsWith("render")) resolve("Greeting('Pointer')");
+        else if (prefix.endsWith("renderGreeting('Pointer')")) resolve(";");
+        else if (prefix.endsWith("renderGreeting('Pointer');")) {
+          resolve("\n  // completed by FIM");
+        } else {
+          resolve("Completion");
+        }
+      }, ollamaFimDelay);
     });
   }
 
@@ -1346,8 +1358,16 @@ declare global {
         content?: () => string;
         markers?: () => unknown[];
         visibleTokenClasses?: () => string[];
+        visibleGhostText?: () => Array<{
+          text: string;
+          color: string;
+          backgroundColor: string;
+          display: string;
+          visibility: string;
+        }>;
         triggerSuggest?: (line: number, column: number) => Promise<void>;
         triggerInlineSuggest?: (line: number, column: number) => Promise<void>;
+        triggerInlineSuggestAtCursor?: () => Promise<void>;
         gotoDefinitionAt?: (line: number, column: number) => Promise<string | null>;
       };
       assistant?: {
@@ -1358,6 +1378,9 @@ declare global {
         setCommandOutput?: (command: string, output: string | null) => void;
         setGenerateDelay?: (delay: number) => void;
         setGenerateOverrides?: (overrides: Record<string, string> | null) => void;
+      };
+      ai?: {
+        setFimDelay?: (delay: number) => void;
       };
       debug?: {
         breakpoints?: () => unknown[];
