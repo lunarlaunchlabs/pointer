@@ -18,6 +18,7 @@
     "icons": "node scripts/gen-icons.mjs",
     "eval": "node scripts/quality/run.mjs",
     "eval:stability": "node scripts/quality/run.mjs --rounds=5",
+    "probe:commit": "node scripts/quality/gitCommitPipelineProbe.mjs",
     "assistant:terminal": "node scripts/quality/pointerTerminal.mjs",
     "eval:terminal": "node scripts/quality/pointerTerminal.mjs --suite=smoke",
     "tauri": "tauri",

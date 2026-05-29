@@ -413,6 +413,9 @@ function mockPointerDesktop(fixture: {
   const commandLog: Array<{ command: string; args: unknown; at: number }> = [];
   const unknownCommands: Array<{ command: string; args: unknown }> = [];
   let gitStatusOverride: Record<string, unknown> | null = null;
+  const gitCommandOutputs = new Map<string, string>();
+  let ollamaGenerateDelay = 10;
+  let ollamaGenerateOverrides: Record<string, string> = {};
   let nextCallback = 1;
   let nextRid = 1;
   let nextEventId = 1;
@@ -441,6 +444,16 @@ function mockPointerDesktop(fixture: {
     git: {
       setStatus: (status: Record<string, unknown> | null) => {
         gitStatusOverride = status;
+      },
+      setCommandOutput: (command: string, output: string | null) => {
+        if (output == null) gitCommandOutputs.delete(command);
+        else gitCommandOutputs.set(command, output);
+      },
+      setGenerateDelay: (delay: number) => {
+        ollamaGenerateDelay = delay;
+      },
+      setGenerateOverrides: (overrides: Record<string, string> | null) => {
+        ollamaGenerateOverrides = overrides ?? {};
       },
     },
   };
@@ -590,7 +603,7 @@ function mockPointerDesktop(fixture: {
       case "git_rebase_continue":
       case "git_rebase_abort":
       case "git_discard":
-        return "";
+        return gitCommandOutputs.get(command) ?? "";
       case "terminal_open":
         return { id: args.id, shell: "/bin/zsh" };
       case "terminal_write":
@@ -1124,13 +1137,25 @@ function mockPointerDesktop(fixture: {
     return new Promise((resolve) => {
       window.setTimeout(() => {
         const prompt = String(request?.prompt ?? "");
-        const token = prompt.includes("Write a polished git commit message")
-          ? "Improve source control workflow\n\n- Adds visual git operation controls\n- Drafts commit messages from file summaries"
-          : "Adds visual git workflow support.";
+        const stage = prompt.includes("Write a polished git commit message")
+          ? "commit"
+          : prompt.includes("Consolidate these file summaries")
+            ? "change"
+            : prompt.includes("Consolidate these independent chunk summaries")
+              ? "file"
+              : "chunk";
+        const token = ollamaGenerateOverrides[stage] ??
+          (stage === "commit"
+            ? "Improve source control workflow\n\nKeep remote operations visible while generating concise commit summaries."
+            : stage === "change"
+              ? "Locks the commit composer while generating and builds a concise source control summary."
+              : stage === "file"
+                ? "Summarizes bounded diff chunks into source control intent."
+                : "Adds visual git workflow support.");
         emitTauri(`ollama:gen:${requestId}`, { token });
         emitTauri(`ollama:gen:${requestId}`, { done: true, stats: {} });
         resolve(null);
-      }, 10);
+      }, ollamaGenerateDelay);
     });
   }
 
@@ -1317,6 +1342,9 @@ declare global {
       };
       git?: {
         setStatus?: (status: Record<string, unknown> | null) => void;
+        setCommandOutput?: (command: string, output: string | null) => void;
+        setGenerateDelay?: (delay: number) => void;
+        setGenerateOverrides?: (overrides: Record<string, string> | null) => void;
       };
       debug?: {
         breakpoints?: () => unknown[];

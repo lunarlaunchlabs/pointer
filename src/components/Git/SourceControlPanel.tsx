@@ -2,6 +2,7 @@ import { useEffect, useMemo, useRef, useState } from "react";
 import {
   ArrowDownToLine,
   ArrowUpToLine,
+  Bot,
   Check,
   CircleAlert,
   ChevronDown,
@@ -37,15 +38,25 @@ import {
 import { languageFromPath } from "@/lib/lang";
 import {
   buildCommitMessagePrompt,
-  buildFileSummaryPrompt,
+  buildChangeConsolidationPrompt,
+  buildDiffChunkSummaryPrompt,
+  buildFileConsolidationPrompt,
   changedFilesForCommit,
+  chunkDiffForSummary,
+  fallbackSummaryFromDiff,
   groupBranches,
+  normalizeChangeSummary,
+  normalizeChunkSummary,
+  normalizeFileSummary,
   normalizeGeneratedCommitMessage,
   operationAbortLabel,
   operationActionLabel,
   operationProgress,
+  type CommitChunkSummary,
   type CommitFileSummary,
+  type CommitGenerationMemory,
 } from "@/lib/gitWorkflow";
+import { GitCommitHarness, type CommitFileCandidate } from "@/lib/gitCommitHarness";
 import { isFeatureUsable, useSettings } from "@/store/settings";
 import { toast } from "@/components/Toast";
 import { confirm } from "@/components/Confirm";
@@ -131,10 +142,7 @@ export function SourceControlPanel() {
   const [busy, setBusy] = useState(false);
   const [activeCommand, setActiveCommand] = useState<string | null>(null);
   const [commitGenerating, setCommitGenerating] = useState(false);
-  const [commitDraft, setCommitDraft] = useState<{
-    summaries: CommitFileSummary[];
-    generated: string;
-  } | null>(null);
+  const [commitDraft, setCommitDraft] = useState<CommitGenerationMemory | null>(null);
   const [showStaged, setShowStaged] = useState(true);
   const [showUnstaged, setShowUnstaged] = useState(true);
   const [branches, setBranches] = useState<GitBranchT[] | null>(null);
@@ -279,33 +287,159 @@ export function SourceControlPanel() {
       body: `Summarizing ${files.length} file${files.length === 1 ? "" : "s"}…`,
     });
     try {
-      const summaries: CommitFileSummary[] = [];
+      const harness = new GitCommitHarness();
+      const seedMemory = harness.seed({
+        prompt: "Draft a commit message for the selected git changes.",
+        workspaceRoot: root,
+        openDirectoryEntries: status.entries.map((entry) => ({
+          path: entry.path,
+          kind: "file" as const,
+        })),
+      });
+      const targetMemories = harness.rememberScoutTargets(
+        files.map((file) => ({
+          kind: "file" as const,
+          path: file.path,
+          reason: file.staged
+            ? "Selected from staged git status for commit drafting."
+            : "Selected from tracked unstaged git status for commit drafting.",
+        })),
+        [seedMemory.id],
+      );
+      const candidates: CommitFileCandidate[] = files.map((file) => ({
+        path: file.path,
+        status: file.status,
+        reason: "Selected by deterministic git status for commit drafting.",
+      }));
+      const approvedFiles = harness.promoteApprovedFiles(
+        candidates,
+        candidates.map((candidate) => ({
+          id: candidate.path,
+          label: candidate.path,
+          value: candidate,
+        })),
+        targetMemories.map((memory) => memory.id),
+      );
+      const approvedFileByPath = new Map(
+        approvedFiles.map((memory) => [memory.content.path, memory.id]),
+      );
+      const memories: CommitGenerationMemory["files"] = [];
+      const warnings: string[] = [];
       for (const file of files) {
         const diff = await commitDiffFor(file);
-        const summary = await runCommitModel(
-          buildFileSummaryPrompt(file.path, diff || `${file.path} changed.`),
-          `Summarize ${file.path}`,
-          96,
+        const fallback = fallbackSummaryFromDiff(file.path, file.status, diff);
+        const chunks = chunkDiffForSummary(file.path, diff || `${file.path} changed.`);
+        const chunkSummaries: CommitChunkSummary[] = [];
+        for (const chunk of chunks) {
+          const chunkFallback = fallbackSummaryFromDiff(
+            file.path,
+            file.status,
+            chunk.text,
+          );
+          const rawChunk = await runCommitModel(
+            buildDiffChunkSummaryPrompt(chunk),
+            `Summarize ${file.path} ${chunk.index}/${chunk.total}`,
+            72,
+          );
+          const chunkSummary = await maybeRetryShortSummary(
+            rawChunk,
+            `Compress ${file.path} ${chunk.index}/${chunk.total}`,
+            24,
+            1,
+          );
+          chunkSummaries.push({
+            index: chunk.index,
+            lineRange: `${chunk.startLine}-${chunk.endLine}`,
+            summary: normalizeChunkSummary(
+              chunkSummary,
+              file.path,
+              file.status,
+              chunkFallback,
+            ),
+            fallback: chunkFallback,
+          });
+          harness.rememberChunkSummary(
+            {
+              path: file.path,
+              chunkIndex: chunk.index,
+              totalChunks: chunk.total,
+              lineRange: `${chunk.startLine}-${chunk.endLine}`,
+              summary: chunkSummaries.at(-1)?.summary ?? "",
+            },
+            [approvedFileByPath.get(file.path)].filter((id): id is string => Boolean(id)),
+            true,
+          );
+        }
+
+        const rawFileSummary =
+          chunkSummaries.length <= 1
+            ? (chunkSummaries[0]?.summary ?? "")
+            : await runCommitModel(
+                buildFileConsolidationPrompt(file.path, chunkSummaries),
+                `Consolidate ${file.path}`,
+                96,
+              );
+        const fileSummary = await maybeRetryShortSummary(
+          rawFileSummary,
+          `Shorten ${file.path}`,
+          35,
+          2,
         );
-        summaries.push({
+        memories.push({
           path: file.path,
           status: file.status,
-          summary:
-            summary.trim().replace(/^[-*]\s*/, "") ||
-            `${file.status} ${file.path}`,
+          summary: normalizeFileSummary(fileSummary, file.path, file.status, fallback),
+          fallback,
+          chunks: chunkSummaries,
         });
       }
+
+      const summaries: CommitFileSummary[] = memories.map(
+        ({ path, status, summary, fallback }) => ({
+          path,
+          status,
+          summary,
+          fallback,
+        }),
+      );
+      const rawConsolidated = await runCommitModel(
+        buildChangeConsolidationPrompt(summaries),
+        "Consolidate commit memory",
+        180,
+      );
+      const shortenedConsolidated = await maybeRetryShortSummary(
+        rawConsolidated,
+        "Shorten commit memory",
+        65,
+        3,
+      );
+      const consolidatedSummary = normalizeChangeSummary(
+        shortenedConsolidated,
+        summaries,
+      );
       const generated = await runCommitModel(
-        buildCommitMessagePrompt(summaries),
+        buildCommitMessagePrompt(summaries, consolidatedSummary),
         "Draft commit message",
         180,
       );
       const normalized = normalizeGeneratedCommitMessage(generated, summaries);
+      const chunkTotal = memories.reduce((sum, file) => sum + file.chunks.length, 0);
+      const harnessSnapshot = harness.memory.snapshot();
       setCommitMessage(normalized);
-      setCommitDraft({ summaries, generated: normalized });
+      setCommitDraft({
+        files: memories,
+        consolidatedSummary,
+        generatedCommitMessage: normalized,
+        warnings,
+        harnessMemory: {
+          lanes: harnessSnapshot.lanes.length,
+          memories: harnessSnapshot.memories.length,
+          approved: harnessSnapshot.memories.filter((memory) => memory.status === "approved").length,
+        },
+      });
       setOutput({
         kind: "info",
-        body: `Generated a commit message from ${summaries.length} independent file summary${summaries.length === 1 ? "" : "ies"}.`,
+        body: `Generated a commit message from ${memories.length} file memor${memories.length === 1 ? "y" : "ies"} across ${chunkTotal} bounded diff chunk${chunkTotal === 1 ? "" : "s"}.`,
       });
     } catch (e) {
       const body = e instanceof Error ? e.message : String(e);
@@ -371,6 +505,28 @@ export function SourceControlPanel() {
     } finally {
       off();
     }
+  };
+
+  const maybeRetryShortSummary = async (
+    raw: string,
+    title: string,
+    maxWords: number,
+    maxSentences: number,
+  ): Promise<string> => {
+    if (sentenceCount(raw) <= maxSentences && wordCount(raw) <= maxWords + 6) {
+      return raw;
+    }
+    return runCommitModel(
+      [
+        "Compress this summary. Return only the compressed summary.",
+        `Use at most ${maxSentences} sentence${maxSentences === 1 ? "" : "s"} and ${maxWords} words.`,
+        "Do not add new facts, file paths, filenames, or changed symbols.",
+        "",
+        raw.trim(),
+      ].join("\n"),
+      title,
+      Math.max(48, Math.min(120, maxWords * 3)),
+    );
   };
 
   if (!root) {
@@ -553,33 +709,105 @@ export function SourceControlPanel() {
       </section>
 
       <div className="px-3 py-2 border-b border-noir-line/60 space-y-2">
-        <textarea
-          value={commitMessage}
-          onChange={(e) => setCommitMessage(e.target.value)}
-          placeholder="Commit message (⌘↵ to commit)"
-          aria-label="Commit message"
-          onKeyDown={(e) => {
-            if ((e.metaKey || e.ctrlKey) && e.key === "Enter") {
-              e.preventDefault();
-              commit();
-            }
-          }}
-          rows={2}
-          className="w-full text-[12px] bg-noir-canvas border border-noir-line rounded px-2 py-1.5 resize-none outline-none focus:border-noir-accent placeholder:text-noir-mute"
-        />
+        <div className="relative">
+          <textarea
+            value={commitMessage}
+            onChange={(e) => {
+              if (!commitGenerating) setCommitMessage(e.target.value);
+            }}
+            placeholder="Commit message (⌘↵ to commit)"
+            aria-label="Commit message"
+            aria-busy={commitGenerating}
+            readOnly={commitGenerating}
+            onKeyDown={(e) => {
+              if (commitGenerating) return;
+              if ((e.metaKey || e.ctrlKey) && e.key === "Enter") {
+                e.preventDefault();
+                commit();
+              }
+            }}
+            rows={2}
+            className={`w-full text-[12px] bg-noir-canvas border rounded px-2 py-1.5 resize-none outline-none placeholder:text-noir-mute transition-[border-color,box-shadow,background-color] ${
+              commitGenerating
+                ? "border-noir-accent/55 pr-12 cursor-wait shadow-[0_0_0_1px_rgba(255,45,126,0.15),0_0_26px_-18px_rgba(255,45,126,0.95)]"
+                : "border-noir-line focus:border-noir-accent"
+            }`}
+          />
+          {commitGenerating && (
+            <div
+              className="pointer-events-none absolute right-2 top-2 flex h-8 w-8 items-center justify-center"
+              role="status"
+              aria-live="polite"
+              aria-label="Generating commit message"
+            >
+              <span className="sr-only">Generating commit message</span>
+              <span className="pn-commit-agent-orbit" aria-hidden="true">
+                <Bot size={16} strokeWidth={2.2} />
+              </span>
+            </div>
+          )}
+        </div>
         {commitDraft && (
-          <details className="rounded border border-noir-line/60 bg-noir-canvas/20">
+          <details
+            className="rounded border border-noir-line/60 bg-noir-canvas/20"
+            data-testid="commit-generation-memory"
+          >
             <summary className="cursor-pointer select-none px-2 py-1 text-[10px] uppercase tracking-wider text-noir-mute">
-              Commit intelligence · {commitDraft.summaries.length} file summaries
+              Commit intelligence · {commitDraft.files.length} file memories ·{" "}
+              {commitDraft.files.reduce((sum, item) => sum + item.chunks.length, 0)} chunks
+              {commitDraft.harnessMemory
+                ? ` · ${commitDraft.harnessMemory.approved}/${commitDraft.harnessMemory.memories} approved harness memories`
+                : ""}
             </summary>
-            <ul className="border-t border-noir-line/60 px-2 py-1.5 space-y-1">
-              {commitDraft.summaries.map((item) => (
-                <li key={item.path} className="text-[10.5px] leading-relaxed">
-                  <span className="font-mono text-noir-accent">{item.path}</span>
-                  <span className="text-noir-mute"> — {item.summary}</span>
-                </li>
-              ))}
-            </ul>
+            <div className="border-t border-noir-line/60 px-2 py-2 space-y-2">
+              <CommitDraftOption
+                label="Consolidated summary"
+                value={commitDraft.consolidatedSummary}
+                action="Use summary"
+                onUse={() => setCommitMessage(commitDraft.consolidatedSummary)}
+              />
+              <CommitDraftOption
+                label="Commit message"
+                value={commitDraft.generatedCommitMessage}
+                action="Use message"
+                onUse={() => setCommitMessage(commitDraft.generatedCommitMessage)}
+              />
+              {commitDraft.warnings.length > 0 && (
+                <div className="rounded border border-noir-warn/30 bg-noir-warn/5 px-2 py-1 text-[10.5px] text-noir-warn">
+                  {commitDraft.warnings.join(" ")}
+                </div>
+              )}
+              <div className="space-y-1.5">
+                {commitDraft.files.map((item) => (
+                  <details
+                    key={item.path}
+                    className="rounded border border-noir-line/45 bg-noir-panel/30"
+                  >
+                    <summary className="cursor-pointer px-2 py-1 text-[10.5px] leading-relaxed">
+                      <span className="font-mono text-noir-accent">{item.path}</span>
+                      <span className="text-noir-mute">
+                        {" "}
+                        — {item.summary} ({item.chunks.length} chunk
+                        {item.chunks.length === 1 ? "" : "s"})
+                      </span>
+                    </summary>
+                    <ol className="border-t border-noir-line/40 px-2 py-1.5 space-y-1">
+                      {item.chunks.map((chunk) => (
+                        <li
+                          key={`${item.path}:${chunk.index}`}
+                          className="text-[10px] leading-relaxed text-noir-mute"
+                        >
+                          <span className="font-mono text-noir-subtext">
+                            {chunk.index} · lines {chunk.lineRange}
+                          </span>
+                          <span> — {chunk.summary}</span>
+                        </li>
+                      ))}
+                    </ol>
+                  </details>
+                ))}
+              </div>
+            </div>
           </details>
         )}
         <div className="flex items-center justify-between gap-2">
@@ -710,14 +938,15 @@ export function SourceControlPanel() {
 
       {output && (
         <div
-          className={`border-t border-noir-line/60 px-3 py-2 text-[11px] font-mono max-h-32 overflow-y-auto ${
+          className={`border-t border-noir-line/60 text-[11px] font-mono ${
             output.kind === "error" ? "text-noir-err" : "text-noir-subtext"
           }`}
+          data-testid="git-output-pane"
         >
-          <div className="flex items-start justify-between gap-2">
-            <pre className="whitespace-pre-wrap flex-1 break-words">
-              {output.body}
-            </pre>
+          <div className="px-3 py-1.5 flex items-center justify-between gap-2 border-b border-noir-line/40 bg-noir-canvas/45">
+            <span className="text-[10px] uppercase tracking-wider text-noir-mute">
+              Git output
+            </span>
             <button
               onClick={() => setOutput(null)}
               className="text-noir-mute hover:text-noir-text shrink-0"
@@ -727,10 +956,61 @@ export function SourceControlPanel() {
               <X size={11} aria-hidden="true" />
             </button>
           </div>
+          <pre
+            className="max-h-32 overflow-y-auto px-3 py-2 whitespace-pre-wrap break-words"
+            data-testid="git-output-log"
+          >
+            {output.body}
+          </pre>
         </div>
       )}
     </div>
   );
+}
+
+function CommitDraftOption({
+  label,
+  value,
+  action,
+  onUse,
+}: {
+  label: string;
+  value: string;
+  action: string;
+  onUse: () => void;
+}) {
+  return (
+    <section className="rounded border border-noir-line/45 bg-noir-panel/40 px-2 py-1.5">
+      <div className="mb-1 flex items-center justify-between gap-2">
+        <div className="text-[10px] uppercase tracking-wider text-noir-mute">
+          {label}
+        </div>
+        <button
+          type="button"
+          onClick={onUse}
+          className="rounded border border-noir-line px-1.5 py-0.5 text-[10px] text-noir-subtext hover:border-noir-accent/50 hover:text-noir-accent"
+        >
+          {action}
+        </button>
+      </div>
+      <p className="whitespace-pre-wrap text-[10.5px] leading-relaxed text-noir-subtext">
+        {value}
+      </p>
+    </section>
+  );
+}
+
+function sentenceCount(text: string): number {
+  return (
+    text
+      .replace(/\s+/g, " ")
+      .trim()
+      .match(/[^.!?]+[.!?]+|[^.!?]+$/g)?.length ?? 0
+  );
+}
+
+function wordCount(text: string): number {
+  return text.split(/\s+/).filter(Boolean).length;
 }
 
 type GitCommandRunner = (

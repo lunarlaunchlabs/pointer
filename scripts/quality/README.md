@@ -26,6 +26,16 @@ node scripts/quality/run.mjs --only=chat,agent
 # Terminal workbench that mirrors the app's Ask / Plan / Agent flows.
 npm run assistant:terminal -- --repo /Users/sameer/express
 
+# Probe every stage of staged-diff commit generation.
+npm run probe:commit -- --model qwen2.5-coder:14b-instruct
+
+# Deterministic chaos probe: injects bad raw model output and proves the
+# normalizers repair it before the user sees the summary/message.
+npm run probe:commit -- --mock --fail-on-warnings
+
+# Same probe with the six-vote judge layer on the final output and trace.
+npm run probe:commit -- --mock --judge --fail-on-warnings
+
 # Fast terminal smoke across real repos.
 npm run eval:terminal
 
@@ -172,6 +182,10 @@ model went wrong vs. where the harness mis-scored.
 
 If you change any of these, update the corresponding harness file:
 
+* `src/lib/harnessCore.ts` is the executable contract for mode
+  permissions, Agent phase gates, failure taxonomy, transcript grading,
+  critic verdicts, and experiment-card acceptance. Prompt changes should
+  not bypass these gates.
 * `src/store/chat.ts` :: `chatSystemPrompt` → `evalChat.mjs::chatSystem`
 * `src/lib/diff.ts` :: `parseSearchReplace` → `scripts/quality/lib.mjs::parseSearchReplace`
 * `src-tauri/prompts/agent_system.txt` is read directly — no copy.
@@ -185,6 +199,73 @@ If you change any of these, update the corresponding harness file:
 * `src-tauri/src/commands/agent.rs` :: `run_grep` (regex-with-literal-
   fallback) → harness `runTool` grep branch in `evalAgent.mjs`.
 
+## State-machine harness contract
+
+Pointer's local-model runtime is a constrained IDE system, not a
+freeform chatbot. The core contract lives in `src/lib/harnessCore.ts`
+and names the components every surface should converge on:
+
+* `AgentOrchestrator`, `ContextBuilder`, `ToolRouter`,
+  `PermissionEngine`, `PatchManager`, `Verifier`, `Critic`, and
+  `Judge`.
+* `ScenarioRunner`, `TranscriptRecorder`, `TranscriptGrader`,
+  `RepoCurator`, `TaskGenerator`, `FailureTaxonomy`, and
+  `RegressionRunner`.
+
+The first rule is deterministic enforcement: Ask/Plan are read-only,
+Commit Message can only see git diffs/status, Agent cannot edit before an
+evidence packet plus checkpoint, Repair can only touch files already
+touched in the current attempt, and dangerous shell commands are blocked
+at the permission layer. Every harness change should include an
+experiment card and must improve grades without introducing a new
+critical failure tag.
+
+`Judge` is the tight Y/N validation layer for model outputs that need
+extra confidence. It runs three isolated judges, and each judge votes
+twice: once on the final outcome, and once on due diligence using the
+agent path that led there (reads, searches, directory listings,
+diagnostics, command checks, or other trace events). Each vote must
+return exactly `Y` or `N`; invalid text triggers a stricter retry prompt,
+and Pointer only records `invalid` after the retry budget is exhausted.
+The default pass threshold is 4 yes votes out of 6, with invalid votes
+blocking validation.
+
+`StageJudge` wraps that same voting layer around a scheduled harness
+stage. A stage can only return `complete`, `retry`, or `blocked`; failed
+validation replays the exact agent prompt that produced the failed
+output, preserving that prompt's context-clear flag. After three failed
+validations for the same prompt, the stage backtracks to the previous
+prompt in the prompt stack and retries from there. If the first prompt in
+the stack exhausts its retry budget, the stage blocks so the UI and
+transcript can show which scheduled task did not complete.
+`ScenarioRunner.runScheduledStages` uses this gate for ordered stage
+packs, stopping at the first incomplete stage so later work cannot start
+on top of unvalidated context.
+
+The shared harness is composable rather than feature-specific. Core
+agent archetypes include scouts, scout troop leaders, researchers,
+summarizers, consolidators, evaluators, action proposers, action takers,
+judges, critics, verifiers, drafters, and memory curators. Each feature
+gets a dedicated blueprint made from those archetypes. The blueprint
+declares allowed tools, memory inputs/outputs, whether a layer may only
+propose or may take an action, and which judge gate must approve the
+layer before its output becomes usable.
+
+`MemoryGraph` stores durable memories by lane, kind, stage, archetype,
+parents, tags, and approval status. This lets Pointer keep parallel lanes
+of thought, trace every summary back to its prompt/tool result, and
+materialize only approved memories for later layers. Model agents propose
+or summarize; typed code gathers files, diffs, diagnostics, and command
+outputs; judge councils decide what is promoted into memory.
+
+The git commit harness is specialized in `src/lib/gitCommitHarness.ts`.
+It has no action taker layers: it can propose context, gather read-only
+git/file evidence, summarize chunks, evaluate sufficiency, propose commit
+splits, and draft a message, but it cannot edit, stage, commit, reset, or
+discard files. Per-item judge councils approve individual scout targets,
+candidate files, and chunk summaries before those memories feed the next
+layer.
+
 ### Terminal workbench (`pointerTerminal.mjs`)
 
 Runs a REPL that mimics the unified Assistant UI from a terminal so we
@@ -193,6 +274,30 @@ real repo into the same in-memory VFS used by `evalAgent.mjs`, resolves
 implicit file mentions, attaches the active editor file to Ask mode,
 routes Plan/Agent through the production agent system prompt, and prompts
 for approvals when running `agent-ask`.
+
+### Commit pipeline probe (`gitCommitPipelineProbe.mjs`)
+
+Runs the same staged-diff commit generation pipeline outside the UI and
+prints every stage:
+
+* per-file diff chunks,
+* raw chunk model output,
+* normalized chunk summaries,
+* raw file consolidation,
+* normalized file summaries,
+* raw consolidated summary,
+* normalized consolidated summary,
+* raw final commit message,
+* normalized final commit message.
+
+The probe imports `src/lib/gitWorkflow.ts` through Vite, so it exercises
+the production normalizers and prompts rather than a copied script. It
+can call a real Ollama model with `--model <name>` or run `--mock`,
+which intentionally emits bad strings like template literals, path
+fragments, and theme-only commit subjects. Use `--fail-on-warnings` in
+CI-style loops to make leaks fail the command. Add `--judge` to run the
+six-vote Judge layer over both final commit-message quality and pipeline
+due diligence.
 
 Useful commands inside the REPL:
 

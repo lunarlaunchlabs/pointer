@@ -127,6 +127,11 @@ test.describe("workspace tree and assistant flows", () => {
         ],
         dirty_count: 1,
       });
+      window.__POINTER_E2E__?.git?.setCommandOutput?.(
+        "git_push",
+        Array.from({ length: 80 }, (_, i) => `remote line ${i + 1}`).join("\n"),
+      );
+      window.__POINTER_E2E__?.git?.setGenerateDelay?.(60);
       window.dispatchEvent(new Event("focus"));
     });
 
@@ -136,20 +141,84 @@ test.describe("workspace tree and assistant flows", () => {
     await expect(page.getByText("Remote sync")).toBeVisible();
     const sync = page.locator("section").filter({ hasText: "Remote sync" });
     await sync.getByRole("button", { name: "Push to remote" }).click();
-    await expect(page.getByText(/git push done/)).toBeVisible();
+    await expect(page.getByText(/remote line 1/)).toBeVisible();
+    await page.getByTestId("git-output-log").evaluate((node) => {
+      node.scrollTop = node.scrollHeight;
+    });
+    await expect(page.getByRole("button", { name: "Dismiss git output" })).toBeVisible();
+    await page.getByRole("button", { name: "Dismiss git output" }).click();
+    await expect(page.getByTestId("git-output-pane")).toBeHidden();
 
     await expect(page.getByRole("button", { name: /Generate commit message/ })).toBeEnabled();
 
     await page.getByRole("button", { name: /Generate commit message/ }).click();
+    await expect(page.getByRole("textbox", { name: "Commit message" })).toHaveJSProperty(
+      "readOnly",
+      true,
+    );
     await expect(page.getByRole("textbox", { name: "Commit message" })).toHaveValue(
       /Improve source control workflow/,
     );
+    await expect(page.getByRole("textbox", { name: "Commit message" })).toHaveJSProperty(
+      "readOnly",
+      false,
+    );
     await expect(page.getByText(/Commit intelligence/)).toBeVisible();
+    await page.getByText(/Commit intelligence/).click();
+    const memory = page.getByTestId("commit-generation-memory");
+    await expect(memory.getByText("Consolidated summary")).toBeVisible();
+    await expect(memory.getByText("Commit message")).toBeVisible();
 
     const calls = await commandLog(page);
     expect(calls.some((entry) => entry.command === "git_push")).toBe(true);
     expect(calls.some((entry) => entry.command === "git_diff")).toBe(true);
     expect(calls.some((entry) => entry.command === "ollama_generate")).toBe(true);
+  });
+
+  test("normalizes weak draft output from the commit UI path", async ({
+    appPage: page,
+  }) => {
+    await page.evaluate(() => {
+      window.__POINTER_E2E__?.git?.setStatus?.({
+        files: {
+          "src/App.tsx": "modified",
+        },
+        entries: [
+          {
+            path: "src/App.tsx",
+            status: "modified",
+            staged: true,
+            unstaged: false,
+          },
+        ],
+        dirty_count: 1,
+      });
+      window.__POINTER_E2E__?.git?.setCommandOutput?.(
+        "git_diff",
+        [
+          "diff --git a/src/App.tsx b/src/App.tsx",
+          "@@ -1,3 +1,5 @@",
+          '+const draftStatus = "commit draft validation keeps generated summaries grounded";',
+          '+const judgeStatus = "judge retry prevents incomplete scheduled stages";',
+        ].join("\n"),
+      );
+      window.__POINTER_E2E__?.git?.setGenerateOverrides?.({
+        chunk: "Adds file path.",
+        file: "Updates src/lib/harnessCore.",
+        change:
+          "Updates remote line ${i + 1}. Updates Adds visual git workflow support.. Updates src/lib/harnessCore.",
+        commit:
+          "fix: correct git commit pipeline probe and commit file summary\n\nIncludes commit agent orbit, commit draft, and file path.",
+      });
+      window.dispatchEvent(new Event("focus"));
+    });
+
+    await page.getByRole("tab", { name: "Source Control" }).click();
+    await page.getByRole("button", { name: /Generate commit message/ }).click();
+    const message = page.getByRole("textbox", { name: "Commit message" });
+    await expect(message).toHaveValue(/commit|judge|summary/i);
+    await expect(message).not.toHaveValue(/file path/i);
+    await expect(message).not.toHaveValue(/remote line|\$\{/i);
   });
 
   test("handles Git credential prompts inside Pointer", async ({ appPage: page }) => {
