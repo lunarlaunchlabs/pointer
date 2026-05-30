@@ -9,7 +9,7 @@ export default {
   theme: {
     extend: {
       colors: {
-        // Read from CSS variables so themes (Noir / Light) can swap
+        // Read from CSS variables so Pointer themes can swap
         // at runtime without rebuilding Tailwind. Legacy hex
         // fallbacks live in :root and body.pn-theme-light in
         // index.css; the values below are just the lookup keys.
@@ -65,7 +65,8 @@ export default {
         editor: ["14px", { lineHeight: "1.55", letterSpacing: "0" }],
       },
       boxShadow: {
-        glow: "0 0 0 1px #FF2D7E33, 0 0 24px -4px #FF2D7E44",
+        glow:
+          "0 0 0 1px rgb(var(--pn-accent-rgb, 255 45 126) / 0.2), 0 0 24px -4px rgb(var(--pn-accent-rgb, 255 45 126) / 0.27)",
         soft: "0 1px 0 0 #ffffff08 inset, 0 8px 24px -12px #000",
       },
       backdropBlur: {
