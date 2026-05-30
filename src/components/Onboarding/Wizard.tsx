@@ -170,6 +170,152 @@ function Intro({ rerun, onNext }: { rerun: boolean; onNext: () => void }) {
   );
 }
 
+function ThemeStep({ onNext }: { onNext: () => void }) {
+  const appTheme = useSettings((s) => s.appTheme);
+  const setAppTheme = useSettings((s) => s.setAppTheme);
+  const selectTheme = (themeId: AppThemeId) => {
+    setAppTheme(themeId);
+  };
+
+  return (
+    <div className="space-y-4">
+      <div className="flex items-center gap-3">
+        <Palette size={20} className="text-noir-accent" />
+        <div>
+          <h3 className="font-sans text-[16px] text-noir-text">
+            Choose your theme
+          </h3>
+          <p className="mt-1 font-sans text-[12px] text-noir-subtext">
+            This sets Pointer&apos;s chrome and editor syntax palette. You can
+            change it later from Settings or the Themes menu.
+          </p>
+        </div>
+      </div>
+      <div
+        role="radiogroup"
+        aria-label="Pointer theme"
+        className="grid max-h-[330px] grid-cols-1 gap-2 overflow-y-auto pr-1 sm:grid-cols-2"
+      >
+        {POINTER_THEMES.map((theme) => {
+          const selected = theme.id === appTheme;
+          return (
+            <button
+              key={theme.id}
+              type="button"
+              role="radio"
+              aria-checked={selected}
+              aria-label={theme.menuLabel}
+              onClick={() => selectTheme(theme.id)}
+              className={`group rounded-lg border p-3 text-left transition-colors ${
+                selected
+                  ? "border-noir-accent bg-noir-accent/10"
+                  : "border-noir-line bg-noir-canvas/35 hover:border-noir-accent/50 hover:bg-noir-ridge/35"
+              }`}
+            >
+              <div className="flex items-center justify-between gap-3">
+                <div className="min-w-0">
+                  <div className="font-sans text-[12px] text-noir-text">
+                    {theme.menuLabel}
+                  </div>
+                  <div className="mt-1 flex items-center gap-1.5" aria-hidden="true">
+                    {[
+                      "--pn-canvas",
+                      "--pn-panel",
+                      "--pn-accent",
+                      "--pn-code-keyword",
+                      "--pn-code-string",
+                      "--pn-code-function",
+                    ].map((token) => (
+                      <span
+                        key={token}
+                        className="h-3 w-5 rounded-sm border border-noir-line/50"
+                        style={{
+                          backgroundColor:
+                            theme.css[token as keyof typeof theme.css],
+                        }}
+                      />
+                    ))}
+                  </div>
+                </div>
+                <span
+                  className={`flex h-5 w-5 shrink-0 items-center justify-center rounded-full border ${
+                    selected
+                      ? "border-noir-accent bg-noir-accent text-white"
+                      : "border-noir-line text-transparent group-hover:border-noir-accent/60"
+                  }`}
+                  aria-hidden="true"
+                >
+                  <Check size={12} />
+                </span>
+              </div>
+              <div
+                className="mt-3 overflow-hidden rounded-md border border-noir-line/50"
+                style={{
+                  backgroundColor: theme.css["--pn-code-bg"],
+                  color: theme.css["--pn-code-fg"],
+                }}
+                aria-hidden="true"
+              >
+                <div
+                  className="flex items-center gap-1 border-b px-2 py-1"
+                  style={{
+                    borderColor: theme.css["--pn-line"],
+                    backgroundColor: theme.css["--pn-chrome"],
+                  }}
+                >
+                  <span
+                    className="h-2 w-2 rounded-full"
+                    style={{ backgroundColor: theme.css["--pn-accent"] }}
+                  />
+                  <span className="font-mono text-[9px] opacity-80">
+                    App.tsx
+                  </span>
+                </div>
+                <div className="space-y-1 px-2 py-2 font-mono text-[10px] leading-tight">
+                  <div>
+                    <span style={{ color: theme.css["--pn-code-keyword"] }}>
+                      export
+                    </span>{" "}
+                    <span style={{ color: theme.css["--pn-code-function"] }}>
+                      default
+                    </span>{" "}
+                    <span style={{ color: theme.css["--pn-code-type"] }}>
+                      function
+                    </span>
+                  </div>
+                  <div>
+                    <span style={{ color: theme.css["--pn-code-tag"] }}>
+                      &lt;main
+                    </span>{" "}
+                    <span style={{ color: theme.css["--pn-code-attribute"] }}>
+                      className
+                    </span>
+                    =
+                    <span style={{ color: theme.css["--pn-code-string"] }}>
+                      &quot;pointer&quot;
+                    </span>
+                    <span style={{ color: theme.css["--pn-code-tag"] }}>
+                      /&gt;
+                    </span>
+                  </div>
+                </div>
+              </div>
+            </button>
+          );
+        })}
+      </div>
+      <div className="flex justify-end">
+        <button
+          onClick={onNext}
+          className="pn-button-accent font-sans flex items-center gap-1.5"
+        >
+          Continue <ChevronRight size={12} />
+        </button>
+      </div>
+    </div>
+  );
+}
+
 function OllamaStep({
   onNext,
   onBusyChange,

@@ -66,6 +66,7 @@ function resetSettings() {
     agentModel: "qwen2.5-coder:7b-instruct",
     fimModel: "qwen2.5-coder:1.5b-base",
     embedModel: "nomic-embed-text",
+    appTheme: "pointer-noir",
     chatEnabled: true,
     agentEnabled: true,
     inlineEditEnabled: true,
@@ -100,6 +101,8 @@ describe("<Onboarding>", () => {
 
     expect(screen.getByText("Review Pointer setup")).toBeInTheDocument();
     await user.click(screen.getByRole("button", { name: /Review setup/i }));
+    expect(await screen.findByText("Choose your theme")).toBeInTheDocument();
+    await user.click(screen.getByRole("button", { name: /Continue/i }));
 
     expect(await screen.findByText(/Ollama is running/)).toBeInTheDocument();
     await waitFor(() =>
@@ -140,6 +143,8 @@ describe("<Onboarding>", () => {
     render(<Onboarding onDone={vi.fn()} />);
 
     await user.click(screen.getByRole("button", { name: /Get started/i }));
+    expect(await screen.findByText("Choose your theme")).toBeInTheDocument();
+    await user.click(screen.getByRole("button", { name: /Continue/i }));
     expect(await screen.findByText(/Ollama is running/)).toBeInTheDocument();
     await user.click(screen.getByRole("button", { name: /^Next/i }));
 
@@ -152,5 +157,27 @@ describe("<Onboarding>", () => {
         screen.getByRole("button", { name: /Use current setup/i }),
       ).toBeEnabled(),
     );
+  });
+
+  it("lets first-run setup pick the app theme before runtime setup", async () => {
+    mockRuntime(["qwen2.5-coder:7b-instruct"]);
+
+    const user = userEvent.setup();
+    render(<Onboarding onDone={vi.fn()} />);
+
+    await user.click(screen.getByRole("button", { name: /Get started/i }));
+    expect(await screen.findByRole("radiogroup", { name: "Pointer theme" })).toBeInTheDocument();
+
+    await user.click(screen.getByRole("radio", { name: "Pointer Blanc" }));
+    expect(useSettings.getState().appTheme).toBe("pointer-blanc");
+    await waitFor(() =>
+      expect(screen.getByRole("radio", { name: "Pointer Blanc" })).toHaveAttribute(
+        "aria-checked",
+        "true",
+      ),
+    );
+
+    await user.click(screen.getByRole("button", { name: /Continue/i }));
+    expect(await screen.findByText(/Ollama is running/)).toBeInTheDocument();
   });
 });
