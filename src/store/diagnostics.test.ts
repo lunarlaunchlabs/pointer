@@ -73,4 +73,26 @@ describe("diagnostics store", () => {
     expect(state.byUri[baseDiag.uri]).toEqual([monacoDiag]);
     expect(state.errors).toBe(1);
   });
+
+  it("subscribes once per Monaco instance instead of once per module lifetime", () => {
+    const first = fakeMonaco();
+    const second = fakeMonaco();
+
+    useDiagnostics.getState().installFromMonaco(first as any);
+    useDiagnostics.getState().installFromMonaco(first as any);
+    useDiagnostics.getState().installFromMonaco(second as any);
+
+    expect(first.editor.onDidChangeMarkers).toHaveBeenCalledTimes(1);
+    expect(second.editor.onDidChangeMarkers).toHaveBeenCalledTimes(1);
+  });
 });
+
+function fakeMonaco() {
+  return {
+    editor: {
+      onDidChangeMarkers: vi.fn(),
+      getModels: vi.fn(() => []),
+      getModelMarkers: vi.fn(() => []),
+    },
+  };
+}

@@ -294,6 +294,10 @@ export function fallbackSummaryFromDiff(
     const target = sign === "+" ? added : removed;
     for (const concept of extractIdentifierConcepts(text)) target.add(concept);
     for (const phrase of extractFeaturePhrases(text)) featurePhrases.add(phrase);
+    if (sign === "+") {
+      const prose = extractProsePhrase(text);
+      if (prose) featurePhrases.add(prose);
+    }
   }
 
   const symbols = [...added].filter((symbol) => !removed.has(symbol)).slice(0, 3);
@@ -377,7 +381,17 @@ function removePathInventory(text: string, paths: string[]): string {
     const escaped = path.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
     out = out.replace(new RegExp(escaped, "gi"), "");
   }
-  return out.replace(/\s+/g, " ").trim();
+  return cleanupPathRemovalArtifacts(out.replace(/\s+/g, " ").trim());
+}
+
+function cleanupPathRemovalArtifacts(text: string): string {
+  return text
+    .replace(/\b(?:the|this)\s+is\s+updated\s+to\s+describe\s+/gi, "Updates ")
+    .replace(/\b(?:the|this)\s+is\s+(updated|changed|modified)\s+to\s+/gi, "Updates ")
+    .replace(/\b(?:the|this)\s+is\s+(updated|changed|modified)\b/gi, "Updates")
+    .replace(/\b(?:the|this)\s+adds?\b/gi, "Adds")
+    .replace(/\s+/g, " ")
+    .trim();
 }
 
 function pathInventoryFragments(path: string): string[] {
@@ -491,14 +505,17 @@ function rankedConceptsFromSummaries(summaries: CommitFileSummary[]): string[] {
 
 function semanticSummaryFromDiff(diff: string): string {
   const candidates: string[] = [];
+  const proseCandidates: string[] = [];
   for (const rawLine of diff.split(/\r?\n/)) {
     if (!rawLine.startsWith("+") || rawLine.startsWith("+++")) continue;
     const text = rawLine.slice(1).trim();
     if (!text) continue;
     candidates.push(...extractFeaturePhrases(text));
+    const prose = extractProsePhrase(text);
+    if (prose) proseCandidates.push(prose);
     candidates.push(...extractIdentifierConcepts(text));
   }
-  return rankConcepts(candidates)[0] ?? "";
+  return proseCandidates[0] ?? rankConcepts(candidates)[0] ?? "";
 }
 
 function conceptsFromText(text: string): string[] {
@@ -516,7 +533,7 @@ function conceptFromPhrase(value: string): string {
     .replace(/([a-z0-9])([A-Z])/g, "$1 $2")
     .replace(/([A-Z]+)([A-Z][a-z])/g, "$1 $2")
     .replace(/^(?:adds?|updates?|removes?|renames?|fixes?|improves?|refines?|includes?|chunks?|locks?|shows?|keeps?|consolidates?|writes?|reads?|selects?|promotes?|stores?|materializes?|allows?|evaluates?|rejects?)\b/i, "")
-    .replace(/\b(?:before|after|while|when|with|using|through|into|from)\b.*$/i, "")
+    .replace(/\b(?:before|after|while|when|with|using|through|into|from|as)\b.*$/i, "")
     .replace(/[()[\]{}"'`]/g, " ")
     .replace(/[-_]+/g, " ")
     .replace(/\s+/g, " ")
@@ -850,6 +867,28 @@ function extractFeaturePhrases(line: string): string[] {
     )
     .slice(0, 2);
   return quoted;
+}
+
+function extractProsePhrase(line: string): string {
+  const cleaned = line
+    .replace(/^#+\s*/, "")
+    .replace(/^[-*]\s+/, "")
+    .replace(/[`*_>]+/g, "")
+    .replace(/\s+/g, " ")
+    .replace(/[.!?]+$/g, "")
+    .trim();
+  if (!/[A-Za-z]/.test(cleaned)) return "";
+  if (/[{}()[\];=<>]|=>|<\/?[A-Za-z]/.test(cleaned)) return "";
+  if (cleaned.length < 12 || cleaned.length > 120) return "";
+  if (cleaned.split(/\s+/).length < 3 || cleaned.split(/\s+/).length > 14) return "";
+  if (
+    looksLikeStyleClassPhrase(cleaned) ||
+    looksLikeSymbolInventory(cleaned) ||
+    looksLikeMalformedSummary(cleaned)
+  ) {
+    return "";
+  }
+  return conceptFromPhrase(cleaned);
 }
 
 function extractIdentifierConcepts(line: string): string[] {

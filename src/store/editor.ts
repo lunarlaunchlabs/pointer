@@ -1,10 +1,14 @@
-import { create } from "zustand";
+import { create } from "@/lib/signalStore";
 import { ipc } from "@/lib/ipc";
 import { languageFromPath } from "@/lib/lang";
 import { useSession } from "@/store/session";
 import { useSettings } from "@/store/settings";
 import { useRecentEdits } from "@/store/recentEdits";
 import { toast } from "@/components/Toast";
+import {
+  resolveRepoEditorStandards,
+  type RepoEditorStandards,
+} from "@/lib/repoStandards";
 
 export type Tab = {
   path: string;
@@ -31,6 +35,16 @@ type State = {
   closeTab: (path: string) => void;
   setActive: (path: string) => void;
   setLanguage: (path: string, language: string) => void;
+  /** Keystroke-hot path: keep Monaco's latest buffer outside reactive
+   *  state, mark the tab dirty once, then commit content after typing
+   *  goes idle. This keeps editor input from waking the whole IDE. */
+  stageContent: (path: string, content: string) => void;
+  /** Force any staged Monaco buffer for a path into the reactive tab state. */
+  flushStagedContent: (path: string) => void;
+  /** Drop uncommitted staged text when the user explicitly discards/reloads. */
+  discardStagedContent: (path: string) => void;
+  /** Return the freshest known content, including uncommitted editor text. */
+  getContent: (path: string) => string | null;
   updateContent: (path: string, content: string) => void;
   saveActive: () => Promise<void>;
   /** Save the active buffer to disk *without* invoking the
@@ -83,6 +97,58 @@ const inflightOpens = new Map<string, Promise<void>>();
 /** Keep the closed-tab stack bounded. 20 is enough for normal navigation
  *  but small enough that the persisted session payload stays tiny. */
 const CLOSED_TAB_LIMIT = 20;
+const contentCommitTimers = new Map<string, ReturnType<typeof setTimeout>>();
+const stagedContent = new Map<string, string>();
+
+function tabContent(tab: Tab): string {
+  return stagedContent.get(tab.path) ?? tab.content;
+}
+
+function clearStagedContent(path: string): void {
+  const timer = contentCommitTimers.get(path);
+  if (timer) clearTimeout(timer);
+  contentCommitTimers.delete(path);
+  stagedContent.delete(path);
+}
+
+function flushStagedContentForPath(path: string): void {
+  const content = stagedContent.get(path);
+  if (content === undefined) return;
+  const timer = contentCommitTimers.get(path);
+  if (timer) clearTimeout(timer);
+  contentCommitTimers.delete(path);
+  stagedContent.delete(path);
+  const tab = useEditorStore.getState().tabs.find((t) => t.path === path);
+  if (!tab || tab.content === content) return;
+  useEditorStore.setState((s) => ({
+    tabs: s.tabs.map((t) => (t.path === path ? { ...t, content } : t)),
+  }));
+}
+
+function scheduleContentCommit(path: string): void {
+  const existing = contentCommitTimers.get(path);
+  if (existing) clearTimeout(existing);
+  contentCommitTimers.set(
+    path,
+    setTimeout(() => {
+      flushStagedContentForPath(path);
+    }, 450),
+  );
+}
+
+const recentEditTimers = new Map<string, ReturnType<typeof setTimeout>>();
+
+function scheduleRecentEditNote(path: string, content: string): void {
+  const existing = recentEditTimers.get(path);
+  if (existing) clearTimeout(existing);
+  recentEditTimers.set(
+    path,
+    setTimeout(() => {
+      recentEditTimers.delete(path);
+      useRecentEdits.getState().note(path, content);
+    }, 180),
+  );
+}
 
 export const useEditorStore = create<State>((set, get) => ({
   tabs: [],
@@ -238,6 +304,7 @@ export const useEditorStore = create<State>((set, get) => ({
     }
   },
   closeTab: (path) => {
+    clearStagedContent(path);
     set((s) => {
       const idx = s.tabs.findIndex((t) => t.path === path);
       if (idx === -1) return s;
@@ -282,7 +349,32 @@ export const useEditorStore = create<State>((set, get) => ({
       tabs: s.tabs.map((t) => (t.path === path ? { ...t, language } : t)),
     }));
   },
+  stageContent: (path, content) => {
+    stagedContent.set(path, content);
+    scheduleContentCommit(path);
+    const tab = get().tabs.find((t) => t.path === path);
+    if (tab && !tab.dirty) {
+      set((s) => ({
+        tabs: s.tabs.map((t) =>
+          t.path === path ? { ...t, dirty: true } : t,
+        ),
+      }));
+    }
+    scheduleRecentEditNote(path, content);
+    if (useSettings.getState().editorHotExit) {
+      scheduleHotExitFlush(path, content);
+    }
+    scheduleAutoSaveAfterDelay(path);
+  },
+  flushStagedContent: flushStagedContentForPath,
+  discardStagedContent: clearStagedContent,
+  getContent: (path) => {
+    const staged = stagedContent.get(path);
+    if (staged !== undefined) return staged;
+    return get().tabs.find((t) => t.path === path)?.content ?? null;
+  },
   updateContent: (path, content) => {
+    clearStagedContent(path);
     set((s) => ({
       tabs: s.tabs.map((t) =>
         t.path === path ? { ...t, content, dirty: true } : t,
@@ -305,6 +397,7 @@ export const useEditorStore = create<State>((set, get) => ({
     scheduleAutoSaveAfterDelay(path);
   },
   applyEdit: (path, content) => {
+    clearStagedContent(path);
     set((s) => ({
       tabs: s.tabs.map((t) =>
         t.path === path ? { ...t, content, dirty: true } : t,
@@ -319,8 +412,9 @@ export const useEditorStore = create<State>((set, get) => ({
       await saveUntitledViaDialog(tab);
       return;
     }
-    const content = await formatBeforeSave(tab.path, tab.content);
+    const content = await formatBeforeSave(tab.path, tabContent(tab));
     await ipc.writeTextFile(tab.path, content);
+    clearStagedContent(tab.path);
     set((s) => ({
       tabs: s.tabs.map((t) =>
         t.path === tab.path ? { ...t, content, dirty: false } : t,
@@ -336,10 +430,12 @@ export const useEditorStore = create<State>((set, get) => ({
       await saveUntitledViaDialog(tab);
       return;
     }
-    await ipc.writeTextFile(tab.path, tab.content);
+    const content = tabContent(tab);
+    await ipc.writeTextFile(tab.path, content);
+    clearStagedContent(tab.path);
     set((s) => ({
       tabs: s.tabs.map((t) =>
-        t.path === tab.path ? { ...t, dirty: false } : t,
+        t.path === tab.path ? { ...t, content, dirty: false } : t,
       ),
     }));
     useSession.getState().noteHotExit(tab.path, null);
@@ -351,8 +447,9 @@ export const useEditorStore = create<State>((set, get) => ({
         await saveUntitledViaDialog(t);
         continue;
       }
-      const content = await formatBeforeSave(t.path, t.content);
+      const content = await formatBeforeSave(t.path, tabContent(t));
       await ipc.writeTextFile(t.path, content);
+      clearStagedContent(t.path);
       set((s) => ({
         tabs: s.tabs.map((tt) =>
           tt.path === t.path ? { ...tt, content, dirty: false } : tt,
@@ -363,7 +460,11 @@ export const useEditorStore = create<State>((set, get) => ({
   },
   getActive: () => {
     const p = get().activePath;
-    return p ? get().tabs.find((t) => t.path === p) ?? null : null;
+    if (!p) return null;
+    const tab = get().tabs.find((t) => t.path === p);
+    if (!tab) return null;
+    const content = stagedContent.get(tab.path);
+    return content === undefined ? tab : { ...tab, content };
   },
 }));
 
@@ -432,8 +533,17 @@ async function loadAndAddTab(
   }
   // Re-check after the awaited read so we never push a duplicate
   // if a concurrent caller raced ahead.
-  if (get().tabs.some((t) => t.path === path)) {
-    set({ activePath: path });
+  const existingTab = get().tabs.find((t) => t.path === path);
+  if (existingTab) {
+    const language = languageFromPath(path);
+    set((s) => ({
+      activePath: path,
+      tabs: s.tabs.map((t) =>
+        t.path === path && !t.preview && t.language !== language
+          ? { ...t, language }
+          : t,
+      ),
+    }));
     return;
   }
   // Hot exit: if a persisted unsaved buffer exists *and* hot-exit
@@ -554,8 +664,9 @@ async function saveUntitledViaDialog(tab: Tab): Promise<void> {
   if (!target || typeof target !== "string") return;
   // Format-on-save pipeline still applies — language is derived
   // from the chosen file extension at write time.
-  const content = await formatBeforeSave(target, tab.content);
+  const content = await formatBeforeSave(target, tabContent(tab));
   await ipc.writeTextFile(target, content);
+  clearStagedContent(tab.path);
   const newName = target.split(/[\\/]/).pop() ?? tab.name;
   useEditorStore.setState((s) => ({
     tabs: s.tabs.map((t) =>
@@ -594,8 +705,9 @@ async function saveUntitledViaDialog(tab: Tab): Promise<void> {
  */
 async function formatBeforeSave(path: string, content: string): Promise<string> {
   const s = useSettings.getState();
+  const standards = await repoStandardsForSave(path);
   let out = content;
-  if (s.editorFormatOnSave) {
+  if (standards.formatOnSave ?? s.editorFormatOnSave) {
     try {
       const r = await ipc.formatText(path, out);
       if (r.formatted && r.content) out = r.content;
@@ -603,23 +715,44 @@ async function formatBeforeSave(path: string, content: string): Promise<string> 
       // Backend error — fall through; still apply the cheap pass below.
     }
   }
-  return applyWhitespaceRules(out);
+  return applyWhitespaceRules(out, standards);
+}
+
+async function repoStandardsForSave(path: string): Promise<RepoEditorStandards> {
+  try {
+    const { useWorkspace } = await import("@/store/workspace");
+    return await resolveRepoEditorStandards({
+      path,
+      workspaceRoot: useWorkspace.getState().root,
+      readTextFile: ipc.readTextFile,
+    });
+  } catch {
+    return { sources: [] };
+  }
 }
 
 /** Whitespace policy applied unconditionally before save when the user has
  *  asked for it. Independent of the formatter: even if Prettier ran and
  *  reformatted everything, the user might still want trailing whitespace
  *  trimmed or a single trailing newline guaranteed. */
-function applyWhitespaceRules(content: string): string {
+function applyWhitespaceRules(
+  content: string,
+  standards: Partial<RepoEditorStandards> = {},
+): string {
   const s = useSettings.getState();
   let out = content;
-  if (s.editorTrimTrailingWhitespace) {
+  if (standards.trimTrailingWhitespace ?? s.editorTrimTrailingWhitespace) {
     out = out
       .split("\n")
       .map((l) => l.replace(/[ \t]+$/, ""))
       .join("\n");
   }
-  if (s.editorInsertFinalNewline && !out.endsWith("\n")) out += "\n";
+  if (standards.trimFinalNewlines) {
+    out = out.replace(/\n+$/g, "\n");
+  }
+  if ((standards.insertFinalNewline ?? s.editorInsertFinalNewline) && !out.endsWith("\n")) {
+    out += "\n";
+  }
   return out;
 }
 
@@ -677,8 +810,9 @@ function scheduleAutoSaveAfterDelay(path: string): void {
       const tab = useEditorStore.getState().tabs.find((t) => t.path === path);
       if (!tab || !tab.dirty) return;
       try {
-        const content = maybeFormatOnSave(tab.content);
+        const content = maybeFormatOnSave(tabContent(tab));
         await ipc.writeTextFile(path, content);
+        clearStagedContent(path);
         useEditorStore.setState((state) => ({
           tabs: state.tabs.map((t) =>
             t.path === path ? { ...t, content, dirty: false } : t,

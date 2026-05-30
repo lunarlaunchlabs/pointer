@@ -34,7 +34,7 @@
  *   • Stacking math is correct: toast.z > ctx.z > panel.z.
  */
 
-import { useRef, useState } from "react";
+import { useRef, useState } from "@/lib/preactSignalCompat";
 import { describe, expect, it } from "vitest";
 import { render, screen } from "@testing-library/react";
 import { Popover } from "./Popover";

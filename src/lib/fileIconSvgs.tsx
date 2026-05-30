@@ -24,7 +24,7 @@
  * can swap them in anywhere a Lucide icon used to live.
  */
 
-import type { CSSProperties } from "react";
+import type { CSSProperties } from "@/lib/preactSignalCompat";
 
 export type IconProps = {
   size?: number;

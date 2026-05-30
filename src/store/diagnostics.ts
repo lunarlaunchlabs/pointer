@@ -14,7 +14,7 @@
  * downstream code doesn't have to import the Monaco types directly.
  */
 
-import { create } from "zustand";
+import { create } from "@/lib/signalStore";
 import type { Monaco } from "@monaco-editor/react";
 import { ipc, type ProjectCheckInfo } from "@/lib/ipc";
 
@@ -62,7 +62,7 @@ type State = {
   countsForPath: (path: string) => { errors: number; warnings: number };
 };
 
-let installed = false;
+const installedMonacos = new WeakSet<object>();
 
 function severityFromMonaco(n: number): DiagnosticSeverity {
   // Monaco numeric values: 8=error, 4=warning, 2=info, 1=hint.
@@ -196,8 +196,8 @@ export const useDiagnostics = create<State>((set, get) => ({
     }));
   },
   installFromMonaco: (monaco) => {
-    if (installed) return;
-    installed = true;
+    if (installedMonacos.has(monaco as object)) return;
+    installedMonacos.add(monaco as object);
 
     const refresh = (uris: { toString: () => string }[]) => {
       const updates: Record<string, Diagnostic[]> = { ...get().monacoByUri };

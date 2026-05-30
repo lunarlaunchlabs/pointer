@@ -83,7 +83,7 @@ describe("Composer", () => {
     await user.type(ta, "@");
     // The picker debounces 60ms before issuing the search; wait for
     // the file row to materialise.
-    const row = await screen.findByText("src/App.tsx", {}, { timeout: 1500 });
+    const row = await screen.findByText("App.tsx", {}, { timeout: 1500 });
     fireEvent.mouseDown(row);
     await waitFor(() =>
       expect(onAddReference).toHaveBeenCalledWith({
@@ -121,6 +121,50 @@ describe("Composer", () => {
     expect(onSend).toHaveBeenCalledWith("hello");
   });
 
+  it("preserves spaces and caret position during normal middle-of-text edits", async () => {
+    const user = userEvent.setup();
+    renderComposer();
+    const ta = screen.getByPlaceholderText(
+      /Ask, edit, generate/i,
+    ) as HTMLTextAreaElement;
+
+    await user.click(ta);
+    await user.type(ta, "Can you add another slide?");
+    const insertionPoint = "Can you add ".length;
+    await user.type(ta, "please ", {
+      initialSelectionStart: insertionPoint,
+      initialSelectionEnd: insertionPoint,
+    });
+
+    expect(ta.value).toBe("Can you add please another slide?");
+    expect(ta.selectionStart).toBe("Can you add please ".length);
+    expect(ta.selectionEnd).toBe("Can you add please ".length);
+  });
+
+  it("does not submit while an IME composition is confirming text", async () => {
+    const { onSend } = renderComposer();
+    const ta = screen.getByPlaceholderText(
+      /Ask, edit, generate/i,
+    ) as HTMLTextAreaElement;
+
+    fireEvent.change(ta, {
+      target: {
+        value: "compose me",
+        selectionStart: "compose me".length,
+        selectionEnd: "compose me".length,
+      },
+    });
+    fireEvent.keyDown(ta, {
+      key: "Enter",
+      code: "Enter",
+      isComposing: true,
+      keyCode: 229,
+    });
+
+    expect(onSend).not.toHaveBeenCalled();
+    expect(ta.value).toBe("compose me");
+  });
+
   it("does not fire onSend while the picker is open", async () => {
     const user = userEvent.setup();
     const { onSend, onAddReference } = renderComposer();
@@ -143,7 +187,8 @@ describe("Composer", () => {
     renderComposer();
     const ta = screen.getByPlaceholderText(/Ask, edit, generate/i);
     await user.type(ta, "@file App");
-    expect(await screen.findByText("src/App.tsx")).toBeInTheDocument();
+    expect(await screen.findByText("App.tsx")).toBeInTheDocument();
+    expect(screen.getByText("src")).toBeInTheDocument();
   });
 
   it("accepts dropped files, breakpoints, and debug values as context", async () => {

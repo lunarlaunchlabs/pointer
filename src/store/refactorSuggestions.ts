@@ -8,7 +8,7 @@
  * a dismissal sticks for the session so the user isn't re-prompted.
  */
 
-import { create } from "zustand";
+import { create } from "@/lib/signalStore";
 import type { TextHit } from "@/lib/ipc";
 
 export type ActiveRenameSuggestion = {

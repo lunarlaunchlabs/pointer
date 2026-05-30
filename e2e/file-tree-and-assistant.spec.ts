@@ -12,8 +12,10 @@ test.describe("workspace tree and assistant flows", () => {
   test("supports file-tree context menus, inline rename, and inline creation", async ({
     appPage: page,
   }) => {
-    await page.locator(`[data-tree-path="${ROOT}/src"]`).click();
     const appRow = page.locator(`[data-tree-path="${paths.app}"]`);
+    if (!(await appRow.isVisible())) {
+      await page.locator(`[data-tree-path="${ROOT}/src"]`).click();
+    }
     await expect(appRow).toBeVisible();
 
     await appRow.click({ button: "right" });
@@ -40,6 +42,113 @@ test.describe("workspace tree and assistant flows", () => {
     await createInput.fill("Scratch.ts");
     await createInput.press("Enter");
     await expect(page.locator(`[data-tree-path="${ROOT}/Scratch.ts"]`)).toBeVisible();
+  });
+
+  test("supports file-tree copy, cut, paste, and drag-move operations", async ({
+    appPage: page,
+  }) => {
+    const srcRow = page.locator(`[data-tree-path="${ROOT}/src"]`);
+    const componentsRow = page.locator(`[data-tree-path="${ROOT}/src/components"]`);
+    const buttonRow = page.locator(`[data-tree-path="${paths.button}"]`);
+
+    if (!(await componentsRow.isVisible())) {
+      await srcRow.click();
+    }
+    if (!(await buttonRow.isVisible())) {
+      await componentsRow.click();
+    }
+    await expect(buttonRow).toBeVisible();
+
+    await buttonRow.click({ button: "right" });
+    await page.getByRole("menuitem", { name: "Copy (⌘C)" }).click();
+    await srcRow.click({ button: "right" });
+    await page.getByRole("menuitem", { name: /Paste 1 item/ }).click();
+    const copiedToSrc = page.locator(`[data-tree-path="${ROOT}/src/Button.tsx"]`);
+    await expect(copiedToSrc).toBeVisible();
+
+    await copiedToSrc.click({ button: "right" });
+    await page.getByRole("menuitem", { name: "Cut (⌘X)" }).click();
+    await componentsRow.click({ button: "right" });
+    await page.getByRole("menuitem", { name: /Paste 1 item/ }).click();
+    await expect(copiedToSrc).toHaveCount(0);
+    await expect(
+      page.locator(`[data-tree-path="${ROOT}/src/components/Button copy.tsx"]`),
+    ).toBeVisible();
+
+    const dragPayload = await page.evaluateHandle((sourcePath) => {
+      const data = new DataTransfer();
+      data.setData("application/x-pointer-paths", JSON.stringify([sourcePath]));
+      data.setData("text/plain", sourcePath);
+      return data;
+    }, paths.router);
+    await srcRow.dispatchEvent("dragover", { dataTransfer: dragPayload });
+    await srcRow.dispatchEvent("drop", { dataTransfer: dragPayload });
+    await dragPayload.dispose();
+    await expect(page.locator(`[data-tree-path="${ROOT}/src/router.js"]`)).toBeVisible();
+
+    const dragCopyPayload = await page.evaluateHandle((sourcePath) => {
+      const data = new DataTransfer();
+      data.setData("application/x-pointer-paths", JSON.stringify([sourcePath]));
+      data.setData("text/plain", sourcePath);
+      return data;
+    }, `${ROOT}/src/router.js`);
+    await componentsRow.dispatchEvent("dragover", {
+      dataTransfer: dragCopyPayload,
+      altKey: true,
+    });
+    await componentsRow.dispatchEvent("drop", {
+      dataTransfer: dragCopyPayload,
+      altKey: true,
+    });
+    await dragCopyPayload.dispose();
+    await expect(page.locator(`[data-tree-path="${ROOT}/src/router.js"]`)).toBeVisible();
+    await expect(page.locator(`[data-tree-path="${ROOT}/src/components/router.js"]`)).toBeVisible();
+
+    const calls = await commandLog(page);
+    expect(calls.some((entry) => entry.command === "copy_path")).toBe(true);
+    expect(calls.some((entry) => entry.command === "rename_path")).toBe(true);
+  });
+
+  test("keeps file-tree rows and editor tabs colored by git status", async ({
+    appPage: page,
+  }) => {
+    await page.evaluate(() => {
+      window.__POINTER_E2E__?.git?.setStatus?.({
+        files: { "src/App.tsx": "modified" },
+        entries: [
+          {
+            path: "src/App.tsx",
+            status: "modified",
+            staged: false,
+            unstaged: true,
+          },
+        ],
+        dirty_count: 1,
+      });
+      window.dispatchEvent(new Event("focus"));
+    });
+
+    const treeRow = page.locator(`[data-tree-path="${paths.app}"]`);
+    const tab = page.getByRole("tab", { name: "App.tsx" });
+    const treeName = treeRow.locator("span").filter({ hasText: "App.tsx" }).first();
+    const tabName = tab.locator("span").filter({ hasText: "App.tsx" }).first();
+
+    await expect(treeRow).toHaveAttribute("data-git-status", "modified");
+    await expect(tab).toHaveAttribute("data-git-status", "modified");
+    await expect(treeName).toHaveClass(/text-noir-warn/);
+    await expect(tabName).toHaveClass(/text-noir-warn/);
+
+    await page.evaluate(() => {
+      window.__POINTER_E2E__?.git?.setStatus?.({
+        files: {},
+        entries: [],
+        dirty_count: 0,
+      });
+      window.dispatchEvent(new Event("focus"));
+    });
+
+    await expect(treeRow).not.toHaveAttribute("data-git-status", "modified");
+    await expect(tab).not.toHaveAttribute("data-git-status", "modified");
   });
 
   test("accepts dragged files as assistant context and sends grounded ask requests", async ({
@@ -131,7 +240,7 @@ test.describe("workspace tree and assistant flows", () => {
         "git_push",
         Array.from({ length: 80 }, (_, i) => `remote line ${i + 1}`).join("\n"),
       );
-      window.__POINTER_E2E__?.git?.setGenerateDelay?.(180);
+      window.__POINTER_E2E__?.git?.setGenerateDelay?.(900);
       window.dispatchEvent(new Event("focus"));
     });
 

@@ -475,9 +475,11 @@ describe("harness core", () => {
     expect(result.status).toBe("retry");
     if (result.status === "retry") {
       expect(result.nextAttempt).toBe(2);
-      expect(result.retryPrompt).toBe("Explain App.jsx.");
+      expect(result.retryPrompt).toContain("Deliberate retry:");
+      expect(result.retryPrompt).toContain("\n\nExplain App.jsx.");
       expect(result.retryPromptIndex).toBe(0);
       expect(result.backtracked).toBe(false);
+      expect(result.thoughtEffort).toBe("deliberate");
     }
   });
 
@@ -508,11 +510,15 @@ describe("harness core", () => {
     );
     expect(result.status).toBe("retry");
     if (result.status === "retry") {
-      expect(result.retryPrompt).toBe("Search the repo for the owner of commit drafting.");
+      expect(result.retryPrompt).toContain("Fast path:");
+      expect(result.retryPrompt).toContain(
+        "\n\nSearch the repo for the owner of commit drafting.",
+      );
       expect(result.retryPromptIndex).toBe(0);
       expect(result.nextAttempt).toBe(1);
       expect(result.clearContext).toBe(true);
       expect(result.backtracked).toBe(true);
+      expect(result.thoughtEffort).toBe("quick");
     }
   });
 

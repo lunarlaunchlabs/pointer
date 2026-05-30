@@ -28,9 +28,7 @@ use crate::commands::agent::{
 };
 use crate::commands::ollama::ChatMsg;
 use crate::error::AppResult;
-use crate::services::context_lifecycle::{
-    compact_dialogue, CompactMessage, CompactOptions,
-};
+use crate::services::context_lifecycle::{compact_dialogue, CompactMessage, CompactOptions};
 use crate::services::history::{entry_for_answer, LedgerEntry};
 use crate::services::opencode::{run_opencode, OpenCodeMode, OpenCodeRunRequest};
 use crate::state::AppState;
@@ -223,30 +221,12 @@ fn render_opencode_ask_prompt(
         }
     }
     out.push_str("ASK MODE CONTRACT:\n");
-    out.push_str(
-        "- Answer from the repository files OpenCode reads or receives as attached files.\n",
-    );
-    out.push_str("- If Additional context contains relevant file blocks or literal evidence lines that answer the question, answer directly from that context without using additional tools.\n");
-    out.push_str("- If Additional context contains <brain-frontier>, treat it as Pointer's deterministic external-memory search frontier: use included evidence first, inspect listed candidates before asserting behavior, and do not rediscover facts it already provides.\n");
-    out.push_str("- If Additional context contains <context-memory>, treat it as Pointer's deterministic retained source map: use its exact paths, symbols, imports, evidence lines, and reasons to ground the answer, but do not invent code that is not present in file blocks or repository reads.\n");
-    out.push_str("- For file explanation questions, name the file's purpose, important imports/exports, state or data flow, and notable risks or neighboring files.\n");
-    out.push_str("- For interface code, call out important state owners, event handlers, and conditional rendered UI when they are present.\n");
-    out.push_str("- For routing questions, name the exact router components visible in the file, including Switch when it is present.\n");
-    out.push_str("- For theme persistence questions, name the exact storage import/local variable and storage calls when they are visible, for example local-storage-fallback, storage.getItem, or storage.setItem only if those names appear in repository context.\n");
-    out.push_str("- For editor or media-heavy components, mention file operations, upload/image handling, export, and persistence flows when those symbols are visible.\n");
-    out.push_str("- For codebase research questions that ask where a behavior is configured, compiled, consumed, or flows through the project, use search/read tools to trace at least the definition file and consumer file before answering.\n");
-    out.push_str("- For codebase research or source-path answers, name exact repository-relative file paths for each hop; do not stop at import specifiers such as ./utils.\n");
-    out.push_str("- If a search finds the symbol or behavior, read the matching file before answering; do not answer from search snippets alone.\n");
-    out.push_str("- Unless the user explicitly asks for code samples, do not emit fenced code blocks in Ask mode; describe short code facts inline with backticks instead.\n");
-    out.push_str("- Include a compact Key identifiers sentence with 4-8 exact symbols, dotted assignments, method names, and configuration keys visible in the file; never list more than 8 identifiers and never repeat an identifier. If more than 8 identifiers are possible, choose the 8 most important.\n");
-    out.push_str("- If a file defines dotted exported assignments such as object.method = function, name the dotted assignment exactly instead of only the bare method name.\n");
-    out.push_str("- If Additional context includes app.defaultConfiguration, app.set(...), or setting keys, name the important literal setting keys in the prose.\n");
-    out.push_str("- Do not list bare prior-version method names such as mount or lazyrouter unless the file defines that exact method/export in the visible context.\n");
-    out.push_str("- Key identifiers must be real identifiers or setting keys from the file, not synthesized property chains.\n");
-    out.push_str("- Preserve literal identifiers exactly as they appear in files. Never copy identifier examples from instructions into the answer unless OpenCode actually saw them in repository content.\n");
-    out.push_str("- Never output internal progress blocks or headings like ## Goal, ## Progress, Constraints, Next Steps, or Continue if you have next steps.\n");
-    out.push_str("- Do not claim you lack access to a named, active, or attached file.\n");
-    out.push_str("- Do not modify files in Ask mode.\n\n");
+    out.push_str("- Answer only from attached context or repository files OpenCode reads.\n");
+    out.push_str("- Use <brain-frontier> and <context-memory> as deterministic navigation/evidence memory; do not re-discover facts they already prove and do not invent unseen code.\n");
+    out.push_str("- For named-file questions, read or use that file first, then explain purpose, important imports/exports, data flow, adjacent files, and risks when visible.\n");
+    out.push_str("- For behavior-flow questions, trace definition-to-consumer hops with exact repository-relative paths; read matches before answering.\n");
+    out.push_str("- Mention exact visible symbols/settings only; preserve spelling and include a compact Key identifiers sentence with 4-8 real identifiers when useful.\n");
+    out.push_str("- Avoid fenced code unless requested. Do not output internal progress headings, claim missing access to named files, or modify files.\n\n");
     out.push_str("Answer the latest user message using the ASK MODE CONTRACT above.");
     out
 }

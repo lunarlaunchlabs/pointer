@@ -1,10 +1,8 @@
-import { useEffect, useState } from "react";
-import { ChevronDown, ChevronRight } from "lucide-react";
+import { useEffect, useState } from "@/lib/preactSignalCompat";
+import { ChevronDown, ChevronRight } from "@/lib/lucide";
 import { useEditorStore } from "@/store/editor";
 import { ipc, type LspDocumentSymbol } from "@/lib/ipc";
 import { vueOutlineSymbols } from "@/lib/vueIntelligence";
-import { pathFromMonacoUri } from "@/lib/monacoUri";
-import type * as MonacoNs from "monaco-editor";
 
 /**
  * Document outline. Surfaces the symbols Monaco's language workers
@@ -36,45 +34,33 @@ export function Outline() {
   const [expanded, setExpanded] = useState<Set<string>>(new Set());
 
   useEffect(() => {
+    setItems(null);
+    setError(null);
+    setExpanded(new Set());
+  }, [active?.path]);
+
+  useEffect(() => {
     if (!active) {
       setItems(null);
       setError(null);
       return;
     }
+    if (active.preview) {
+      setItems([]);
+      setError("Outline is available for text files.");
+      return;
+    }
     let cancelled = false;
     const t = setTimeout(async () => {
       try {
-        // Monaco is imported lazily so the outline panel doesn't
-        // force the entire Monaco bundle into chunks that load on
-        // the welcome screen.
-        const monaco: typeof MonacoNs = await import("monaco-editor");
-        const model = monaco.editor
-          .getModels()
-          .find((m) => pathFromMonacoUri(m.uri.toString()) === active.path);
-        if (!model) {
+        if (active.language === "markdown" || active.language === "mdx") {
           if (!cancelled) {
-            setItems([]);
-            setError("Outline available once the file is open in the editor.");
+            setItems(scanByRegex(active.content, active.language));
+            setError(null);
           }
           return;
         }
-        // Monaco exposes `editor.getDocumentSymbolProviders` via its
-        // private API. The public API path is the
-        // `DocumentSymbolProviderRegistry` — but that's not exported
-        // in the bundled build. We use `getModel` + a typed
-        // command-style call to the language registry.
-        // eslint-disable-next-line @typescript-eslint/no-explicit-any
-        const registry = (monaco.languages as any).getLanguages
-          // The public way to read symbols is via the command that
-          // powers ⌘⇧O — `_executeDocumentSymbolProvider`. Returns
-          // the same payload Monaco's outline view uses.
-          ? null
-          : null;
-        // eslint-disable-next-line @typescript-eslint/no-explicit-any
-        const symbols = await (monaco.editor as any)
-          .getRootElement?.()
-          ? null
-          : null;
+
         const lspSymbols = await ipc
           .lspDocumentSymbols({
             path: active.path,
@@ -82,16 +68,6 @@ export function Outline() {
             content: active.content,
           })
           .catch(() => []);
-        if (active.language === "vue") {
-          const fallback = scanByRegex(model.getValue(), active.language);
-          if (fallback.length > 0) {
-            if (!cancelled) {
-              setItems(fallback);
-              setError(null);
-            }
-            return;
-          }
-        }
         if (lspSymbols.length > 0) {
           if (!cancelled) {
             setItems(lspSymbols.map(fromLspSymbol));
@@ -100,15 +76,7 @@ export function Outline() {
           return;
         }
 
-        // Fall back to a regex-based scan if Monaco's symbol APIs
-        // aren't reachable — gives at least functions/classes for
-        // most C-style languages. The provider-based path lives
-        // above (and gracefully no-ops) so when Monaco ships a
-        // public registry we can plug it in without changing this
-        // file's shape.
-        void registry;
-        void symbols;
-        const fallback = scanByRegex(model.getValue(), active.language);
+        const fallback = scanByRegex(active.content, active.language);
         if (!cancelled) {
           setItems(fallback);
           setError(null);
@@ -119,7 +87,7 @@ export function Outline() {
           setError(e instanceof Error ? e.message : String(e));
         }
       }
-    }, 250);
+    }, 150);
     return () => {
       cancelled = true;
       clearTimeout(t);
@@ -128,18 +96,18 @@ export function Outline() {
 
   if (!active) {
     return (
-      <div className="px-3 py-2 text-[11px] text-noir-mute">
+      <div className="flex-1 min-h-0 px-3 py-2 text-[11px] text-noir-mute">
         Open a file to see its outline.
       </div>
     );
   }
 
   return (
-    <div className="flex flex-col h-full">
-      <header className="px-3 h-7 flex items-center text-[10px] uppercase tracking-wider text-noir-mute font-sans border-b border-noir-line/60">
+    <div className="flex flex-1 min-h-0 flex-col overflow-hidden">
+      <header className="px-3 h-7 shrink-0 flex items-center text-[10px] uppercase tracking-wider text-noir-mute font-sans border-b border-noir-line/60">
         Outline · {active.name}
       </header>
-      <div className="flex-1 overflow-y-auto py-1 text-[12px]">
+      <div className="flex-1 min-h-0 overflow-y-auto py-1 text-[12px]">
         {error && !items?.length && (
           <div className="px-3 py-2 text-[11px] text-noir-mute" role="status">
             {error}
@@ -148,6 +116,11 @@ export function Outline() {
         {items && items.length === 0 && !error && (
           <div className="px-3 py-2 text-[11px] text-noir-mute" role="status">
             No outline symbols detected for this file.
+          </div>
+        )}
+        {items === null && !error && (
+          <div className="px-3 py-2 text-[11px] text-noir-mute" role="status">
+            Building outline…
           </div>
         )}
         {items && items.length > 0 && (
@@ -360,32 +333,56 @@ export function scanByRegex(source: string, language: string): OutlineItem[] {
     }));
   }
 
-  // Generic C-style: function, class, interface, type, enum, const fn.
+  const ident = String.raw`([A-Za-z_$][\w$]*)`;
   const patterns: { re: RegExp; kind: string }[] = [
-    { re: /^\s*(?:export\s+)?(?:async\s+)?function\s+([A-Za-z_$][\w$]*)\s*\(/, kind: "Function" },
-    { re: /^\s*(?:export\s+)?class\s+([A-Za-z_$][\w$]*)/, kind: "Class" },
-    { re: /^\s*(?:export\s+)?interface\s+([A-Za-z_$][\w$]*)/, kind: "Interface" },
-    { re: /^\s*(?:export\s+)?type\s+([A-Za-z_$][\w$]*)\s*=/, kind: "Type" },
-    { re: /^\s*(?:export\s+)?enum\s+([A-Za-z_$][\w$]*)/, kind: "Enum" },
-    { re: /^\s*(?:export\s+(?:default\s+)?)?const\s+([A-Za-z_$][\w$]*)\s*=\s*(?:\([^)]*\)\s*=>|async\s*\(|function\b)/, kind: "Function" },
-    { re: /^\s*(?:public|private|protected|static)?\s*async?\s*([A-Za-z_$][\w$]*)\s*\([^)]*\)\s*\{?\s*$/, kind: "Method" },
+    // JS / TS / JSX / TSX
+    { re: new RegExp(String.raw`^\s*(?:export\s+)?(?:default\s+)?(?:async\s+)?function\s+${ident}\s*\(`), kind: "Function" },
+    { re: new RegExp(String.raw`^\s*(?:export\s+)?(?:default\s+)?class\s+${ident}\b`), kind: "Class" },
+    { re: new RegExp(String.raw`^\s*(?:export\s+)?interface\s+${ident}\b`), kind: "Interface" },
+    { re: new RegExp(String.raw`^\s*(?:export\s+)?type\s+${ident}\s*=`), kind: "Type" },
+    { re: new RegExp(String.raw`^\s*(?:export\s+)?enum\s+${ident}\b`), kind: "Enum" },
+    { re: new RegExp(String.raw`^\s*(?:export\s+)?(?:const|let|var)\s+${ident}(?:\s*:[^=]+)?\s*=\s*(?:async\s*)?(?:\([^)]*\)|${ident})\s*=>`), kind: "Function" },
+    { re: new RegExp(String.raw`^\s*(?:export\s+)?(?:const|let|var)\s+${ident}(?:\s*:[^=]+)?\s*=\s*(?:async\s+)?function\b`), kind: "Function" },
+    { re: new RegExp(String.raw`^\s*(?:(?:public|private|protected|static|readonly|override|abstract|get|set)\s+)*(?:async\s+)?${ident}\s*\([^)]*\)\s*(?::[^={]+)?\s*\{?\s*$`), kind: "Method" },
+
     // Python
-    { re: /^\s*def\s+([A-Za-z_][\w]*)\s*\(/, kind: "Function" },
+    { re: /^\s*(?:async\s+)?def\s+([A-Za-z_][\w]*)\s*\(/, kind: "Function" },
     { re: /^\s*class\s+([A-Za-z_][\w]*)/, kind: "Class" },
+
     // Rust
-    { re: /^\s*(?:pub(?:\([^)]+\))?\s+)?fn\s+([A-Za-z_][\w]*)\s*[(<]/, kind: "Function" },
+    { re: /^\s*(?:pub(?:\([^)]+\))?\s+)?(?:async\s+)?fn\s+([A-Za-z_][\w]*)\s*[(<]/, kind: "Function" },
     { re: /^\s*(?:pub(?:\([^)]+\))?\s+)?struct\s+([A-Za-z_][\w]*)/, kind: "Struct" },
+    { re: /^\s*(?:pub(?:\([^)]+\))?\s+)?enum\s+([A-Za-z_][\w]*)/, kind: "Enum" },
     { re: /^\s*(?:pub(?:\([^)]+\))?\s+)?trait\s+([A-Za-z_][\w]*)/, kind: "Trait" },
     { re: /^\s*impl(?:\s*<[^>]+>)?\s+([A-Za-z_][\w<>:'_]*)/, kind: "Impl" },
+
     // Go
     { re: /^\s*func\s+(?:\([^)]+\)\s+)?([A-Za-z_][\w]*)\s*\(/, kind: "Function" },
     { re: /^\s*type\s+([A-Za-z_][\w]*)\s+(?:struct|interface)/, kind: "Type" },
+
+    // Swift / Kotlin / Dart-ish declarations
+    { re: /^\s*(?:(?:public|private|internal|open|static|override|mutating|suspend|async)\s+)*(?:func|fun)\s+([A-Za-z_][\w]*)\s*[\(<]/, kind: "Function" },
+    { re: /^\s*(?:(?:public|private|internal|open|data|sealed|abstract|final)\s+)*class\s+([A-Za-z_][\w]*)\b/, kind: "Class" },
+    { re: /^\s*(?:(?:public|private|internal|open|data|sealed|abstract|final)\s+)*struct\s+([A-Za-z_][\w]*)\b/, kind: "Struct" },
+    { re: /^\s*(?:(?:public|private|internal|open|data|sealed|abstract|final)\s+)*enum\s+([A-Za-z_][\w]*)\b/, kind: "Enum" },
+    { re: /^\s*(?:(?:public|private|internal|open|data|sealed|abstract|final)\s+)*(?:protocol|object)\s+([A-Za-z_][\w]*)\b/, kind: "Type" },
+
+    // JVM / .NET-style declarations
+    { re: /^\s*(?:(?:public|private|protected|internal|static|final|abstract|override|virtual|sealed|async|suspend|pub)\s+)+(?:[\w<>,.?[\]]+\s+)+([A-Za-z_$][\w$]*)\s*\(/, kind: "Method" },
+    { re: /^\s*(?:(?:public|private|protected|internal|final|abstract|sealed|data)\s+)*(?:class|record)\s+([A-Za-z_$][\w$]*)\b/, kind: "Class" },
+    { re: /^\s*(?:(?:public|private|protected|internal)\s+)*interface\s+([A-Za-z_$][\w$]*)\b/, kind: "Interface" },
+
+    // PHP / Ruby
+    { re: /^\s*(?:(?:public|private|protected|static)\s+)*function\s+([A-Za-z_][\w]*)\s*\(/, kind: "Function" },
+    { re: /^\s*def\s+(?:self\.)?([A-Za-z_][\w!?=]*)/, kind: "Function" },
+    { re: /^\s*class\s+([A-Za-z_][\w:]*)/, kind: "Class" },
+    { re: /^\s*module\s+([A-Za-z_][\w:]*)/, kind: "Module" },
   ];
 
   for (let i = 0; i < lines.length; i++) {
     for (const p of patterns) {
       const m = p.re.exec(lines[i]);
-      if (m) {
+      if (m && !IGNORED_SYMBOL_NAMES.has(m[1])) {
         push(m[1], p.kind, i);
         break;
       }
@@ -400,3 +397,13 @@ export function scanByRegex(source: string, language: string): OutlineItem[] {
     return true;
   });
 }
+
+const IGNORED_SYMBOL_NAMES = new Set([
+  "catch",
+  "describe",
+  "for",
+  "if",
+  "it",
+  "switch",
+  "while",
+]);

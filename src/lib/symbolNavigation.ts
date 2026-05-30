@@ -98,12 +98,12 @@ export function definitionSearchPatterns(
   const s = escapeRegex(symbol);
   const lang = language.toLowerCase();
   const jsLike = [
-    String.raw`^\s*(?:export\s+)?(?:default\s+)?(?:async\s+)?function\s+${s}\b`,
-    String.raw`^\s*(?:export\s+)?(?:default\s+)?class\s+${s}\b`,
-    String.raw`^\s*(?:export\s+)?interface\s+${s}\b`,
-    String.raw`^\s*(?:export\s+)?type\s+${s}\b`,
-    String.raw`^\s*(?:export\s+)?enum\s+${s}\b`,
-    String.raw`^\s*(?:export\s+)?(?:const|let|var)\s+${s}\b`,
+    String.raw`^\s*(?:export\s+)?(?:default\s+)?(?:declare\s+)?(?:async\s+)?function\s+${s}\b`,
+    String.raw`^\s*(?:export\s+)?(?:default\s+)?(?:declare\s+)?class\s+${s}\b`,
+    String.raw`^\s*(?:export\s+)?(?:declare\s+)?interface\s+${s}\b`,
+    String.raw`^\s*(?:export\s+)?(?:declare\s+)?type\s+${s}\b`,
+    String.raw`^\s*(?:export\s+)?(?:declare\s+)?enum\s+${s}\b`,
+    String.raw`^\s*(?:export\s+)?(?:declare\s+)?(?:const|let|var)\s+${s}\b`,
   ];
 
   if (

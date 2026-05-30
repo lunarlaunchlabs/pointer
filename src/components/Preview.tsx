@@ -1,5 +1,5 @@
-import { useEffect, useState } from "react";
-import { ExternalLink, Maximize2, Minus, Plus } from "lucide-react";
+import { useEffect, useState } from "@/lib/preactSignalCompat";
+import { ExternalLink, Maximize2, Minus, Plus } from "@/lib/lucide";
 import { convertFileSrc } from "@tauri-apps/api/core";
 import { revealInFiler } from "@/lib/reveal";
 

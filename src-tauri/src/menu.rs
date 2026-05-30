@@ -12,10 +12,32 @@
 
 use tauri::{
     menu::{
-        AboutMetadataBuilder, MenuBuilder, MenuItemBuilder, PredefinedMenuItem, SubmenuBuilder,
+        AboutMetadataBuilder, CheckMenuItemBuilder, MenuBuilder, MenuItemBuilder, MenuItemKind,
+        PredefinedMenuItem, SubmenuBuilder,
     },
     AppHandle, Emitter, Runtime,
 };
+
+const THEMES_MENU_ID: &str = "menu:themes";
+const DEFAULT_THEME_MENU_ID: &str = "theme:pointer-noir";
+const THEME_MENU_ITEMS: &[(&str, &str)] = &[
+    ("theme:pointer-noir", "Pointer Noir"),
+    ("theme:pointer-gris", "Pointer Gris"),
+    ("theme:pointer-blanc", "Pointer Blanc"),
+    ("theme:pointer-magnet", "Pointer Magnet"),
+    ("theme:pointer-alien", "Pointer Alien"),
+    ("theme:pointer-pastelle", "Pointer Pastelle"),
+    ("theme:pointer-paladin", "Pointer Paladin"),
+    ("theme:pointer-desert-sage", "Pointer Desert Sage"),
+    ("theme:pointer-salmon", "Pointer Salmon"),
+    ("theme:pointer-dark-photon", "Pointer Dark Photon"),
+    ("theme:pointer-harmonic-tide", "Pointer Harmonic Tide"),
+    ("theme:pointer-rocket", "Pointer Rocket"),
+    ("theme:pointer-meteor", "Pointer Meteor"),
+    ("theme:pointer-dark-cola", "Pointer Dark Cola"),
+    ("theme:pointer-vampire", "Pointer Vampire"),
+    ("theme:pointer-monkey-pro", "Pointer Monkey Pro"),
+];
 
 /// Build and install the application menu. Call once during `setup`.
 pub fn install<R: Runtime>(app: &AppHandle<R>) -> tauri::Result<()> {
@@ -290,6 +312,48 @@ pub fn install<R: Runtime>(app: &AppHandle<R>) -> tauri::Result<()> {
         )?)
         .build()?;
 
+    // ── Themes ──────────────────────────────────────────────────────────
+    // Theme selection is routed through the same action bus as commands so
+    // the native menu, Settings page, command palette, and editor all share
+    // one persisted source of truth.
+    let theme_item = |id: &str, label: &str| {
+        CheckMenuItemBuilder::with_id(id, label)
+            .checked(id == DEFAULT_THEME_MENU_ID)
+            .build(app)
+    };
+    let themes_menu = SubmenuBuilder::with_id(app, THEMES_MENU_ID, "Themes")
+        .item(&theme_item("theme:pointer-noir", "Pointer Noir")?)
+        .item(&theme_item("theme:pointer-gris", "Pointer Gris")?)
+        .item(&theme_item("theme:pointer-blanc", "Pointer Blanc")?)
+        .item(&theme_item("theme:pointer-magnet", "Pointer Magnet")?)
+        .item(&theme_item("theme:pointer-alien", "Pointer Alien")?)
+        .item(&theme_item("theme:pointer-pastelle", "Pointer Pastelle")?)
+        .separator()
+        .item(&theme_item("theme:pointer-paladin", "Pointer Paladin")?)
+        .item(&theme_item(
+            "theme:pointer-desert-sage",
+            "Pointer Desert Sage",
+        )?)
+        .item(&theme_item("theme:pointer-salmon", "Pointer Salmon")?)
+        .item(&theme_item(
+            "theme:pointer-dark-photon",
+            "Pointer Dark Photon",
+        )?)
+        .item(&theme_item(
+            "theme:pointer-harmonic-tide",
+            "Pointer Harmonic Tide",
+        )?)
+        .separator()
+        .item(&theme_item("theme:pointer-rocket", "Pointer Rocket")?)
+        .item(&theme_item("theme:pointer-meteor", "Pointer Meteor")?)
+        .item(&theme_item("theme:pointer-dark-cola", "Pointer Dark Cola")?)
+        .item(&theme_item("theme:pointer-vampire", "Pointer Vampire")?)
+        .item(&theme_item(
+            "theme:pointer-monkey-pro",
+            "Pointer Monkey Pro",
+        )?)
+        .build()?;
+
     // ── Source Control ─────────────────────────────────────────────────
     let scm_menu = SubmenuBuilder::new(app, "Source Control")
         .item(
@@ -329,6 +393,7 @@ pub fn install<R: Runtime>(app: &AppHandle<R>) -> tauri::Result<()> {
             &edit_menu,
             &ai_menu,
             &view_menu,
+            &themes_menu,
             &scm_menu,
             &window_menu,
             &help_menu,
@@ -346,6 +411,38 @@ pub fn install<R: Runtime>(app: &AppHandle<R>) -> tauri::Result<()> {
         // Marker for menu-bar events so the frontend doesn't have to grep ids.
         let _ = handle.emit("menu:action", serde_json::json!({ "id": id }));
     });
+
+    Ok(())
+}
+
+pub(crate) fn set_active_theme<R: Runtime>(
+    app: &AppHandle<R>,
+    theme_id: &str,
+) -> tauri::Result<()> {
+    let active_id = format!("theme:{theme_id}");
+    if !THEME_MENU_ITEMS.iter().any(|(id, _)| *id == active_id) {
+        return Ok(());
+    }
+
+    let Some(themes_menu) = app
+        .menu()
+        .and_then(|menu| menu.get(THEMES_MENU_ID))
+        .and_then(|item| match item {
+            MenuItemKind::Submenu(submenu) => Some(submenu),
+            _ => None,
+        })
+    else {
+        return Ok(());
+    };
+
+    for &(id, _) in THEME_MENU_ITEMS {
+        if let Some(check_item) = themes_menu
+            .get(id)
+            .and_then(|item| item.as_check_menuitem().cloned())
+        {
+            check_item.set_checked(id == active_id)?;
+        }
+    }
 
     Ok(())
 }

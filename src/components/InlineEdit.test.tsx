@@ -16,6 +16,7 @@ import { InlineEdit } from "./InlineEdit";
 import { useEditorStore } from "@/store/editor";
 import { useDiagnostics, type Diagnostic } from "@/store/diagnostics";
 import { useRecentEdits } from "@/store/recentEdits";
+import { useSettings } from "@/store/settings";
 import * as ipcModule from "@/lib/ipc";
 
 function resetStores() {
@@ -34,6 +35,12 @@ function resetStores() {
     pendingReveal: null,
   });
   useDiagnostics.setState({ byUri: {}, errors: 0, warnings: 0 });
+  useSettings.setState({
+    ollamaReady: true,
+    installedModels: ["qwen2.5-coder:7b-instruct"],
+    chatModel: "qwen2.5-coder:7b-instruct",
+    inlineEditEnabled: true,
+  });
 }
 
 const diag: Diagnostic = {

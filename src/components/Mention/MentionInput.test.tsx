@@ -11,6 +11,7 @@
  *   • Editing the textarea fires the onChange callback verbatim.
  */
 
+import { useState } from "@/lib/preactSignalCompat";
 import { describe, expect, it, vi } from "vitest";
 import { render, screen } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
@@ -69,10 +70,32 @@ describe("MentionInput", () => {
     );
     const ta = screen.getByPlaceholderText("placeholder");
     await userEvent.type(ta, "ab");
-    // userEvent fires one event per keystroke (controlled inputs reset
-    // the value between keystrokes from the test's perspective).
+    // Preact preserves the textarea's DOM value between synthetic
+    // keystrokes, so each change reports the actual visible text.
     expect(onChange).toHaveBeenCalledTimes(2);
-    expect(onChange).toHaveBeenLastCalledWith("b");
+    expect(onChange).toHaveBeenLastCalledWith(
+      "ab",
+      expect.objectContaining({ selectionStart: 2, selectionEnd: 2 }),
+    );
+  });
+
+  it("keeps normal typed text as the textarea's visible source of truth", async () => {
+    function Harness() {
+      const [value, setValue] = useState("");
+      return (
+        <MentionInput
+          value={value}
+          onChange={(next) => setValue(next)}
+          highlightTokens={[]}
+          placeholder="composer"
+        />
+      );
+    }
+
+    render(<Harness />);
+    const ta = screen.getByPlaceholderText("composer") as HTMLTextAreaElement;
+    await userEvent.type(ta, "ask plan agent");
+    expect(ta.value).toBe("ask plan agent");
   });
 
   it("handles an empty token list without crashing", () => {

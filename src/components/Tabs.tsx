@@ -1,13 +1,20 @@
-import { useMemo, useState } from "react";
-import { Pin, X } from "lucide-react";
+import { useMemo, useState } from "@/lib/preactSignalCompat";
+import { Pin, X } from "@/lib/lucide";
 import { useEditorStore } from "@/store/editor";
 import { choose } from "@/components/Confirm";
 import { FileIconFor } from "@/lib/fileIcon";
 import { ContextMenu, type MenuItem } from "@/components/ContextMenu";
 import { dispatchAction } from "@/lib/actions";
-import { useGit, gitStatusColor, gitStatusLetter } from "@/store/git";
+import {
+  useGit,
+  gitStatusBorderClass,
+  gitStatusColor,
+  gitStatusLetter,
+  gitStatusNameClass,
+} from "@/store/git";
 import { useSession } from "@/store/session";
 import { toast } from "@/components/Toast";
+import type { GitFileStatus } from "@/lib/ipc";
 
 /**
  * Tab strip with the full IDE-grade interactions:
@@ -29,6 +36,9 @@ export function Tabs() {
   const closeTab = useEditorStore((s) => s.closeTab);
   const reorderTab = useEditorStore((s) => s.reorderTab);
   const togglePinned = useEditorStore((s) => s.togglePinned);
+  const gitWorkspace = useGit((s) => s.workspace);
+  const gitIsRepo = useGit((s) => s.status.is_repo);
+  const gitFiles = useGit((s) => s.status.files);
 
   const [ctx, setCtx] = useState<null | { x: number; y: number; path: string }>(
     null,
@@ -44,6 +54,18 @@ export function Tabs() {
     const rest = tabs.filter((t) => !pinSet.has(t.path));
     return [...pinnedTabs, ...rest];
   }, [tabs, pinned]);
+
+  const gitStatusByPath = useMemo(() => {
+    const byPath = new Map<string, GitFileStatus>();
+    if (!gitWorkspace || !gitIsRepo) return byPath;
+    for (const tab of tabs) {
+      const rel = relativeGitPath(gitWorkspace, tab.path);
+      if (!rel) continue;
+      const status = gitFiles[rel];
+      if (status) byPath.set(tab.path, status);
+    }
+    return byPath;
+  }, [gitFiles, gitIsRepo, gitWorkspace, tabs]);
 
   /** Same Save / Discard / Cancel flow as ⌘W and File → Close Tab. */
   const closeWithGuard = async (path: string) => {
@@ -188,9 +210,11 @@ export function Tabs() {
           const active = t.path === activePath;
           const isPinned = pinned.includes(t.path);
           const isDragSource = dragPath === t.path;
+          const gitStatus = gitStatusByPath.get(t.path) ?? null;
           return (
             <div
               key={t.path}
+              data-git-status={gitStatus ?? undefined}
               role="tab"
               aria-selected={active}
               aria-label={`${t.name}${t.dirty ? " (unsaved)" : ""}${isPinned ? ", pinned" : ""}`}
@@ -198,8 +222,13 @@ export function Tabs() {
               draggable
               onDragStart={(e) => {
                 setDragPath(t.path);
-                e.dataTransfer.effectAllowed = "move";
+                e.dataTransfer.effectAllowed = "copyMove";
                 e.dataTransfer.setData("text/pointer-tab", t.path);
+                e.dataTransfer.setData(
+                  "application/x-pointer-paths",
+                  JSON.stringify([t.path]),
+                );
+                e.dataTransfer.setData("text/plain", t.path);
               }}
               onDragEnd={() => setDragPath(null)}
               onDragOver={(e) => {
@@ -251,7 +280,7 @@ export function Tabs() {
                 setCtx({ x: e.clientX, y: e.clientY, path: t.path });
               }}
               title={t.path}
-              className={`group relative flex items-center gap-2 h-full px-3 cursor-pointer border-r border-noir-line/60 ${
+              className={`group relative flex items-center gap-2 h-full px-3 cursor-pointer border-l-2 ${gitStatusBorderClass(gitStatus)} border-r border-noir-line/60 ${
                 active
                   ? "bg-noir-canvas text-noir-text"
                   : "text-noir-subtext hover:text-noir-text hover:bg-noir-panel/60"
@@ -280,10 +309,10 @@ export function Tabs() {
                   aria-hidden="true"
                 />
               )}
-              <span className="font-mono text-[12px] truncate max-w-[160px]">
+              <span className={`font-mono text-[12px] truncate max-w-[160px] ${gitStatusNameClass(gitStatus)}`}>
                 {t.name}
               </span>
-              <GitTabBadge path={t.path} />
+              <GitTabBadge status={gitStatus} />
               
               <button
                 onClick={(e) => {
@@ -337,8 +366,7 @@ export function Tabs() {
  *  the user's mental model is consistent — a yellow "M" means the
  *  same thing everywhere. Untracked files in the workspace don't
  *  get a badge; only files git knows about. */
-function GitTabBadge({ path }: { path: string }) {
-  const status = useGit((s) => s.statusFor(path));
+function GitTabBadge({ status }: { status: GitFileStatus | null }) {
   if (!status) return null;
   // The store returns the raw `GitFileStatus` enum value as a
   // string ("modified" | "added" | "untracked" | "deleted" | "renamed").
@@ -351,4 +379,20 @@ function GitTabBadge({ path }: { path: string }) {
       {gitStatusLetter(status)}
     </span>
   );
+}
+
+function relativeGitPath(workspace: string, absolutePath: string): string | null {
+  const ws = normalizeAbs(workspace);
+  const abs = normalizeAbs(absolutePath);
+  if (!ws) return null;
+  if (abs === ws) return "";
+  const prefix = ws.endsWith("/") ? ws : `${ws}/`;
+  if (!abs.startsWith(prefix)) return null;
+  return abs.slice(prefix.length).replace(/^\/+/, "");
+}
+
+function normalizeAbs(path: string): string {
+  const normal = path.replace(/\\/g, "/");
+  if (normal === "/") return normal;
+  return normal.replace(/\/+$/, "");
 }

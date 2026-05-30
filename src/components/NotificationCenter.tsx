@@ -1,5 +1,5 @@
-import { useEffect, useState } from "react";
-import { createPortal } from "react-dom";
+import { useEffect, useState } from "@/lib/preactSignalCompat";
+import { createPortal } from "@/lib/preactSignalDomCompat";
 import {
   AlertTriangle,
   Bell,
@@ -8,7 +8,7 @@ import {
   Trash2,
   X,
   XCircle,
-} from "lucide-react";
+} from "@/lib/lucide";
 import {
   clearHistory,
   markAllSeen,

@@ -11,6 +11,7 @@ use crate::error::{AppError, AppResult};
 use crate::services::inference::{acquire_inference, InferenceClaim, InferencePolicy};
 use crate::state::AppState;
 use regex::Regex;
+use serde::Deserialize;
 use serde_json::{json, Value};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -24,9 +25,12 @@ use tokio::sync::Mutex;
 use tokio::time::timeout;
 
 const OLLAMA_OPENAI_BASE: &str = "http://127.0.0.1:11434/v1";
+const OLLAMA_DIRECT_BASE: &str = "http://127.0.0.1:11434";
 const CHANGE_SNAPSHOT_MAX_FILE_BYTES: u64 = 2 * 1024 * 1024;
 const CHANGE_SNAPSHOT_MAX_TOTAL_BYTES: u64 = 96 * 1024 * 1024;
 const PROCESS_TAIL_LIMIT: usize = 8_000;
+const DIRECT_PATCH_MAX_CONTEXT_BYTES: usize = 92_000;
+const DIRECT_PATCH_MAX_FILE_BYTES: usize = 24_000;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OpenCodeMode {
@@ -118,8 +122,11 @@ pub async fn run_opencode(
         .arg("--dir")
         .arg(&workspace)
         .arg("--model")
-        .arg(&model_arg)
-        .arg("--agent")
+        .arg(&model_arg);
+    if let Some(variant) = opencode_variant(&req.mode) {
+        cmd.arg("--variant").arg(variant);
+    }
+    cmd.arg("--agent")
         .arg(agent_name)
         .arg("--format")
         .arg("json")
@@ -131,6 +138,8 @@ pub async fn run_opencode(
         .env("XDG_CACHE_HOME", runtime.cache_dir.as_os_str())
         .env("OPENAI_API_KEY", "pointer-local")
         .env("OLLAMA_API_KEY", "pointer-local")
+        .env("OLLAMA_CONTEXT_LENGTH", "32768")
+        .env("OLLAMA_NUM_PARALLEL", "1")
         .env("OPENCODE_DISABLE_EXTERNAL_SKILLS", "1")
         .env("OPENCODE_DISABLE_CLAUDE_CODE_SKILLS", "1")
         .stdin(Stdio::null())
@@ -360,24 +369,108 @@ pub async fn run_opencode(
 
     let status = child.wait().await.map_err(AppError::Io)?;
     cleanup_runtime_dir(&runtime.root);
+    let mut direct_fallback_final: Option<String> = None;
     if !status.success() {
         let tail = process_tail.lock().await.clone();
         let msg = last_error.unwrap_or_else(|| opencode_exit_message(status, &tail));
-        if req.mode == OpenCodeMode::Ask {
+        if req.mode == OpenCodeMode::Agent && !saw_agent_mutation {
+            if let Some(before) = before_snapshot.as_ref() {
+                let after_failure = snapshot_workspace(&workspace);
+                if workspace_snapshot_changed(before, &after_failure) {
+                    let summary = "OpenCode changed files but exited with an error. Pointer captured the resulting diff for review.".to_string();
+                    direct_fallback_final = Some(summary.clone());
+                    out.text.push_str("\n\n");
+                    out.text.push_str(&summary);
+                } else {
+                    match run_direct_ollama_patch_fallback(
+                        &app,
+                        state,
+                        &req,
+                        &workspace,
+                        before,
+                        &msg,
+                        &evt,
+                        step.max(1),
+                        &mut cancel,
+                    )
+                    .await
+                    {
+                        Ok(Some(summary)) => {
+                            direct_fallback_final = Some(summary.clone());
+                            out.text.push_str("\n\n");
+                            out.text.push_str(&summary);
+                        }
+                        Ok(None) => {
+                            let _ = app.emit(
+                                &evt,
+                                json!({ "kind": "error", "step": step.max(1), "text": msg }),
+                            );
+                            let _ = app.emit(&evt, json!({ "kind": "done", "termination": "error", "elapsed_ms": start.elapsed().as_millis() as u64 }));
+                            return Err(AppError::Msg(msg));
+                        }
+                        Err(error) => {
+                            let text = format!("{msg}\n\nDirect Ollama fallback failed: {error}");
+                            let _ = app.emit(
+                                &evt,
+                                json!({ "kind": "error", "step": step.max(1), "text": text }),
+                            );
+                            let _ = app.emit(&evt, json!({ "kind": "done", "termination": "error", "elapsed_ms": start.elapsed().as_millis() as u64 }));
+                            return Err(AppError::Msg(text));
+                        }
+                    }
+                }
+            } else {
+                let _ = app.emit(
+                    &evt,
+                    json!({ "kind": "error", "step": step.max(1), "text": msg }),
+                );
+                let _ = app.emit(&evt, json!({ "kind": "done", "termination": "error", "elapsed_ms": start.elapsed().as_millis() as u64 }));
+                return Err(AppError::Msg(msg));
+            }
+        } else if req.mode == OpenCodeMode::Ask {
             let _ = app.emit(&chat_evt, json!({ "error": msg, "done": true }));
+            return Err(AppError::Msg(msg));
         } else {
             let _ = app.emit(
                 &evt,
                 json!({ "kind": "error", "step": step.max(1), "text": msg }),
             );
             let _ = app.emit(&evt, json!({ "kind": "done", "termination": "error", "elapsed_ms": start.elapsed().as_millis() as u64 }));
+            return Err(AppError::Msg(msg));
         }
-        return Err(AppError::Msg(msg));
     }
 
     let change_records = if req.mode == OpenCodeMode::Agent {
         if let Some(before) = before_snapshot.as_ref() {
-            let after = snapshot_workspace(&workspace);
+            let mut after = snapshot_workspace(&workspace);
+            let structural = run_structural_integration_fallback(
+                &workspace,
+                before,
+                &after,
+                &req.prompt,
+                &req.files,
+            )?;
+            if !structural.is_empty() {
+                let _ = app.emit(
+                    &evt,
+                    json!({
+                        "kind": "tool_result",
+                        "step": step.max(1),
+                        "tool": "pointer_supervisor",
+                        "status": "ok",
+                        "result": format!(
+                            "Structural integration completed {} file update{}",
+                            structural.len(),
+                            if structural.len() == 1 { "" } else { "s" }
+                        ),
+                        "extra": {
+                            "reason": "deterministic_structural_integration",
+                            "applied": structural,
+                        },
+                    }),
+                );
+                after = snapshot_workspace(&workspace);
+            }
             let records = record_workspace_changes(&app, step.max(1), &workspace, before, &after)?;
             emit_change_records(
                 &app,
@@ -416,8 +509,10 @@ pub async fn run_opencode(
             } else {
                 &text_since_tool
             };
-            let plan =
-                sanitize_verification_claims(&normalize_final_text(plan_source), &bash_records);
+            let plan = sanitize_verification_claims(
+                &sanitize_workspace_paths(&normalize_final_text(plan_source), &workspace),
+                &bash_records,
+            );
             let _ = app.emit(
                 &evt,
                 json!({ "kind": "plan", "step": step.max(1), "text": plan }),
@@ -430,13 +525,18 @@ pub async fn run_opencode(
             let _ = app.emit(&evt, json!({ "kind": "done", "termination": "final", "elapsed_ms": start.elapsed().as_millis() as u64 }));
         }
         OpenCodeMode::Agent => {
-            let answer_source = if text_since_tool.trim().is_empty() {
+            let answer_source = if let Some(fallback) = direct_fallback_final.as_deref() {
+                fallback
+            } else if text_since_tool.trim().is_empty() {
                 &out.text
             } else {
                 &text_since_tool
             };
             let final_text = ensure_verification_status(
-                &sanitize_verification_claims(&normalize_final_text(answer_source), &bash_records),
+                &sanitize_verification_claims(
+                    &sanitize_workspace_paths(&normalize_final_text(answer_source), &workspace),
+                    &bash_records,
+                ),
                 &bash_records,
             );
             let _ = app.emit(
@@ -710,6 +810,1065 @@ fn record_workspace_changes(
     Ok(records)
 }
 
+fn workspace_snapshot_changed(before: &WorkspaceSnapshot, after: &WorkspaceSnapshot) -> bool {
+    if before.files.len() != after.files.len() {
+        return true;
+    }
+    before
+        .files
+        .iter()
+        .any(|(path, bytes)| after.files.get(path) != Some(bytes))
+}
+
+#[derive(Debug, Deserialize)]
+struct DirectPatchPlan {
+    #[serde(default)]
+    edits: Vec<DirectPatchEdit>,
+    #[serde(default)]
+    summary: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct DirectPatchEdit {
+    path: String,
+    #[serde(default)]
+    search: Option<String>,
+    #[serde(default)]
+    replace: String,
+    #[serde(default)]
+    create: bool,
+}
+
+struct DirectPatchContextFile {
+    path: String,
+    text: String,
+    score: i32,
+}
+
+async fn run_direct_ollama_patch_fallback(
+    app: &AppHandle,
+    state: &AppState,
+    req: &OpenCodeRunRequest,
+    workspace: &Path,
+    before: &WorkspaceSnapshot,
+    opencode_error: &str,
+    evt: &str,
+    step: u32,
+    cancel: &mut tokio::sync::broadcast::Receiver<()>,
+) -> AppResult<Option<String>> {
+    let context = select_direct_patch_context(workspace, before, &req.prompt, &req.files);
+    if context.is_empty() {
+        return Ok(None);
+    }
+    let _ = app.emit(
+        evt,
+        json!({
+            "kind": "tool_call",
+            "step": step,
+            "tool": "pointer_direct_ollama_patch",
+            "attrs": {
+                "reason": "opencode_failed_before_write",
+                "files": context.iter().map(|f| f.path.clone()).collect::<Vec<_>>(),
+            },
+            "args": serde_json::to_string_pretty(&json!({
+                "reason": "OpenCode exited before applying a mutating tool",
+                "model": req.model,
+            })).unwrap_or_else(|_| "{}".into()),
+        }),
+    );
+
+    let mut last_apply_error: Option<String> = None;
+    for attempt in 1..=2 {
+        let prompt = render_direct_patch_prompt(
+            workspace,
+            &req.prompt,
+            opencode_error,
+            &context,
+            last_apply_error.as_deref(),
+        );
+        let response = direct_ollama_generate(req, state, &prompt, cancel).await?;
+        let Some(json_text) = extract_first_json_object(&response) else {
+            last_apply_error = Some("model did not return a JSON object".into());
+            continue;
+        };
+        let plan: DirectPatchPlan = match serde_json::from_str(&json_text) {
+            Ok(plan) => plan,
+            Err(error) => {
+                last_apply_error = Some(format!("model returned invalid JSON: {error}"));
+                continue;
+            }
+        };
+        if plan.edits.is_empty() {
+            let _ = app.emit(
+                evt,
+                json!({
+                    "kind": "tool_result",
+                    "step": step,
+                    "tool": "pointer_direct_ollama_patch",
+                    "status": "error",
+                    "result": "Direct Ollama fallback found no safe patch to apply.",
+                    "extra": { "attempt": attempt },
+                }),
+            );
+            return Ok(None);
+        }
+        match apply_direct_patch_plan(workspace, before, &plan.edits) {
+            Ok(changed) if !changed.is_empty() => {
+                let summary = direct_patch_final_summary(&plan, &changed);
+                let _ = app.emit(
+                    evt,
+                    json!({
+                        "kind": "tool_result",
+                        "step": step,
+                        "tool": "pointer_direct_ollama_patch",
+                        "status": "ok",
+                        "result": summary,
+                        "extra": {
+                            "attempt": attempt,
+                            "changed": changed,
+                        },
+                    }),
+                );
+                return Ok(Some(summary));
+            }
+            Ok(_) => {
+                last_apply_error = Some("patch was valid but produced no file changes".into());
+            }
+            Err(error) => {
+                last_apply_error = Some(error);
+            }
+        }
+    }
+
+    Err(AppError::Msg(last_apply_error.unwrap_or_else(|| {
+        "direct Ollama fallback could not produce a patch".into()
+    })))
+}
+
+async fn direct_ollama_generate(
+    req: &OpenCodeRunRequest,
+    state: &AppState,
+    prompt: &str,
+    cancel: &mut tokio::sync::broadcast::Receiver<()>,
+) -> AppResult<String> {
+    let body = json!({
+        "model": opencode_model_id(&req.model),
+        "prompt": prompt,
+        "system": "You are Pointer's direct Ollama patch fallback. Return only the requested JSON object. Do not use Markdown fences or commentary.",
+        "stream": false,
+        "think": false,
+        "options": {
+            "temperature": 0.1,
+            "num_ctx": 32768,
+            "num_predict": 4096
+        }
+    });
+    let client = reqwest::Client::new();
+    let send = client
+        .post(format!("{OLLAMA_DIRECT_BASE}/api/generate"))
+        .json(&body)
+        .send();
+    let resp = tokio::select! {
+        _ = cancel.recv() => {
+            return Err(AppError::Msg("direct Ollama fallback cancelled".into()));
+        }
+        resp = send => resp?,
+    };
+    if !resp.status().is_success() {
+        let status = resp.status();
+        let text = resp.text().await.unwrap_or_default();
+        return Err(AppError::Msg(format!(
+            "direct Ollama fallback returned HTTP {status}: {text}",
+        )));
+    }
+    let parsed: Value = tokio::select! {
+        _ = cancel.recv() => {
+            return Err(AppError::Msg("direct Ollama fallback cancelled".into()));
+        }
+        parsed = resp.json() => parsed?,
+    };
+    let text = parsed
+        .get("response")
+        .and_then(|v| v.as_str())
+        .unwrap_or_default()
+        .to_string();
+    if !text.trim().is_empty() {
+        state
+            .inference
+            .note_tokens(&req.request_id, estimate_tokens(&text));
+    }
+    Ok(text)
+}
+
+fn render_direct_patch_prompt(
+    workspace: &Path,
+    user_prompt: &str,
+    opencode_error: &str,
+    context: &[DirectPatchContextFile],
+    previous_error: Option<&str>,
+) -> String {
+    let mut out = String::new();
+    out.push_str("OpenCode failed before applying any file write. Produce a bounded patch using only the repository evidence below.\n");
+    out.push_str("Return exactly this JSON shape:\n");
+    out.push_str(r#"{"summary":"one concise sentence","edits":[{"path":"relative/file","search":"exact current text to replace","replace":"new text"},{"path":"relative/new-file","create":true,"replace":"full file contents"}]}"#);
+    out.push_str("\nRules:\n");
+    out.push_str(
+        "- Paths must be workspace-relative and must not contain .. or absolute prefixes.\n",
+    );
+    out.push_str("- For existing files, search must be an exact substring copied from the supplied file content.\n");
+    out.push_str("- Prefer the smallest edit that satisfies the request.\n");
+    out.push_str("- If the supplied evidence is insufficient, return {\"summary\":\"insufficient evidence\",\"edits\":[]}.\n\n");
+    out.push_str(&format!(
+        "Workspace: {}\n",
+        workspace
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("workspace")
+    ));
+    out.push_str("User request:\n");
+    out.push_str(user_prompt.trim());
+    out.push_str("\n\nOpenCode error:\n");
+    out.push_str(opencode_error.trim());
+    if let Some(error) = previous_error {
+        out.push_str("\n\nPrevious patch attempt failed:\n");
+        out.push_str(error);
+    }
+    out.push_str("\n\nRepository evidence:\n");
+    for file in context {
+        out.push_str("\n<file path=\"");
+        out.push_str(&file.path);
+        out.push_str("\">\n");
+        out.push_str(&file.text);
+        if !file.text.ends_with('\n') {
+            out.push('\n');
+        }
+        out.push_str("</file>\n");
+    }
+    out
+}
+
+fn select_direct_patch_context(
+    workspace: &Path,
+    before: &WorkspaceSnapshot,
+    prompt: &str,
+    attached_files: &[String],
+) -> Vec<DirectPatchContextFile> {
+    let terms = prompt_terms(prompt);
+    let mut attached = attached_files
+        .iter()
+        .filter_map(|path| opencode_file_arg(workspace, path))
+        .collect::<Vec<_>>();
+    attached.extend(referenced_prompt_paths(workspace, prompt));
+    attached.sort();
+    attached.dedup();
+    let mut files = before
+        .files
+        .iter()
+        .filter_map(|(path, bytes)| {
+            if !is_direct_patch_context_path(path) || bytes.len() > DIRECT_PATCH_MAX_FILE_BYTES {
+                return None;
+            }
+            let text = std::str::from_utf8(bytes).ok()?.to_string();
+            let lower_path = path.to_ascii_lowercase();
+            let lower_text = text.to_ascii_lowercase();
+            let mut score = 0;
+            if attached.iter().any(|attached_path| attached_path == path) {
+                score += 120;
+            }
+            for term in &terms {
+                if lower_path.contains(term) {
+                    score += 20;
+                }
+                if lower_text.contains(term) {
+                    score += 6;
+                }
+            }
+            if is_aggregator_like_file(path, &text) {
+                score += 18;
+            }
+            if score <= 0 {
+                return None;
+            }
+            Some(DirectPatchContextFile {
+                path: path.clone(),
+                text,
+                score,
+            })
+        })
+        .collect::<Vec<_>>();
+    files.sort_by(|a, b| b.score.cmp(&a.score).then_with(|| a.path.cmp(&b.path)));
+
+    let mut total = 0usize;
+    let mut out = Vec::new();
+    for file in files {
+        let next_total = total.saturating_add(file.text.len());
+        if next_total > DIRECT_PATCH_MAX_CONTEXT_BYTES {
+            continue;
+        }
+        total = next_total;
+        out.push(file);
+        if out.len() >= 12 {
+            break;
+        }
+    }
+    out
+}
+
+fn referenced_prompt_paths(workspace: &Path, prompt: &str) -> Vec<String> {
+    prompt
+        .lines()
+        .map(str::trim)
+        .filter(|line| {
+            !line.is_empty()
+                && !line.contains(' ')
+                && !line.ends_with(':')
+                && (line.contains('/') || line.contains('.'))
+        })
+        .filter_map(|line| opencode_file_arg(workspace, line))
+        .collect()
+}
+
+fn prompt_terms(prompt: &str) -> Vec<String> {
+    let mut out = prompt
+        .to_ascii_lowercase()
+        .split(|ch: char| !ch.is_ascii_alphanumeric())
+        .filter(|term| term.len() >= 4)
+        .filter(|term| {
+            !matches!(
+                *term,
+                "this" | "that" | "with" | "from" | "into" | "another"
+            )
+        })
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+    out.sort();
+    out.dedup();
+    out
+}
+
+fn is_direct_patch_context_path(path: &str) -> bool {
+    if is_integratable_source_artifact(path) {
+        return true;
+    }
+    matches!(
+        Path::new(path)
+            .extension()
+            .and_then(|ext| ext.to_str())
+            .map(|ext| ext.to_ascii_lowercase())
+            .as_deref(),
+        Some("json" | "toml" | "yaml" | "yml" | "md" | "mdx" | "html" | "css" | "scss")
+    )
+}
+
+fn apply_direct_patch_plan(
+    workspace: &Path,
+    before: &WorkspaceSnapshot,
+    edits: &[DirectPatchEdit],
+) -> Result<Vec<String>, String> {
+    if edits.is_empty() {
+        return Ok(Vec::new());
+    }
+    if edits.len() > 12 {
+        return Err("direct patch rejected: too many edits".into());
+    }
+    let mut pending: Vec<(PathBuf, String, Vec<u8>)> = Vec::new();
+    for edit in edits {
+        let rel = safe_direct_patch_path(&edit.path)?;
+        let abs = workspace.join(&rel);
+        if should_skip_snapshot_path(&abs, workspace) {
+            return Err(format!("direct patch rejected unsafe path `{}`", edit.path));
+        }
+        let rel_key = normalize_rel_path(&rel);
+        if edit.create || !before.files.contains_key(&rel_key) {
+            if abs.exists() {
+                return Err(format!(
+                    "direct patch create target already exists `{rel_key}`"
+                ));
+            }
+            if edit.replace.trim().is_empty() {
+                return Err(format!("direct patch create target is empty `{rel_key}`"));
+            }
+            pending.push((abs, rel_key, edit.replace.as_bytes().to_vec()));
+            continue;
+        }
+
+        let current = std::fs::read_to_string(&abs)
+            .map_err(|e| format!("direct patch read `{rel_key}` failed: {e}"))?;
+        let search = edit
+            .search
+            .as_deref()
+            .ok_or_else(|| format!("direct patch missing search text for `{rel_key}`"))?;
+        if search.is_empty() {
+            return Err(format!("direct patch empty search text for `{rel_key}`"));
+        }
+        if !current.contains(search) {
+            return Err(format!(
+                "direct patch search text did not match `{rel_key}`"
+            ));
+        }
+        let next = current.replacen(search, &edit.replace, 1);
+        if next == current {
+            return Err(format!("direct patch produced no change for `{rel_key}`"));
+        }
+        pending.push((abs, rel_key, next.into_bytes()));
+    }
+
+    let mut changed = Vec::new();
+    for (abs, rel, bytes) in pending {
+        if let Some(parent) = abs.parent() {
+            std::fs::create_dir_all(parent)
+                .map_err(|e| format!("direct patch mkdir `{}` failed: {e}", parent.display()))?;
+        }
+        std::fs::write(&abs, bytes)
+            .map_err(|e| format!("direct patch write `{rel}` failed: {e}"))?;
+        changed.push(rel);
+    }
+    changed.sort();
+    changed.dedup();
+    Ok(changed)
+}
+
+fn safe_direct_patch_path(path: &str) -> Result<PathBuf, String> {
+    let trimmed = path.trim().replace('\\', "/");
+    if trimmed.is_empty() {
+        return Err("direct patch path is empty".into());
+    }
+    let path = Path::new(&trimmed);
+    if path.is_absolute() {
+        return Err(format!("direct patch rejected absolute path `{trimmed}`"));
+    }
+    if path
+        .components()
+        .any(|component| matches!(component, std::path::Component::ParentDir))
+    {
+        return Err(format!(
+            "direct patch rejected parent traversal `{trimmed}`"
+        ));
+    }
+    if trimmed.starts_with(".git/") || trimmed == ".git" {
+        return Err("direct patch rejected .git path".into());
+    }
+    Ok(PathBuf::from(trimmed))
+}
+
+fn direct_patch_final_summary(plan: &DirectPatchPlan, changed: &[String]) -> String {
+    let summary = plan
+        .summary
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .unwrap_or("Applied a direct Ollama fallback patch after OpenCode exited before editing.");
+    format!(
+        "{summary}\n\nFiles changed: {}.\nPointer used direct Ollama fallback because OpenCode exited before applying edits.",
+        changed.join(", "),
+    )
+}
+
+fn extract_first_json_object(s: &str) -> Option<String> {
+    let bytes = s.as_bytes();
+    let start = bytes.iter().position(|&b| b == b'{')?;
+    let mut depth: i32 = 0;
+    let mut in_string = false;
+    let mut escape = false;
+    for (i, &b) in bytes.iter().enumerate().skip(start) {
+        if in_string {
+            if escape {
+                escape = false;
+            } else if b == b'\\' {
+                escape = true;
+            } else if b == b'"' {
+                in_string = false;
+            }
+            continue;
+        }
+        match b {
+            b'"' => in_string = true,
+            b'{' => depth += 1,
+            b'}' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(s[start..=i].to_string());
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+fn run_structural_integration_fallback(
+    workspace: &Path,
+    before: &WorkspaceSnapshot,
+    after: &WorkspaceSnapshot,
+    prompt: &str,
+    context_files: &[String],
+) -> AppResult<Vec<String>> {
+    let created = created_source_files_needing_integration(before, after);
+    if created.is_empty() {
+        return Ok(Vec::new());
+    }
+    let candidates = structural_candidate_files(after, prompt, context_files, &created);
+    if candidates.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut applied = Vec::new();
+    for created_file in created {
+        for candidate_file in &candidates {
+            if let Some(mut changed) = try_integrate_module_registry_file(
+                workspace,
+                after,
+                prompt,
+                &created_file,
+                candidate_file,
+            )? {
+                applied.append(&mut changed);
+                break;
+            }
+        }
+    }
+    applied.sort();
+    applied.dedup();
+    Ok(applied)
+}
+
+fn created_source_files_needing_integration(
+    before: &WorkspaceSnapshot,
+    after: &WorkspaceSnapshot,
+) -> Vec<String> {
+    let mut out = after
+        .files
+        .keys()
+        .filter(|path| !before.files.contains_key(*path))
+        .filter(|path| is_integratable_source_artifact(path))
+        .filter(|path| !workspace_mentions_created_file(after, path))
+        .cloned()
+        .collect::<Vec<_>>();
+    out.sort();
+    out.truncate(6);
+    out
+}
+
+fn is_integratable_source_artifact(path: &str) -> bool {
+    let lower = path.to_ascii_lowercase();
+    matches!(
+        Path::new(&lower).extension().and_then(|ext| ext.to_str()),
+        Some(
+            "astro"
+                | "c"
+                | "cc"
+                | "cpp"
+                | "cs"
+                | "css"
+                | "go"
+                | "h"
+                | "hpp"
+                | "html"
+                | "java"
+                | "js"
+                | "jsx"
+                | "kt"
+                | "less"
+                | "mjs"
+                | "py"
+                | "rb"
+                | "rs"
+                | "sass"
+                | "scss"
+                | "svelte"
+                | "ts"
+                | "tsx"
+                | "vue"
+        )
+    )
+}
+
+fn workspace_mentions_created_file(snapshot: &WorkspaceSnapshot, target: &str) -> bool {
+    let base = Path::new(target)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    let stem = path_stem(target).to_ascii_lowercase();
+    let target_lower = target.to_ascii_lowercase();
+    let symbols = snapshot
+        .files
+        .get(target)
+        .and_then(|bytes| std::str::from_utf8(bytes).ok())
+        .map(default_export_symbol)
+        .unwrap_or(None)
+        .into_iter()
+        .map(|symbol| symbol.to_ascii_lowercase())
+        .collect::<Vec<_>>();
+    for (path, bytes) in &snapshot.files {
+        if path == target {
+            continue;
+        }
+        let Ok(body) = std::str::from_utf8(bytes) else {
+            continue;
+        };
+        let lower = body.to_ascii_lowercase();
+        if base.len() >= 4 && lower.contains(&base) {
+            return true;
+        }
+        if stem.len() >= 4 && lower.contains(&stem) {
+            return true;
+        }
+        if lower.contains(&target_lower) {
+            return true;
+        }
+        if symbols
+            .iter()
+            .any(|symbol| symbol.len() >= 4 && lower.contains(symbol))
+        {
+            return true;
+        }
+        let spec = relative_module_spec(path, target);
+        if mentions_module_spec(body, &spec) {
+            return true;
+        }
+    }
+    false
+}
+
+fn structural_candidate_files(
+    snapshot: &WorkspaceSnapshot,
+    prompt: &str,
+    context_files: &[String],
+    created: &[String],
+) -> Vec<String> {
+    let mut scored: HashMap<String, i32> = HashMap::new();
+    let created_dirs = created
+        .iter()
+        .map(|path| parent_dir(path))
+        .collect::<Vec<_>>();
+    let prompt_lower = prompt.to_ascii_lowercase();
+    let add_score = |scores: &mut HashMap<String, i32>, file: &str, score: i32| {
+        if score < 35 || !is_integratable_source_artifact(file) {
+            return;
+        }
+        scores
+            .entry(file.to_string())
+            .and_modify(|current| *current = (*current).max(score))
+            .or_insert(score);
+    };
+    for file in context_files {
+        add_score(&mut scored, file, 45);
+    }
+    for (file, bytes) in &snapshot.files {
+        if created.iter().any(|created_file| created_file == file) {
+            continue;
+        }
+        let Ok(body) = std::str::from_utf8(bytes) else {
+            continue;
+        };
+        let file_dir = parent_dir(file);
+        let imports = extract_relative_imports(body);
+        let mut score = 0;
+        if is_aggregator_like_file(file, body) {
+            score += 70;
+        }
+        if is_entry_like_file(file, body) {
+            score += 35;
+        }
+        if created_dirs.iter().any(|dir| dir == &file_dir) {
+            score += 55;
+        }
+        if imports.iter().any(|spec| {
+            resolve_relative_import(file, spec, snapshot)
+                .map(|resolved| created_dirs.iter().any(|dir| parent_dir(&resolved) == *dir))
+                .unwrap_or(false)
+        }) {
+            score += 45;
+        }
+        if prompt_lower
+            .split(|ch: char| !ch.is_ascii_alphanumeric())
+            .filter(|term| term.len() >= 5)
+            .any(|term| {
+                file.to_ascii_lowercase().contains(term) || body.to_ascii_lowercase().contains(term)
+            })
+        {
+            score += 15;
+        }
+        add_score(&mut scored, file, score);
+    }
+    let mut items = scored.into_iter().collect::<Vec<_>>();
+    items.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+    items.into_iter().map(|(file, _)| file).take(8).collect()
+}
+
+fn try_integrate_module_registry_file(
+    workspace: &Path,
+    snapshot: &WorkspaceSnapshot,
+    prompt: &str,
+    created_file: &str,
+    candidate_file: &str,
+) -> AppResult<Option<Vec<String>>> {
+    if !looks_like_module_file(created_file) || !looks_like_module_file(candidate_file) {
+        return Ok(None);
+    }
+    let Some(created_body) = snapshot
+        .files
+        .get(created_file)
+        .and_then(|bytes| std::str::from_utf8(bytes).ok())
+    else {
+        return Ok(None);
+    };
+    let Some(candidate_body) = snapshot
+        .files
+        .get(candidate_file)
+        .and_then(|bytes| std::str::from_utf8(bytes).ok())
+    else {
+        return Ok(None);
+    };
+    let Some(symbol) = default_export_symbol(created_body) else {
+        return Ok(None);
+    };
+    if candidate_body.contains(&symbol) || extract_relative_imports(candidate_body).is_empty() {
+        return Ok(None);
+    }
+    let import_line = format!(
+        "import {symbol} from '{}';",
+        relative_module_spec(candidate_file, created_file)
+    );
+    let with_import = insert_import_declaration(candidate_body, &import_line);
+    let Some((next_candidate, references_title)) =
+        insert_module_registry_entry(&with_import, &symbol)
+    else {
+        return Ok(None);
+    };
+    if patch_would_corrupt_module(candidate_body, &next_candidate) {
+        return Ok(None);
+    }
+    std::fs::write(workspace.join(candidate_file), next_candidate).map_err(AppError::Io)?;
+    let mut applied = vec![candidate_file.to_string()];
+    if references_title && !module_symbol_has_title(created_body, &symbol) {
+        let titled = insert_module_title_assignment(
+            created_body,
+            &symbol,
+            &title_for_created_module(prompt, &symbol),
+        );
+        if !patch_would_corrupt_module(created_body, &titled) {
+            std::fs::write(workspace.join(created_file), titled).map_err(AppError::Io)?;
+            applied.push(created_file.to_string());
+        }
+    }
+    Ok(Some(applied))
+}
+
+fn looks_like_module_file(path: &str) -> bool {
+    matches!(
+        Path::new(path)
+            .extension()
+            .and_then(|ext| ext.to_str())
+            .map(|ext| ext.to_ascii_lowercase())
+            .as_deref(),
+        Some("js" | "jsx" | "ts" | "tsx" | "mjs" | "cjs" | "vue" | "svelte")
+    )
+}
+
+fn default_export_symbol(body: &str) -> Option<String> {
+    for pattern in [
+        r"\bexport\s+default\s+function\s+([A-Za-z_$][\w$]*)",
+        r"\bexport\s+default\s+class\s+([A-Za-z_$][\w$]*)",
+        r"\bexport\s+default\s+([A-Za-z_$][\w$]*)\s*;?",
+    ] {
+        let re = Regex::new(pattern).ok()?;
+        if let Some(hit) = re.captures(body).and_then(|captures| captures.get(1)) {
+            return Some(hit.as_str().to_string());
+        }
+    }
+    None
+}
+
+fn insert_import_declaration(body: &str, import_line: &str) -> String {
+    if body.contains(import_line) {
+        return body.to_string();
+    }
+    let mut lines = body.lines().map(str::to_string).collect::<Vec<_>>();
+    let mut insert_at = 0usize;
+    for (idx, line) in lines.iter().enumerate() {
+        let trimmed = line.trim();
+        if trimmed.starts_with("import ")
+            || trimmed.starts_with("import\"")
+            || trimmed.starts_with("import'")
+        {
+            insert_at = idx + 1;
+        } else if !trimmed.is_empty() && !trimmed.starts_with("//") {
+            break;
+        }
+    }
+    lines.insert(insert_at, import_line.to_string());
+    format!("{}\n", lines.join("\n"))
+}
+
+fn insert_module_registry_entry(body: &str, symbol: &str) -> Option<(String, bool)> {
+    if body.contains(&format!("Component: {symbol}")) {
+        return None;
+    }
+    let component_re =
+        Regex::new(r"(?s)(const\s+[A-Za-z_$][\w$]*\s*=\s*\[.*?)(\n\]\.map|\n\];)").ok()?;
+    if let Some(hit) = component_re.captures(body) {
+        let prefix = hit.get(1)?.as_str();
+        if prefix.contains("Component:") {
+            let references_title = Regex::new(r"\b[A-Za-z_$][\w$]*\.title\b")
+                .ok()?
+                .is_match(prefix);
+            let entry = if references_title {
+                format!("  {{ Component: {symbol}, title: {symbol}.title }},")
+            } else {
+                format!("  {{ Component: {symbol} }},")
+            };
+            let start = hit.get(1)?.start();
+            let end = hit.get(1)?.end();
+            let mut next = String::new();
+            next.push_str(&body[..start]);
+            next.push_str(prefix.trim_end());
+            next.push('\n');
+            next.push_str(&entry);
+            next.push_str(&body[end..]);
+            return Some((next, references_title));
+        }
+    }
+    let default_array_re = Regex::new(r"(?s)(export\s+default\s+\[.*?)(\n\];)").ok()?;
+    if let Some(hit) = default_array_re.captures(body) {
+        let start = hit.get(1)?.start();
+        let end = hit.get(1)?.end();
+        let prefix = hit.get(1)?.as_str();
+        let mut next = String::new();
+        next.push_str(&body[..start]);
+        next.push_str(prefix.trim_end());
+        next.push('\n');
+        next.push_str(&format!("  {symbol},"));
+        next.push_str(&body[end..]);
+        return Some((next, false));
+    }
+    None
+}
+
+fn patch_would_corrupt_module(before: &str, after: &str) -> bool {
+    if has_import_after_executable_code(after) {
+        return true;
+    }
+    let before_defaults = before.matches("export default").count();
+    let after_defaults = after.matches("export default").count();
+    before_defaults >= 1 && after_defaults > before_defaults
+}
+
+fn has_import_after_executable_code(body: &str) -> bool {
+    let mut saw_executable = false;
+    for line in body.lines().map(str::trim) {
+        if line.is_empty()
+            || line.starts_with("//")
+            || line.starts_with("/*")
+            || line.starts_with('*')
+        {
+            continue;
+        }
+        if line.starts_with("import ")
+            || line.starts_with("import\"")
+            || line.starts_with("import'")
+        {
+            if saw_executable {
+                return true;
+            }
+            continue;
+        }
+        if line.starts_with("export type ") || line.starts_with("export interface ") {
+            continue;
+        }
+        saw_executable = true;
+    }
+    false
+}
+
+fn module_symbol_has_title(body: &str, symbol: &str) -> bool {
+    body.contains(&format!("{symbol}.title"))
+}
+
+fn insert_module_title_assignment(body: &str, symbol: &str, title: &str) -> String {
+    let assignment = format!("{symbol}.title = \"{}\";", title.replace('"', "\\\""));
+    let export = format!("export default {symbol};");
+    if body.contains(&export) {
+        return body.replace(&export, &format!("{assignment}\n\n{export}"));
+    }
+    format!("{}\n{assignment}\n", body.trim_end())
+}
+
+fn title_for_created_module(prompt: &str, symbol: &str) -> String {
+    let called = Regex::new(r#"(?i)\bcalled\s+["']?([A-Za-z0-9][A-Za-z0-9 _-]{1,80})["']?"#)
+        .ok()
+        .and_then(|re| re.captures(prompt))
+        .and_then(|captures| captures.get(1).map(|m| m.as_str().to_string()));
+    if let Some(value) = called {
+        let cleaned = Regex::new("(?i)\\bslide\\b|\\bcomponent\\b|\\bview\\b|\\bpage\\b")
+            .map(|re| re.replace_all(&value, "").to_string())
+            .unwrap_or(value);
+        let title = title_case_words(&cleaned);
+        if !title.is_empty() {
+            return title;
+        }
+    }
+    title_case_words(
+        &Regex::new("(?i)(Slide|Component|View|Page)$")
+            .map(|re| re.replace(symbol, "").to_string())
+            .unwrap_or_else(|_| symbol.to_string()),
+    )
+}
+
+fn title_case_words(value: &str) -> String {
+    split_identifier_words(value)
+        .split_whitespace()
+        .map(|word| {
+            let mut chars = word.chars();
+            match chars.next() {
+                Some(first) => format!("{}{}", first.to_uppercase(), chars.as_str()),
+                None => String::new(),
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn split_identifier_words(value: &str) -> String {
+    let mut out = String::new();
+    let mut prev_lower_or_digit = false;
+    for ch in value.replace(['_', '-'], " ").chars() {
+        if ch.is_ascii_uppercase() && prev_lower_or_digit {
+            out.push(' ');
+        }
+        prev_lower_or_digit = ch.is_ascii_lowercase() || ch.is_ascii_digit();
+        out.push(ch);
+    }
+    out.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+fn extract_relative_imports(body: &str) -> Vec<String> {
+    let Ok(re) = Regex::new(
+        r#"(?:import\s+(?:[^'"]+?\s+from\s+)?|export\s+[^'"]+?\s+from\s+|import\s*\(\s*|require\s*\(\s*)['"](\.{1,2}/[^'"]+)['"]"#,
+    ) else {
+        return Vec::new();
+    };
+    re.captures_iter(body)
+        .filter_map(|captures| {
+            captures.get(1).map(|m| {
+                m.as_str()
+                    .split(['?', '#'])
+                    .next()
+                    .unwrap_or("")
+                    .to_string()
+            })
+        })
+        .filter(|spec| !spec.is_empty())
+        .collect()
+}
+
+fn resolve_relative_import(
+    from_file: &str,
+    spec: &str,
+    snapshot: &WorkspaceSnapshot,
+) -> Option<String> {
+    let base = Path::new(from_file)
+        .parent()
+        .unwrap_or_else(|| Path::new(""))
+        .join(spec);
+    let base = normalize_rel_path(&base);
+    [
+        base.clone(),
+        format!("{base}.js"),
+        format!("{base}.jsx"),
+        format!("{base}.ts"),
+        format!("{base}.tsx"),
+        format!("{base}.vue"),
+        format!("{base}/index.js"),
+        format!("{base}/index.jsx"),
+        format!("{base}/index.ts"),
+        format!("{base}/index.tsx"),
+        format!("{base}/index.vue"),
+    ]
+    .into_iter()
+    .find(|candidate| snapshot.files.contains_key(candidate))
+}
+
+fn relative_module_spec(from_file: &str, target_file: &str) -> String {
+    let from_dir = parent_dir(from_file);
+    let from_parts = from_dir
+        .split('/')
+        .filter(|part| !part.is_empty() && *part != ".")
+        .collect::<Vec<_>>();
+    let target_parts = target_file
+        .split('/')
+        .filter(|part| !part.is_empty() && *part != ".")
+        .collect::<Vec<_>>();
+    let mut common = 0usize;
+    while common < from_parts.len()
+        && common < target_parts.len()
+        && from_parts[common] == target_parts[common]
+    {
+        common += 1;
+    }
+    let mut rel_parts = Vec::new();
+    for _ in common..from_parts.len() {
+        rel_parts.push("..");
+    }
+    rel_parts.extend(target_parts.iter().skip(common).copied());
+    let mut spec = rel_parts.join("/");
+    if !spec.starts_with('.') {
+        spec = format!("./{spec}");
+    }
+    if let Some(stripped) = spec.rsplit_once('.') {
+        if !stripped.0.ends_with('/') {
+            spec = stripped.0.to_string();
+        }
+    }
+    spec
+}
+
+fn mentions_module_spec(body: &str, spec: &str) -> bool {
+    body.contains(&format!("'{spec}'")) || body.contains(&format!("\"{spec}\""))
+}
+
+fn is_aggregator_like_file(path: &str, body: &str) -> bool {
+    let imports = extract_relative_imports(body);
+    if imports.len() < 3 {
+        return false;
+    }
+    let lower = path.to_ascii_lowercase();
+    lower.ends_with("/index.js")
+        || lower.ends_with("/index.jsx")
+        || lower.ends_with("/index.ts")
+        || lower.ends_with("/index.tsx")
+        || lower.contains("registry")
+        || lower.contains("routes")
+        || lower.contains("manifest")
+        || (body.contains("export default") && (body.contains('[') || body.contains('{')))
+}
+
+fn is_entry_like_file(path: &str, body: &str) -> bool {
+    let lower = path.to_ascii_lowercase();
+    (lower.ends_with("/main.js")
+        || lower.ends_with("/main.ts")
+        || lower.ends_with("/app.jsx")
+        || lower.ends_with("/app.tsx")
+        || lower.ends_with("/index.js")
+        || lower.ends_with("/index.ts"))
+        && !extract_relative_imports(body).is_empty()
+}
+
+fn path_stem(path: &str) -> String {
+    Path::new(path)
+        .file_stem()
+        .and_then(|name| name.to_str())
+        .unwrap_or_default()
+        .to_string()
+}
+
+fn parent_dir(path: &str) -> String {
+    Path::new(path)
+        .parent()
+        .map(normalize_rel_path)
+        .unwrap_or_default()
+}
+
 fn emit_change_records(
     app: &AppHandle,
     evt: &str,
@@ -895,7 +2054,7 @@ fn prepare_runtime_dir(app: &AppHandle, model: &str) -> AppResult<RuntimeDir> {
                 "models": {
                     model_id.clone(): {
                         "name": model_id.clone(),
-                        "limit": { "context": 32768, "output": 4096 }
+                        "limit": { "context": 32768, "output": 1536 }
                     }
                 }
             }
@@ -904,7 +2063,7 @@ fn prepare_runtime_dir(app: &AppHandle, model: &str) -> AppResult<RuntimeDir> {
             "pointer-ask": {
                 "model": model_arg,
                 "description": "Pointer Ask mode",
-                "prompt": "Answer questions about the current codebase using read-only repository context. If the user asks about a named or attached file, read that file first and center the answer on that file rather than giving a broad repository overview. If attached context contains relevant file blocks or literal evidence lines that answer the question, answer directly from that context without using additional tools. If attached context contains <context-memory>, treat it as Pointer's deterministic retained source map: use its exact paths, symbols, imports, evidence lines, and reasons to ground the answer, but do not invent code that is not present in file blocks or repository reads. If the user asks how a behavior flows through the codebase, read the directly related definition and consumer files before answering. If a search finds the symbol or behavior, read the matching file before answering; do not answer from search snippets alone. For codebase research or source-path answers, name exact repository-relative file paths for each hop; do not stop at import specifiers such as ./utils. Unless the user explicitly asks for code samples, do not emit fenced code blocks in Ask mode; describe short code facts inline with backticks instead. For interface code, call out important state owners, event handlers, and conditional rendered UI when they are present. For routing questions, name the exact router components visible in the file, including Switch when it is present. For theme persistence questions, name the exact storage import/local variable and storage calls when they are visible, for example local-storage-fallback, storage.getItem, or storage.setItem only if those names appear in repository context. For editor or media-heavy components, mention file operations, upload/image handling, export, and persistence flows when those symbols are visible. When a file defines default/configuration methods, name the important literal setting keys and defaults visible in those methods. If attached context includes app.defaultConfiguration, app.set(...), or setting keys, name the important literal setting keys in the prose. Do not list bare prior-version method names such as mount or lazyrouter unless the file defines that exact method/export in the visible context. Include a compact Key identifiers sentence with 4-8 exact symbols, dotted assignments, method names, and configuration keys visible in the file; never list more than 8 identifiers and never repeat an identifier. If more than 8 identifiers are possible, choose the 8 most important. If a file defines dotted exported assignments such as object.method = function, name the dotted assignment exactly instead of only the bare method name. Key identifiers must be real identifiers or setting keys from the file, not synthesized property chains. Preserve literal identifiers exactly as they appear in files. Never copy identifier examples from instructions into the answer unless OpenCode actually saw them in repository content. Never output internal progress blocks or headings like ## Goal, ## Progress, Constraints, Next Steps, or Continue if you have next steps. Do not claim you lack access to a named, active, or attached file. Do not modify files.",
+                "prompt": "Ask mode: answer from attached context or repository files you read. For named-file questions, read/use that file first. For behavior-flow questions, trace definition-to-consumer hops with exact repository-relative paths and read matches before answering. Use <context-memory> as deterministic evidence/navigation memory, not as permission to invent unseen code. Mention exact visible symbols/settings only, preserve spelling, and include a compact Key identifiers sentence when useful. Avoid fenced code unless requested. Do not modify files.",
                 "permission": {
                     "edit": "deny",
                     "bash": "deny",
@@ -918,7 +2077,7 @@ fn prepare_runtime_dir(app: &AppHandle, model: &str) -> AppResult<RuntimeDir> {
             "pointer-plan": {
                 "model": model_arg,
                 "description": "Pointer Plan mode",
-                "prompt": "Create executable engineering plans for the current codebase. Read the relevant files yourself before finalizing, but keep context gathering bounded. If attached context contains <context-memory>, use it as Pointer's deterministic retained source map to choose the next file, preserve exact paths, and avoid re-discovering facts already supplied. Required reads before final: the active file when relevant; the directly related implementation file; directly related existing verification or specification context when it can be found; and project configuration needed to name the verification command. For interface work, include both the state/logic file and the file that renders the affected UI. Use the repository's own structure and naming conventions to discover tests, specs, examples, snapshots, fixtures, or validation commands; do not assume a language, framework, package manager, or test runner. Do not finalize until relevant verification context has been read or you explicitly state what you checked and that none exists. After reading the source, verification context, and project configuration, finalize instead of continuing to search. Do not propose framework or router API migrations unless package/config context proves the installed major version supports the target API; preserve current dependency major versions for behavior-preserving refactors. For theme/refactor plans, distinguish styled-components ThemeProvider from a custom React context. Do not claim components consume a custom context unless the code shows a hook/provider; if props are used, say props are used. Do not assume a reported bug exists: compare the proposed fix to the code you read. If the code already contains the proposed source change, do not claim it is missing; produce a no-source-change or regression-test-only plan and cite the exact existing behavior. If the user asks for a refactor, cleanup, feature, or creative change, do not no-op merely because the current behavior works; produce a behavior-preserving implementation plan. If the evidence disproves the suspected bug, do not restate that suspected bug as true anywhere in the final answer. If the final plan is no-source-change, the Assessment must not say the reported bug exists, remains visible, does not re-render, or still needs a source fix. Do not edit, write, delete, rename, run shell commands, create todos, use skills, or delegate to tasks. Final response format: Context read: exact paths; Assessment: what the code proves; Plan: exact changes or no-source-change rationale; Verification: exact narrow command. Final output must be under 180 words and contain no internal debate, self-correction, or discarded hypotheses. Verification must name an actual project command from repository configuration when available. Always include at least one exact narrow verification command the user can run; prefer the narrowest existing verification that covers the touched behavior. Plan verification commands must be executable by Agent mode without package executors: never use npx, npm exec, pnpm dlx, yarn dlx, or bunx in a plan. Prefer package scripts such as npm test, npm run test:run, npm run build, cargo test, go test, pytest, or the repository's configured equivalent. If the existing code is already correct, say that directly and cite the files and verification evidence that prove it, plus the exact command to rerun that verification.",
+                "prompt": "Plan mode: inspect bounded evidence, then produce an executable plan without editing or running shell commands. Read active/named files when relevant, directly related implementation files, analogous examples for additive work, likely tests/specs/fixtures, and project config for verification. Use only repository-relative paths returned by tools; if a read fails, list the parent and retry the exact relative path. Do not assume a language, framework, package manager, or bug. Final format under 180 words: Context read; Assessment; Plan; Verification with an exact configured command.",
                 "permission": {
                     "edit": "deny",
                     "bash": "deny",
@@ -932,9 +2091,11 @@ fn prepare_runtime_dir(app: &AppHandle, model: &str) -> AppResult<RuntimeDir> {
             "pointer-agent": {
                 "model": model_arg,
                 "description": "Pointer Agent mode",
-                "prompt": "Implement the user's requested code change in the current repository. Gather the minimum necessary context, edit only files required for the task, preserve unrelated structure and assets, and verify with the narrowest existing project command when available even if the user did not explicitly ask to run tests. If attached context contains <context-memory>, use it as Pointer's deterministic retained source map to choose the next file, preserve exact paths, and avoid re-discovering facts already supplied. If package scripts or equivalent project commands exist, attempt the narrowest relevant command after editing unless a command is explicitly forbidden. After any successful edit, a final answer with zero bash verification attempts is invalid; run a verification command or attempt one and report the real blocker before finalizing. If the user asks to add or update tests, you must edit or create the relevant test/spec file even when verification cannot run. Do not install, add, remove, or update dependencies unless the user explicitly asks; if verification is blocked by missing dependencies, report the blocked command instead of changing dependency state. Never run or even attempt package executors: npx, npm exec, pnpm dlx, yarn dlx, or bunx are forbidden even for eslint, vitest, mocha, or one-off probing. Use scripts already present in package.json such as npm test, npm run test:run, npm run build, npm run lint, or npm run typecheck. If no relevant script exists, use the closest existing script or report that verification is blocked; do not invent an npx command. If package.json, Cargo.toml, pyproject.toml, or similar config defines verification scripts, do not claim verification commands are unavailable; missing dependencies mean verification was blocked or failed, not absent. Do not run destructive git commands, pushes, resets, cleanups, or broad filesystem deletion. Final response must be concise, non-repetitive, and focused on changed files plus a Verification: sentence naming the exact command attempted or the exact blocked command. Never say verification was skipped because the user did not ask, because the change was minimal, or because of user constraints.",
+                "prompt": "Agent mode: gather minimal evidence, make the smallest relevant edit, preserve unrelated code/assets, and verify with the narrowest configured repository command when available. Use attached context and <context-memory> as deterministic evidence; if they are sufficient, proceed to edits and re-read only files you will modify or need in full. For additive/edit tasks with clear target files and one analogous example visible, perform at most two extra reads before the first edit. Do not keep reading examples once one useful local pattern is visible. Do not install/update dependencies or run destructive git/deploy/database commands unless explicitly requested. Do not use one-off package executors such as npx, npm exec, pnpm dlx, yarn dlx, or bunx. Final response must concisely list changed files and the real verification command/result.",
                 "permission": {
                     "edit": "allow",
+                    "write": "allow",
+                    "apply_patch": "allow",
                     "read": "allow",
                     "glob": "allow",
                     "grep": "allow",
@@ -1073,6 +2234,23 @@ fn opencode_model_arg(model: &str) -> String {
     } else {
         format!("ollama/{trimmed}")
     }
+}
+
+fn opencode_variant(mode: &OpenCodeMode) -> Option<String> {
+    let mode_key = match mode {
+        OpenCodeMode::Ask => "ASK",
+        OpenCodeMode::Plan => "PLAN",
+        OpenCodeMode::Agent => "AGENT",
+    };
+    std::env::var(format!("POINTER_OPENCODE_{mode_key}_VARIANT"))
+        .ok()
+        .or_else(|| std::env::var("POINTER_OPENCODE_VARIANT").ok())
+        .map(|value| value.trim().to_string())
+        .or_else(|| match mode {
+            OpenCodeMode::Agent => Some("default".to_string()),
+            OpenCodeMode::Ask | OpenCodeMode::Plan => Some("minimal".to_string()),
+        })
+        .filter(|value| !value.is_empty() && !value.eq_ignore_ascii_case("default"))
 }
 
 fn normalize_final_text(text: &str) -> String {
@@ -1229,6 +2407,18 @@ fn remove_repeated_boundary_sentence(text: &str) -> String {
         return rest.trim().to_string();
     }
     trimmed.to_string()
+}
+
+fn sanitize_workspace_paths(text: &str, workspace: &Path) -> String {
+    let root = normalize_path_string(workspace);
+    if root.is_empty() {
+        return text.to_string();
+    }
+    text.replace(&format!("{root}/"), "").replace(&root, ".")
+}
+
+fn normalize_path_string(path: &Path) -> String {
+    path.to_string_lossy().replace('\\', "/")
 }
 
 fn sanitize_verification_claims(text: &str, records: &[BashRecord]) -> String {
@@ -1565,5 +2755,124 @@ mod tests {
         );
         assert!(text.contains("Verification: `npm test -- --watchAll=false` failed or was blocked"));
         assert!(text.contains("react-scripts: command not found"));
+    }
+
+    #[test]
+    fn structural_integration_wires_created_module_registry() {
+        let dir = tempfile::tempdir().unwrap();
+        let project = dir.path();
+        std::fs::create_dir_all(project.join("src")).unwrap();
+        std::fs::write(
+            project.join("src/index.js"),
+            [
+                "import OldWidget from './OldWidget';",
+                "",
+                "const widgets = [",
+                "  { Component: OldWidget, title: OldWidget.title },",
+                "].map((item) => item);",
+                "",
+                "export default widgets;",
+                "",
+            ]
+            .join("\n"),
+        )
+        .unwrap();
+        std::fs::write(
+            project.join("src/OldWidget.jsx"),
+            "const OldWidget = () => null;\nOldWidget.title = 'Old';\nexport default OldWidget;\n",
+        )
+        .unwrap();
+        let before = snapshot_workspace(project);
+        std::fs::write(
+            project.join("src/CreditsWidget.jsx"),
+            "const CreditsWidget = () => null;\nexport default CreditsWidget;\n",
+        )
+        .unwrap();
+        let after = snapshot_workspace(project);
+        let applied = run_structural_integration_fallback(
+            project,
+            &before,
+            &after,
+            "Add a new widget called Credits",
+            &["src/index.js".into()],
+        )
+        .unwrap();
+        let index = std::fs::read_to_string(project.join("src/index.js")).unwrap();
+        let created = std::fs::read_to_string(project.join("src/CreditsWidget.jsx")).unwrap();
+        assert!(applied.contains(&"src/index.js".to_string()));
+        assert!(index.contains("import CreditsWidget from './CreditsWidget';"));
+        assert!(index.contains("{ Component: CreditsWidget, title: CreditsWidget.title },"));
+        assert!(created.contains("CreditsWidget.title = \"Credits\";"));
+    }
+
+    #[test]
+    fn direct_patch_plan_applies_exact_search_replace_and_create() {
+        let dir = tempfile::tempdir().unwrap();
+        let project = dir.path();
+        std::fs::create_dir_all(project.join("src")).unwrap();
+        std::fs::write(project.join("src/main.txt"), "alpha\nbeta\n").unwrap();
+        let before = snapshot_workspace(project);
+        let edits = vec![
+            DirectPatchEdit {
+                path: "src/main.txt".into(),
+                search: Some("beta\n".into()),
+                replace: "gamma\n".into(),
+                create: false,
+            },
+            DirectPatchEdit {
+                path: "src/new.txt".into(),
+                search: None,
+                replace: "created\n".into(),
+                create: true,
+            },
+        ];
+
+        let changed = apply_direct_patch_plan(project, &before, &edits).unwrap();
+
+        assert_eq!(changed, vec!["src/main.txt", "src/new.txt"]);
+        assert_eq!(
+            std::fs::read_to_string(project.join("src/main.txt")).unwrap(),
+            "alpha\ngamma\n",
+        );
+        assert_eq!(
+            std::fs::read_to_string(project.join("src/new.txt")).unwrap(),
+            "created\n",
+        );
+    }
+
+    #[test]
+    fn direct_patch_rejects_traversal_and_non_matching_search() {
+        let dir = tempfile::tempdir().unwrap();
+        let project = dir.path();
+        std::fs::write(project.join("main.txt"), "alpha\n").unwrap();
+        let before = snapshot_workspace(project);
+        let traversal = vec![DirectPatchEdit {
+            path: "../outside.txt".into(),
+            search: None,
+            replace: "bad".into(),
+            create: true,
+        }];
+        assert!(apply_direct_patch_plan(project, &before, &traversal)
+            .unwrap_err()
+            .contains("parent traversal"));
+
+        let missing = vec![DirectPatchEdit {
+            path: "main.txt".into(),
+            search: Some("missing".into()),
+            replace: "gamma".into(),
+            create: false,
+        }];
+        assert!(apply_direct_patch_plan(project, &before, &missing)
+            .unwrap_err()
+            .contains("did not match"));
+    }
+
+    #[test]
+    fn extracts_json_object_from_model_envelope() {
+        let text = "Sure:\n```json\n{\"summary\":\"ok\",\"edits\":[]}\n```";
+        assert_eq!(
+            extract_first_json_object(text).as_deref(),
+            Some("{\"summary\":\"ok\",\"edits\":[]}")
+        );
     }
 }

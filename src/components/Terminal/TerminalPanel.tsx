@@ -21,19 +21,167 @@
  *    might want to read the final output) but the input is locked.
  */
 
-import { useEffect, useLayoutEffect, useRef, useState } from "react";
+import { useEffect, useLayoutEffect, useRef, useState } from "@/lib/preactSignalCompat";
 import { Terminal } from "@xterm/xterm";
 import { FitAddon } from "@xterm/addon-fit";
 import { WebLinksAddon } from "@xterm/addon-web-links";
 import { SearchAddon } from "@xterm/addon-search";
 import "@xterm/xterm/css/xterm.css";
-import { ArrowDown, ArrowUp, Plus, Search, X, ChevronDown } from "lucide-react";
+import { ArrowDown, ArrowUp, Plus, Search, X, ChevronDown } from "@/lib/lucide";
 
 import { ipc, listenEvent, type TerminalExitPayload } from "@/lib/ipc";
+import {
+  hydrateTerminalHistory,
+  recordTerminalCommand,
+  suggestTerminalCommand,
+  type TerminalSuggestion,
+} from "@/lib/terminalHistory";
 import { useWorkspace } from "@/store/workspace";
 import { useTerminals, nextTerminalTitle } from "@/store/terminal";
 import { useSession } from "@/store/session";
+import { useSettings } from "@/store/settings";
+import { pointerThemeFor, type PointerTheme } from "@/theme/themes";
 import { toast } from "@/components/Toast";
+
+type XtermTheme = NonNullable<ConstructorParameters<typeof Terminal>[0]>["theme"];
+
+type TerminalInputState = {
+  text: string;
+  cursor: number;
+};
+
+function themeVar(theme: PointerTheme, name: string, fallback: string): string {
+  return theme.css[name as keyof typeof theme.css] ?? fallback;
+}
+
+function hexWithAlpha(color: string, alpha: string): string {
+  return color.startsWith("#") && color.length === 7 ? `${color}${alpha}` : color;
+}
+
+function terminalThemeFromPointer(theme: PointerTheme): XtermTheme {
+  const bg = themeVar(theme, "--pn-code-bg", themeVar(theme, "--pn-canvas", "#0B0B0E"));
+  const fg = themeVar(theme, "--pn-code-fg", themeVar(theme, "--pn-text", "#E5E5EB"));
+  const accent = themeVar(theme, "--pn-accent", "#FF2D7E");
+  const panel = themeVar(theme, "--pn-panel", bg);
+  const mute = themeVar(theme, "--pn-mute", "#858585");
+  return {
+    background: bg,
+    foreground: fg,
+    cursor: accent,
+    cursorAccent: bg,
+    selectionBackground: themeVar(theme, "--pn-selection-bg", hexWithAlpha(accent, "55")),
+    black: themeVar(theme, "--pn-ridge", "#1B1B22"),
+    red: themeVar(theme, "--pn-code-invalid", themeVar(theme, "--pn-err", "#FF6B7A")),
+    green: themeVar(theme, "--pn-code-inserted", themeVar(theme, "--pn-ok", "#7CDB9C")),
+    yellow: themeVar(theme, "--pn-code-string", themeVar(theme, "--pn-warn", "#F0C674")),
+    blue: themeVar(theme, "--pn-code-function", themeVar(theme, "--pn-cyan", "#5FB3F9")),
+    magenta: themeVar(theme, "--pn-code-keyword", accent),
+    cyan: themeVar(theme, "--pn-code-type", themeVar(theme, "--pn-cyan", "#79DBE3")),
+    white: fg,
+    brightBlack: mute,
+    brightRed: themeVar(theme, "--pn-err", "#FF8A95"),
+    brightGreen: themeVar(theme, "--pn-ok", "#A2E6B5"),
+    brightYellow: themeVar(theme, "--pn-warn", "#F5D89C"),
+    brightBlue: themeVar(theme, "--pn-accent-hot", "#85C9FF"),
+    brightMagenta: themeVar(theme, "--pn-accent-soft", "#E2A8FF"),
+    brightCyan: themeVar(theme, "--pn-cyan", "#A6E8ED"),
+    brightWhite: themeVar(theme, "--pn-text", fg),
+    overviewRulerBorder: panel,
+  };
+}
+
+function terminalSearchDecorations(theme: PointerTheme) {
+  const accent = themeVar(theme, "--pn-accent", "#FF2D7E");
+  return {
+    matchBackground: hexWithAlpha(accent, "33"),
+    matchBorder: accent,
+    matchOverviewRuler: accent,
+    activeMatchBackground: hexWithAlpha(accent, "AA"),
+    activeMatchBorder: accent,
+    activeMatchColorOverviewRuler: accent,
+  };
+}
+
+function resetTrackedInput(state: TerminalInputState): void {
+  state.text = "";
+  state.cursor = 0;
+}
+
+function observeTerminalInput(data: string, state: TerminalInputState, cwd: string): void {
+  for (let i = 0; i < data.length; ) {
+    if (data.startsWith("\x1b[D", i) || data.startsWith("\x1bOD", i)) {
+      state.cursor = Math.max(0, state.cursor - 1);
+      i += 3;
+      continue;
+    }
+    if (data.startsWith("\x1b[C", i) || data.startsWith("\x1bOC", i)) {
+      state.cursor = Math.min(state.text.length, state.cursor + 1);
+      i += 3;
+      continue;
+    }
+    if (data.startsWith("\x1b[H", i) || data.startsWith("\x1bOH", i)) {
+      state.cursor = 0;
+      i += 3;
+      continue;
+    }
+    if (data.startsWith("\x1b[F", i) || data.startsWith("\x1bOF", i)) {
+      state.cursor = state.text.length;
+      i += 3;
+      continue;
+    }
+    if (data.startsWith("\x1b[3~", i)) {
+      if (state.cursor < state.text.length) {
+        state.text = state.text.slice(0, state.cursor) + state.text.slice(state.cursor + 1);
+      }
+      i += 4;
+      continue;
+    }
+    if (data.startsWith("\x1b[A", i) || data.startsWith("\x1b[B", i)) {
+      resetTrackedInput(state);
+      i += 3;
+      continue;
+    }
+    if (data[i] === "\x1b") {
+      resetTrackedInput(state);
+      i = skipEscape(data, i);
+      continue;
+    }
+
+    const ch = data[i];
+    if (ch === "\r" || ch === "\n") {
+      recordTerminalCommand(state.text, cwd);
+      resetTrackedInput(state);
+    } else if (ch === "\x7f" || ch === "\b") {
+      if (state.cursor > 0) {
+        state.text = state.text.slice(0, state.cursor - 1) + state.text.slice(state.cursor);
+        state.cursor -= 1;
+      }
+    } else if (ch === "\x01") {
+      state.cursor = 0;
+    } else if (ch === "\x05") {
+      state.cursor = state.text.length;
+    } else if (ch === "\x15") {
+      state.text = state.text.slice(state.cursor);
+      state.cursor = 0;
+    } else if (ch === "\x0b") {
+      state.text = state.text.slice(0, state.cursor);
+    } else if (ch === "\x03" || ch === "\x04" || ch === "\t") {
+      resetTrackedInput(state);
+    } else if (ch >= " ") {
+      state.text = state.text.slice(0, state.cursor) + ch + state.text.slice(state.cursor);
+      state.cursor += ch.length;
+    }
+    i += 1;
+  }
+}
+
+function skipEscape(data: string, index: number): number {
+  for (let i = index + 1; i < data.length; i += 1) {
+    const code = data.charCodeAt(i);
+    if (code >= 0x40 && code <= 0x7e) return i + 1;
+  }
+  return data.length;
+}
 
 export function TerminalPanel() {
   const tabs = useTerminals((s) => s.tabs);
@@ -203,11 +351,57 @@ function TerminalView({ id, active }: { id: string; active: boolean }) {
   const termRef = useRef<Terminal | null>(null);
   const fitRef = useRef<FitAddon | null>(null);
   const searchRef = useRef<SearchAddon | null>(null);
+  const inputRef = useRef<TerminalInputState>({ text: "", cursor: 0 });
+  const suggestionRef = useRef<TerminalSuggestion | null>(null);
+  const acceptSuggestionRef = useRef<(() => boolean) | null>(null);
+  const cwd = useTerminals((s) => s.tabs.find((t) => t.id === id)?.cwd ?? "");
+  const cwdRef = useRef(cwd);
+  cwdRef.current = cwd;
+  const appTheme = useSettings((s) => s.appTheme);
+  const pointerTheme = pointerThemeFor(appTheme);
   // We keep a stable copy of the latest cell-size so resize callbacks
   // don't need to re-measure inside an animation frame.
   const [ready, setReady] = useState(false);
   const [showSearch, setShowSearch] = useState(false);
   const [searchQuery, setSearchQuery] = useState("");
+  const [suggestion, setSuggestion] = useState<TerminalSuggestion | null>(null);
+
+  const publishSuggestion = (next: TerminalSuggestion | null) => {
+    const previous = suggestionRef.current;
+    suggestionRef.current = next;
+    if (
+      previous?.command === next?.command &&
+      previous?.suffix === next?.suffix &&
+      previous?.score === next?.score
+    ) {
+      return;
+    }
+    setSuggestion(next);
+  };
+
+  const refreshSuggestion = () => {
+    const input = inputRef.current;
+    if (input.cursor !== input.text.length) {
+      publishSuggestion(null);
+      return;
+    }
+    publishSuggestion(suggestTerminalCommand(input.text, cwdRef.current));
+  };
+
+  acceptSuggestionRef.current = () => {
+    const next = suggestionRef.current;
+    const input = inputRef.current;
+    if (!next || input.cursor !== input.text.length || !next.suffix) return false;
+    input.text = next.command;
+    input.cursor = next.command.length;
+    publishSuggestion(null);
+    ipc.terminalWrite(id, next.suffix).catch(() => {});
+    return true;
+  };
+
+  useEffect(() => {
+    void hydrateTerminalHistory();
+  }, []);
 
   // Construct the xterm instance exactly once when the host div mounts.
   // We deliberately keep the construction in `useLayoutEffect` so the DOM
@@ -217,30 +411,7 @@ function TerminalView({ id, active }: { id: string; active: boolean }) {
     const term = new Terminal({
       cursorBlink: true,
       cursorStyle: "bar",
-      // Match the noir palette so the panel feels native.
-      theme: {
-        background: "#0B0B0E",
-        foreground: "#E5E5EB",
-        cursor: "#FF2D7E",
-        cursorAccent: "#0B0B0E",
-        selectionBackground: "#FF2D7E55",
-        black: "#1B1B22",
-        red: "#FF6B7A",
-        green: "#7CDB9C",
-        yellow: "#F0C674",
-        blue: "#5FB3F9",
-        magenta: "#D38BFF",
-        cyan: "#79DBE3",
-        white: "#E5E5EB",
-        brightBlack: "#3A3A45",
-        brightRed: "#FF8A95",
-        brightGreen: "#A2E6B5",
-        brightYellow: "#F5D89C",
-        brightBlue: "#85C9FF",
-        brightMagenta: "#E2A8FF",
-        brightCyan: "#A6E8ED",
-        brightWhite: "#FFFFFF",
-      },
+      theme: terminalThemeFromPointer(pointerThemeFor(useSettings.getState().appTheme)),
       fontFamily:
         '"JetBrains Mono", "Fira Code", ui-monospace, SFMono-Regular, Menlo, Consolas, monospace',
       fontSize: 12.5,
@@ -268,6 +439,17 @@ function TerminalView({ id, active }: { id: string; active: boolean }) {
         setShowSearch(true);
         return false;
       }
+      if (
+        ev.type === "keydown" &&
+        ev.key === "ArrowRight" &&
+        !ev.altKey &&
+        !ev.metaKey &&
+        !ev.ctrlKey &&
+        acceptSuggestionRef.current?.()
+      ) {
+        ev.preventDefault();
+        return false;
+      }
       return true;
     });
 
@@ -291,6 +473,8 @@ function TerminalView({ id, active }: { id: string; active: boolean }) {
 
     // Pipe local keystrokes back to the PTY.
     const dataDisposable = term.onData((data) => {
+      observeTerminalInput(data, inputRef.current, cwdRef.current);
+      refreshSuggestion();
       ipc.terminalWrite(id, data).catch(() => {
         /* shell is gone; the exit listener below will mark it */
       });
@@ -351,6 +535,12 @@ function TerminalView({ id, active }: { id: string; active: boolean }) {
     };
   }, [id]);
 
+  useEffect(() => {
+    if (termRef.current) {
+      termRef.current.options.theme = terminalThemeFromPointer(pointerTheme);
+    }
+  }, [appTheme, pointerTheme]);
+
   // Whenever the tab becomes active, refit + refocus so the cursor is
   // ready for typing without an extra click.
   useEffect(() => {
@@ -376,14 +566,7 @@ function TerminalView({ id, active }: { id: string; active: boolean }) {
       regex: false,
       // Highlight every other match in the scrollback so the user
       // can see context — purely visual, doesn't move the viewport.
-      decorations: {
-        matchBackground: "#FF2D7E33",
-        matchBorder: "#FF2D7E",
-        matchOverviewRuler: "#FF2D7E",
-        activeMatchBackground: "#FF2D7EAA",
-        activeMatchBorder: "#FF2D7E",
-        activeMatchColorOverviewRuler: "#FF2D7E",
-      },
+      decorations: terminalSearchDecorations(pointerTheme),
     };
     if (direction === "next") s.findNext(searchQuery, opts);
     else s.findPrevious(searchQuery, opts);
@@ -449,6 +632,20 @@ function TerminalView({ id, active }: { id: string; active: boolean }) {
           >
             <X size={11} aria-hidden="true" />
           </button>
+        </div>
+      )}
+      {suggestion && active && (
+        <div
+          className="pointer-events-none absolute left-3 bottom-2 z-10 max-w-[calc(100%-1.5rem)] rounded border border-noir-line bg-noir-panel/95 px-2 py-1 font-mono text-[11px] shadow-lg backdrop-blur-sm"
+          aria-live="polite"
+          data-testid="terminal-history-suggestion"
+        >
+          <span className="mr-2 font-sans text-[10px] uppercase tracking-[0.16em] text-noir-accent">
+            history
+          </span>
+          <span className="text-noir-subtext">→</span>{" "}
+          <span className="text-noir-text">{suggestion.suffix}</span>
+          <span className="ml-2 font-sans text-[10px] text-noir-mute">accept with →</span>
         </div>
       )}
       <div

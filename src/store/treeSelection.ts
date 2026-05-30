@@ -1,4 +1,4 @@
-import { create } from "zustand";
+import { create } from "@/lib/signalStore";
 
 /**
  * Multi-selection state for the file tree. Stores the set of

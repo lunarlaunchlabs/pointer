@@ -5,46 +5,62 @@
 @layer base {
   :root {
     color-scheme: dark;
-    --pn-canvas: #0a0a0c;
-    --pn-panel: #0f0f13;
-    --pn-chrome: #121218;
-    --pn-ridge: #191920;
-    --pn-line: #22222b;
-    --pn-text: #e8e8f2;
-    --pn-subtext: #b6b6c7;
-    --pn-mute: #7a7a8b;
+    --pn-canvas: #08070b;
+    --pn-panel: #0e0c10;
+    --pn-chrome: #15121a;
+    --pn-ridge: #211722;
+    --pn-line: #432238;
+    --pn-text: #f2edf5;
+    --pn-subtext: #c7bbcb;
+    --pn-mute: #8d7f8b;
     --pn-accent: #ff2d7e;
     --pn-accent-hot: #ff4f9a;
     --pn-accent-soft: #ff9ac3;
-    --pn-accent-deep: #7b123f;
-    --pn-cyan: #77d8ff;
-    --pn-ok: #7cf0bd;
-    --pn-warn: #ffd480;
-    --pn-err: #ff6f91;
+    --pn-accent-deep: #8b164a;
+    --pn-cyan: #78d8ff;
+    --pn-ok: #7ce8b7;
+    --pn-ok-rgb: 124 232 183;
+    --pn-warn: #ffd37a;
+    --pn-warn-rgb: 255 211 122;
+    --pn-err: #ff5c86;
+    --pn-err-rgb: 255 92 134;
+    --pn-body-bg: #050407;
+    --pn-titlebar-bg: rgba(12, 9, 13, 0.97);
+    --pn-app-shell-bg: #070509;
+    --pn-app-shell-highlight: rgba(255, 45, 126, 0.055);
+    --pn-glass-bg: rgba(14, 12, 16, 0.96);
+    --pn-panel-top: rgba(18, 14, 20, 0.96);
+    --pn-panel-bottom: rgba(10, 8, 13, 0.98);
+    --pn-soft-top: rgba(23, 18, 25, 0.93);
+    --pn-soft-bottom: rgba(12, 9, 14, 0.96);
+    --pn-scrollbar-thumb: #372031;
+    --pn-scrollbar-thumb-hover: #52304a;
+    --pn-inset-highlight: rgba(255, 45, 126, 0.09);
+    --pn-hairline: color-mix(in srgb, var(--pn-line) 34%, transparent);
+    --pn-divider: color-mix(in srgb, var(--pn-line) 48%, transparent);
+    --pn-divider-strong: color-mix(in srgb, var(--pn-line) 62%, transparent);
   }
 
-  /* Pointer Light — same vibe, inverted brightness. Designed so
-     the accent (pink) reads on white *and* black; lighter chrome
-     comes from very low-saturation grays so highlights still pop.
-     Toggle via Settings → appTheme. */
+  /* Legacy class kept for old persisted sessions before the registry
+     shipped. Runtime themes now publish variables from src/theme/themes.ts. */
   body.pn-theme-light {
     color-scheme: light;
-    --pn-canvas: #fbfbfd;
-    --pn-panel: #ffffff;
-    --pn-chrome: #f1f1f6;
-    --pn-ridge: #e7e7ee;
-    --pn-line: #d6d6df;
-    --pn-text: #18181f;
-    --pn-subtext: #4d4d5b;
-    --pn-mute: #7f7f8d;
+    --pn-canvas: #faf7fa;
+    --pn-panel: #fffcfe;
+    --pn-chrome: #f0eaf0;
+    --pn-ridge: #e8dfe7;
+    --pn-line: #dac8d4;
+    --pn-text: #211a20;
+    --pn-subtext: #5e4f5b;
+    --pn-mute: #897986;
     --pn-accent: #d92a6e;
     --pn-accent-hot: #f0448b;
     --pn-accent-soft: #ff9ec7;
     --pn-accent-deep: #8f164a;
-    --pn-cyan: #0977a5;
-    --pn-ok: #1d9d5f;
-    --pn-warn: #ad7900;
-    --pn-err: #c8233b;
+    --pn-cyan: #0b6f8f;
+    --pn-ok: #19714a;
+    --pn-warn: #a06a00;
+    --pn-err: #c52845;
   }
 
   html,
@@ -58,13 +74,19 @@
   }
 
   body {
-    background: #070708;
+    background: var(--pn-body-bg);
     font-family: "Inter", ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont,
       "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
     font-feature-settings: "ss01", "ss02", "calt", "liga";
     text-rendering: optimizeLegibility;
     -webkit-font-smoothing: antialiased;
     -moz-osx-font-smoothing: grayscale;
+  }
+
+  *,
+  *::before,
+  *::after {
+    border-color: var(--pn-divider);
   }
 
   /* Respect the platform "Reduce Motion" preference. Tauri windows
@@ -116,13 +138,13 @@
     height: 10px;
   }
   ::-webkit-scrollbar-thumb {
-    background: #2a2a36;
+    background: var(--pn-scrollbar-thumb);
     border-radius: 6px;
     border: 2px solid transparent;
     background-clip: padding-box;
   }
   ::-webkit-scrollbar-thumb:hover {
-    background: #3a3a4a;
+    background: var(--pn-scrollbar-thumb-hover);
     background-clip: padding-box;
     border: 2px solid transparent;
   }
@@ -130,11 +152,10 @@
     background: transparent;
   }
 
-  /* Vibrancy/transparency on macOS — body keeps a subtle base. */
+  /* Solid glass-like surface. Real backdrop filters are reserved for tiny
+     transient overlays because persistent WebKit blur layers are expensive. */
   .pn-glass {
-    background: rgba(13, 13, 17, 0.92);
-    backdrop-filter: blur(16px) saturate(125%);
-    -webkit-backdrop-filter: blur(16px) saturate(125%);
+    background: var(--pn-glass-bg);
   }
 
   .pn-noise::before {
@@ -149,32 +170,34 @@
 
   .pn-app-shell {
     background:
-      linear-gradient(180deg, rgba(255, 255, 255, 0.018), transparent 28px),
-      #08080b;
-    box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.04);
+      linear-gradient(180deg, var(--pn-app-shell-highlight), transparent 28px),
+      var(--pn-app-shell-bg);
+    box-shadow: none;
   }
 
   .pn-titlebar {
     position: relative;
-    background: rgba(13, 13, 17, 0.94);
-    border-bottom: 1px solid color-mix(in srgb, var(--pn-line) 90%, var(--pn-accent) 10%);
-    box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.045);
+    box-sizing: border-box;
+    overflow: visible;
+    background: var(--pn-titlebar-bg);
+    border-bottom: 1px solid var(--pn-hairline);
+    box-shadow: none;
   }
 
   .pn-brand-mark {
-    background: #050507;
-    box-shadow:
-      0 0 0 1px rgba(255, 45, 126, 0.22),
-      0 1px 2px rgba(0, 0, 0, 0.45);
-    filter: saturate(1.08) contrast(1.03);
+    display: block;
+    overflow: visible;
+    background: transparent;
+    box-shadow: none;
+    filter: none;
+    shape-rendering: geometricPrecision;
   }
 
   .pn-brand-logo {
-    mix-blend-mode: screen;
-    filter:
-      contrast(1.08)
-      saturate(1.12)
-      drop-shadow(0 0 10px rgba(255, 45, 126, 0.28));
+    display: block;
+    overflow: visible;
+    color: var(--pn-accent);
+    filter: none;
   }
 
   .pn-welcome-surface {
@@ -190,20 +213,19 @@
 
   .pn-premium-panel {
     background:
-      linear-gradient(180deg, rgba(20, 20, 25, 0.9), rgba(13, 13, 17, 0.94)),
+      linear-gradient(180deg, var(--pn-panel-top), var(--pn-panel-bottom)),
       var(--pn-panel);
-    border: 1px solid color-mix(in srgb, var(--pn-line) 88%, var(--pn-accent) 12%);
+    border: 1px solid var(--pn-divider);
     box-shadow:
-      inset 0 1px 0 rgba(255, 255, 255, 0.04),
       0 18px 44px -36px rgba(0, 0, 0, 0.9);
   }
 
   .pn-soft-panel {
     background:
-      linear-gradient(180deg, rgba(19, 19, 24, 0.9), rgba(12, 12, 15, 0.94)),
-      rgba(16, 16, 20, 0.88);
-    border-color: color-mix(in srgb, var(--pn-line) 90%, var(--pn-accent) 10%);
-    box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.035);
+      linear-gradient(180deg, var(--pn-soft-top), var(--pn-soft-bottom)),
+      var(--pn-panel);
+    border-color: var(--pn-divider);
+    box-shadow: none;
   }
 
   .pn-welcome-grid {
@@ -234,11 +256,15 @@
   }
   .pn-button-accent {
     @apply px-3 py-1.5 rounded-md text-xs font-medium transition-all;
-    background: linear-gradient(180deg, #ff3d8b, #e71e70);
+    background: linear-gradient(
+      180deg,
+      var(--pn-accent-hot),
+      var(--pn-accent)
+    );
     color: white;
     box-shadow:
       inset 0 1px 0 rgba(255, 255, 255, 0.18),
-      0 6px 16px -12px rgba(255, 45, 126, 0.72);
+      0 6px 16px -12px var(--pn-accent);
   }
   .pn-button-accent:disabled {
     background: #2a2a36;
@@ -253,8 +279,61 @@
     @apply px-1.5 py-0.5 rounded text-[10px] bg-noir-ridge text-noir-subtext border border-noir-line;
   }
   .pn-divider {
-    @apply h-px w-full bg-noir-line;
+    height: 1px;
+    width: 100%;
+    background: var(--pn-hairline);
   }
+
+  .pn-statusbar {
+    isolation: isolate;
+    background: var(--pn-status-bg, var(--pn-chrome));
+    box-shadow: 0 -1px 0 var(--pn-hairline);
+  }
+}
+
+.pn-app-shell :is(
+  .border-noir-line\/30,
+  .border-noir-line\/35,
+  .border-noir-line\/40,
+  .border-noir-line\/45,
+  .border-noir-line\/50,
+  .border-noir-line\/60
+) {
+  border-color: var(--pn-hairline) !important;
+}
+
+.pn-app-shell :is(
+  .border-noir-line,
+  .border-noir-line\/70,
+  .border-noir-line\/80
+) {
+  border-color: var(--pn-divider) !important;
+}
+
+.pn-app-shell :is(
+  .divide-noir-line\/30,
+  .divide-noir-line\/35,
+  .divide-noir-line\/40,
+  .divide-noir-line\/45,
+  .divide-noir-line\/50,
+  .divide-noir-line\/60
+) > :not([hidden]) ~ :not([hidden]) {
+  border-color: var(--pn-hairline) !important;
+}
+
+.pn-app-shell :is(
+  .divide-noir-line,
+  .divide-noir-line\/70,
+  .divide-noir-line\/80
+) > :not([hidden]) ~ :not([hidden]) {
+  border-color: var(--pn-divider) !important;
+}
+
+.pn-app-shell .bg-noir-accent\/15 {
+  background-color: var(
+    --pn-selection-bg,
+    rgb(var(--pn-accent-rgb, 255 45 126) / 0.15)
+  ) !important;
 }
 
 /* Pulsing accent for AI affordances. */
@@ -311,6 +390,69 @@
 }
 
 .pn-reduce-motion .pn-commit-agent-orbit {
+  animation: none;
+}
+
+@keyframes pn-fim-loading-blink {
+  0%, 100% { opacity: 0.35; transform: scaleX(0.78); }
+  45% { opacity: 1; transform: scaleX(1); }
+}
+
+.pn-fim-loading-widget {
+  pointer-events: none;
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  height: 1.35em;
+  margin-left: 3px;
+  transform: translateY(-1px);
+  font-family: "JetBrains Mono", "SFMono-Regular", Menlo, Consolas, monospace;
+  line-height: 1;
+  white-space: nowrap;
+  z-index: 20;
+}
+
+.pn-fim-loading-bot {
+  display: inline-flex;
+  width: 1.25em;
+  height: 1.25em;
+  align-items: center;
+  justify-content: center;
+  border-radius: 0.38em;
+  color: var(--pn-accent-hot);
+  background:
+    radial-gradient(circle at 50% 45%, rgba(255, 45, 126, 0.2), transparent 62%),
+    rgba(10, 10, 12, 0.78);
+  box-shadow:
+    inset 0 0 0 1px rgba(255, 45, 126, 0.25),
+    0 0 18px -10px rgba(255, 45, 126, 0.95);
+  animation: pn-commit-agent-orbit 1.35s cubic-bezier(0.34, 0, 0.22, 1) infinite;
+}
+
+.pn-fim-loading-text {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  color: var(--pn-accent-hot);
+  font-size: 0.82em;
+  font-weight: 800;
+  letter-spacing: 0;
+  text-shadow: 0 0 8px rgba(255, 45, 126, 0.32);
+}
+
+.pn-fim-loading-text::after {
+  content: "";
+  display: inline-block;
+  width: 1.6em;
+  height: 0.18em;
+  border-radius: 999px;
+  background: currentColor;
+  transform-origin: left center;
+  animation: pn-fim-loading-blink 0.92s ease-in-out infinite;
+}
+
+.pn-reduce-motion .pn-fim-loading-bot,
+.pn-reduce-motion .pn-fim-loading-text::after {
   animation: none;
 }
 
@@ -448,6 +590,61 @@
   pointer-events: none;
 }
 
+/* VS Code-style Git change indicators. The thin bar is the primary signal;
+   the whole-line wash is intentionally quiet so syntax color remains king. */
+.pn-git-diff-line-added {
+  background: rgb(var(--pn-ok-rgb) / 0.055);
+}
+.pn-git-diff-line-modified {
+  background: rgb(var(--pn-warn-rgb) / 0.065);
+}
+.pn-git-diff-line-deleted {
+  background: rgb(var(--pn-err-rgb) / 0.05);
+}
+.pn-git-diff-bar {
+  width: 3px !important;
+  margin-left: 2px;
+  border-radius: 99px;
+}
+.pn-git-diff-bar-added {
+  background: var(--pn-ok);
+}
+.pn-git-diff-bar-modified {
+  background: var(--pn-warn);
+}
+.pn-git-diff-bar-deleted {
+  background: var(--pn-err);
+}
+.pn-git-diff-glyph {
+  position: relative;
+}
+.pn-git-diff-glyph::before {
+  content: "";
+  position: absolute;
+  left: 8px;
+  top: 50%;
+  width: 7px;
+  height: 7px;
+  border-radius: 999px;
+  transform: translateY(-50%);
+}
+.pn-git-diff-glyph-added::before {
+  background: var(--pn-ok);
+}
+.pn-git-diff-glyph-modified::before {
+  background: var(--pn-warn);
+}
+.pn-git-diff-glyph-deleted::before {
+  background: var(--pn-err);
+}
+.pn-git-diff-deleted-text {
+  color: var(--pn-err) !important;
+  font-size: 11px;
+  opacity: 0.82;
+  font-style: italic;
+  pointer-events: none;
+}
+
 /* Subtle checkerboard for image previews so users can tell which
    pixels are transparent without us painting a confusing dark
    background under them. Kept dim so it doesn't draw the eye. */
@@ -466,7 +663,7 @@
    Fades to background so the user's eye lands on the right spot
    without leaving a permanent visual artifact behind. */
 @keyframes pn-flash {
-  0%   { background-color: rgba(255, 45, 126, 0.18); }
+  0%   { background-color: color-mix(in srgb, var(--pn-accent) 20%, transparent); }
   100% { background-color: transparent; }
 }
 .pn-flash {
@@ -474,6 +671,28 @@
 }
 .pn-reduce-motion .pn-flash {
   animation: none;
+}
+
+.pn-tree-active-file {
+  color: var(--pn-text);
+  background:
+    linear-gradient(
+      90deg,
+      color-mix(in srgb, var(--pn-accent) 22%, transparent),
+      color-mix(in srgb, var(--pn-accent) 10%, transparent)
+    );
+  box-shadow:
+    inset 2px 0 0 var(--pn-accent),
+    inset 0 0 0 1px color-mix(in srgb, var(--pn-accent) 24%, transparent);
+}
+
+.pn-tree-active-file:hover {
+  background:
+    linear-gradient(
+      90deg,
+      color-mix(in srgb, var(--pn-accent) 27%, transparent),
+      color-mix(in srgb, var(--pn-accent) 14%, transparent)
+    );
 }
 
 /* Monaco overrides — keep ghost text in our accent. */
@@ -534,10 +753,10 @@
    colour. We share font / padding / wrap rules across both so the
    highlights track the textarea content character-for-character.
 
-   The textarea text is invisible (`color: transparent`) so we don't
-   double-paint over the mirror. The caret keeps its colour via
-   `caret-color`. Selection still works on the textarea — Webkit's
-   selection background shows through, which is what we want.
+   The textarea remains the visible text layer so the caret always
+   tracks the exact browser layout. The mirror sits behind it and paints
+   token backgrounds only; if the mirror ever wraps slightly differently,
+   it can no longer make typed text appear to jump.
    ────────────────────────────────────────────────────────────────────── */
 .pn-mention-input,
 .pn-mention-mirror,
@@ -553,31 +772,34 @@
      lines up across the mirror and the textarea. The composer wraps
      this in its own outer card so the padding here is just for the
      mirror/textarea pair. */
-  padding: 8px 48px 8px 10px;
+  padding: 8px var(--pn-mention-pad-right, 56px) 8px 10px;
   border: 1px solid transparent;
   border-radius: 8px;
   letter-spacing: 0;
   tab-size: 4;
 }
+.pn-chat-composer-input {
+  --pn-mention-pad-right: 112px;
+}
 .pn-mention-mirror {
-  color: var(--pn-mute);
-  /* The mirror takes its colour from the textarea but we keep an
-     explicit fallback so any unstyled segment is visible. */
+  color: transparent;
 }
 .pn-mention-textarea {
-  color: transparent;
+  color: var(--pn-text);
   width: 100%;
   /* Textarea-specific: we never want a forced minimum height beyond
      the natural single-line case; autosize in MentionInput handles
      growth up to maxHeightPx. */
   min-height: 36px;
+  overflow-y: hidden;
+  caret-color: var(--pn-text);
 }
 .pn-mention-textarea::selection {
   background: rgba(255, 45, 126, 0.25);
   color: var(--pn-text);
 }
 .pn-mention-token {
-  color: var(--pn-accent);
+  color: transparent;
   background: rgba(255, 45, 126, 0.08);
   border-radius: 3px;
   /* No padding — paddings would offset character positions vs the

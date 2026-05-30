@@ -1,7 +1,7 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useState } from "@/lib/preactSignalCompat";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
-import { Edit3, Split, Eye } from "lucide-react";
+import { Edit3, Split, Eye } from "@/lib/lucide";
 import { convertFileSrc } from "@tauri-apps/api/core";
 import { useEditorStore } from "@/store/editor";
 

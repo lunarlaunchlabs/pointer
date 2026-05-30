@@ -12,7 +12,7 @@
  */
 
 import { beforeEach, describe, expect, it } from "vitest";
-import { useGit } from "./git";
+import { aggregateFolderStatus, useGit } from "./git";
 
 function reset() {
   useGit.setState({
@@ -72,6 +72,58 @@ describe("useGit.statusFor", () => {
       status: { ...prev.status, is_repo: false },
     }));
     expect(useGit.getState().statusFor("/Users/test/proj/src/App.tsx")).toBeNull();
+  });
+
+  it("does not match sibling paths that only share a prefix", () => {
+    const s = useGit.getState().statusFor("/Users/test/proj-other/src/App.tsx");
+    expect(s).toBeNull();
+  });
+});
+
+describe("useGit.folderStatusFor", () => {
+  beforeEach(() => reset());
+
+  it("rolls up every descendant git status for folders", () => {
+    useGit.setState((prev) => ({
+      status: {
+        ...prev.status,
+        files: {
+          "src/App.tsx": "modified",
+          "src/components/Button.tsx": "deleted",
+          "src/components/NewButton.tsx": "untracked",
+          "src/lib/lang.ts": "added",
+          "docs/readme.md": "modified",
+        },
+      },
+    }));
+
+    const summary = useGit.getState().folderStatusFor("/Users/test/proj/src");
+    expect(summary?.total).toBe(4);
+    expect(summary?.counts.deleted).toBe(1);
+    expect(summary?.counts.modified).toBe(1);
+    expect(summary?.counts.added).toBe(1);
+    expect(summary?.counts.untracked).toBe(1);
+    expect(summary?.dominant).toBe("deleted");
+    expect(summary?.statuses).toEqual(["deleted", "added", "modified", "untracked"]);
+  });
+
+  it("returns null for clean folders and paths outside the workspace", () => {
+    expect(useGit.getState().folderStatusFor("/Users/test/proj/docs")).toBeNull();
+    expect(useGit.getState().folderStatusFor("/Users/test/other/src")).toBeNull();
+  });
+});
+
+describe("aggregateFolderStatus", () => {
+  it("can aggregate the repository root", () => {
+    const summary = aggregateFolderStatus(
+      {
+        "src/App.tsx": "modified",
+        "README.md": "deleted",
+      },
+      "",
+    );
+    expect(summary?.total).toBe(2);
+    expect(summary?.dominant).toBe("deleted");
   });
 });
 

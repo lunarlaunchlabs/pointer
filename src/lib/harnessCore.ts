@@ -536,6 +536,20 @@ export type AgentPromptFrame = {
   clearsContext?: boolean;
 };
 
+export type AgentThoughtEffort = "quick" | "deliberate";
+
+export type JudgedAgentAttemptFrame = {
+  prompt: string;
+  rawPrompt: string;
+  promptIndex: number;
+  attempt: number;
+  maxAttempts: number;
+  clearContext: boolean;
+  backtracked: boolean;
+  thoughtEffort: AgentThoughtEffort;
+  effortInstruction: string;
+};
+
 export type JudgedStageInput = JudgeInput & {
   stage: string;
   attempt?: number;
@@ -557,6 +571,8 @@ export type JudgedStageResult =
       retryPromptIndex: number;
       clearContext: boolean;
       backtracked: boolean;
+      thoughtEffort: AgentThoughtEffort;
+      effortInstruction: string;
     }
   | { status: "blocked"; stage: string; verdict: JudgeVerdict; reason: string };
 
@@ -681,7 +697,7 @@ export class StageJudge {
   constructor(private readonly judge = new Judge()) {}
 
   async evaluate(input: JudgedStageInput, call: JudgeCall): Promise<JudgedStageResult> {
-    const current = currentPromptFrame(input);
+    const current = currentJudgedAgentAttemptFrame(input);
     const attempt = input.promptAttempt ?? input.attempt ?? 1;
     const maxAttempts = input.maxAttemptsPerPrompt ?? input.maxAttempts ?? 3;
     const verdict = await this.judge.run(
@@ -690,9 +706,14 @@ export class StageJudge {
         initialPrompt: [
           `Scheduled stage: ${input.stage}`,
           `Attempt: ${attempt} of ${maxAttempts}`,
-          current.label ? `Agent prompt: ${current.label}` : "Agent prompt:",
+          `Agent effort: ${current.thoughtEffort}`,
+          current.effortInstruction,
           "",
-          current.prompt,
+          currentPromptFrame(input).label
+            ? `Agent prompt: ${currentPromptFrame(input).label}`
+            : "Agent prompt:",
+          "",
+          current.rawPrompt,
         ].join("\n"),
       },
       call,
@@ -706,11 +727,13 @@ export class StageJudge {
         status: "retry",
         stage: input.stage,
         verdict,
-        nextAttempt: replay.nextAttempt,
-        retryPrompt: replay.frame.prompt,
-        retryPromptIndex: replay.index,
-        clearContext: Boolean(replay.frame.clearsContext),
+        nextAttempt: replay.attempt,
+        retryPrompt: replay.prompt,
+        retryPromptIndex: replay.promptIndex,
+        clearContext: replay.clearContext,
         backtracked: replay.backtracked,
+        thoughtEffort: replay.thoughtEffort,
+        effortInstruction: replay.effortInstruction,
       };
     }
     return {
@@ -720,6 +743,69 @@ export class StageJudge {
       reason: `Stage ${input.stage} failed judge validation after exhausting its prompt stack.`,
     };
   }
+}
+
+export function currentJudgedAgentAttemptFrame(
+  input: JudgedStageInput,
+): JudgedAgentAttemptFrame {
+  const stack = normalizedPromptStack(input);
+  const promptIndex = currentPromptIndex(input, stack);
+  const frame = stack[promptIndex];
+  const attempt = input.promptAttempt ?? input.attempt ?? 1;
+  const maxAttempts = input.maxAttemptsPerPrompt ?? input.maxAttempts ?? 3;
+  return formatJudgedAgentAttemptFrame({
+    frame,
+    promptIndex,
+    attempt,
+    maxAttempts,
+    backtracked: false,
+  });
+}
+
+export function judgedAgentEffortForAttempt(attempt: number): AgentThoughtEffort {
+  return attempt <= 1 ? "quick" : "deliberate";
+}
+
+export function judgedAgentEffortInstruction(effort: AgentThoughtEffort): string {
+  if (effort === "quick") {
+    return [
+      "Fast path: answer directly from available evidence.",
+      "Do not emit <think>, chain-of-thought, scratchpad, or hidden reasoning text.",
+      "Return only the artifact this micro-agent was asked to produce.",
+    ].join(" ");
+  }
+  return [
+    "Deliberate retry: reason privately before answering and check the failure that caused the judge to block.",
+    "Do not reveal chain-of-thought; return only the corrected artifact.",
+  ].join(" ");
+}
+
+function formatJudgedAgentAttemptFrame({
+  frame,
+  promptIndex,
+  attempt,
+  maxAttempts,
+  backtracked,
+}: {
+  frame: AgentPromptFrame;
+  promptIndex: number;
+  attempt: number;
+  maxAttempts: number;
+  backtracked: boolean;
+}): JudgedAgentAttemptFrame {
+  const thoughtEffort = judgedAgentEffortForAttempt(attempt);
+  const effortInstruction = judgedAgentEffortInstruction(thoughtEffort);
+  return {
+    prompt: [effortInstruction, "", frame.prompt].join("\n"),
+    rawPrompt: frame.prompt,
+    promptIndex,
+    attempt,
+    maxAttempts,
+    clearContext: Boolean(frame.clearsContext),
+    backtracked,
+    thoughtEffort,
+    effortInstruction,
+  };
 }
 
 function currentPromptFrame(input: JudgedStageInput): AgentPromptFrame {
@@ -732,15 +818,27 @@ function nextPromptReplay(
   input: JudgedStageInput,
   attempt: number,
   maxAttempts: number,
-): { frame: AgentPromptFrame; index: number; nextAttempt: number; backtracked: boolean } | null {
+): JudgedAgentAttemptFrame | null {
   const stack = normalizedPromptStack(input);
   const index = currentPromptIndex(input, stack);
   if (attempt < maxAttempts) {
-    return { frame: stack[index], index, nextAttempt: attempt + 1, backtracked: false };
+    return formatJudgedAgentAttemptFrame({
+      frame: stack[index],
+      promptIndex: index,
+      attempt: attempt + 1,
+      maxAttempts,
+      backtracked: false,
+    });
   }
   const previousIndex = index - 1;
   if (previousIndex >= 0) {
-    return { frame: stack[previousIndex], index: previousIndex, nextAttempt: 1, backtracked: true };
+    return formatJudgedAgentAttemptFrame({
+      frame: stack[previousIndex],
+      promptIndex: previousIndex,
+      attempt: 1,
+      maxAttempts,
+      backtracked: true,
+    });
   }
   return null;
 }

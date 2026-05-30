@@ -10,15 +10,14 @@ use crate::state::AppState;
 use parking_lot::Mutex;
 use serde::Serialize;
 use std::time::Instant;
-use sysinfo::{ProcessRefreshKind, RefreshKind, System};
+use sysinfo::{CpuRefreshKind, ProcessRefreshKind, RefreshKind, System, UpdateKind};
 use tauri::State;
 
 static SYS: once_cell::sync::Lazy<Mutex<System>> = once_cell::sync::Lazy::new(|| {
     Mutex::new(System::new_with_specifics(
-        RefreshKind::everything()
+        RefreshKind::new()
             .with_memory(sysinfo::MemoryRefreshKind::everything())
-            .with_cpu(sysinfo::CpuRefreshKind::everything())
-            .with_processes(ProcessRefreshKind::everything()),
+            .with_cpu(CpuRefreshKind::new().with_cpu_usage()),
     ))
 });
 
@@ -31,7 +30,8 @@ pub struct ProcInfo {
     pub parent_pid: Option<u32>,
     pub name: String,
     pub cmd: String,
-    /// One of: "pointer" | "ollama" | "ollama_runner" | "renderer" | "other"
+    /// One of: "pointer" | "renderer" | "language_server" | "dev_server" |
+    /// "ollama" | "ollama_runner" | "other"
     pub kind: String,
     pub cpu_percent: f32,
     pub mem_bytes: u64,
@@ -56,6 +56,16 @@ pub struct SystemSnapshot {
     pub pointer_mem_bytes: u64,
 }
 
+#[derive(Serialize, Clone)]
+pub struct SystemLoadSnapshot {
+    pub cpu_percent: f32,
+    pub cpu_count: u32,
+    pub mem_total: u64,
+    pub mem_used: u64,
+    pub pointer_cpu_percent: f32,
+    pub pointer_mem_bytes: u64,
+}
+
 #[tauri::command]
 pub async fn system_snapshot(state: State<'_, AppState>) -> AppResult<SystemSnapshot> {
     let owned_pid = state.ollama_child.lock().as_ref().map(|c| c.id());
@@ -67,6 +77,17 @@ pub async fn system_snapshot(state: State<'_, AppState>) -> AppResult<SystemSnap
     Ok(snap)
 }
 
+#[tauri::command]
+pub async fn system_load_snapshot(state: State<'_, AppState>) -> AppResult<SystemLoadSnapshot> {
+    let owned_pid = state.ollama_child.lock().as_ref().map(|c| c.id());
+    let self_pid = std::process::id();
+
+    let snap = tokio::task::spawn_blocking(move || take_load_snapshot(self_pid, owned_pid))
+        .await
+        .map_err(|e| crate::error::AppError::Msg(format!("load snapshot join: {e}")))?;
+    Ok(snap)
+}
+
 fn take_snapshot(self_pid: u32, owned_ollama_pid: Option<u32>) -> SystemSnapshot {
     let mut sys = SYS.lock();
     // sysinfo CPU% is computed against the prior sample; we keep a singleton
@@ -74,7 +95,11 @@ fn take_snapshot(self_pid: u32, owned_ollama_pid: Option<u32>) -> SystemSnapshot
     // tends to read ~0% — the UI polls so it self-corrects.
     sys.refresh_cpu_all();
     sys.refresh_memory();
-    sys.refresh_processes(sysinfo::ProcessesToUpdate::All, true);
+    sys.refresh_processes_specifics(
+        sysinfo::ProcessesToUpdate::All,
+        true,
+        process_refresh_kind(),
+    );
     *LAST_REFRESH.lock() = Some(Instant::now());
 
     let cpu_percent = sys.global_cpu_usage();
@@ -88,6 +113,10 @@ fn take_snapshot(self_pid: u32, owned_ollama_pid: Option<u32>) -> SystemSnapshot
     let os_name = System::name();
 
     let pointer_descendants = collect_descendants(&sys, self_pid);
+    let pointer_start_time = sys
+        .process(sysinfo::Pid::from_u32(self_pid))
+        .map(|p| p.start_time())
+        .unwrap_or_default();
 
     let mut out: Vec<ProcInfo> = Vec::new();
     let mut pointer_cpu: f32 = 0.0;
@@ -96,7 +125,7 @@ fn take_snapshot(self_pid: u32, owned_ollama_pid: Option<u32>) -> SystemSnapshot
 
     for (pid, proc) in sys.processes() {
         let pid_u = pid.as_u32();
-        let name = proc.name().to_string_lossy().to_string();
+        let raw_name = proc.name().to_string_lossy().to_string();
         let cmd_joined = proc
             .cmd()
             .iter()
@@ -105,8 +134,9 @@ fn take_snapshot(self_pid: u32, owned_ollama_pid: Option<u32>) -> SystemSnapshot
             .join(" ");
         let parent_pid = proc.parent().map(|p| p.as_u32());
 
-        let lower_name = name.to_lowercase();
+        let lower_name = raw_name.to_lowercase();
         let lower_cmd = cmd_joined.to_lowercase();
+        let name = friendly_process_name(&raw_name, &lower_cmd);
         let is_pointer_self = pid_u == self_pid;
         let is_descendant = pointer_descendants.contains(&pid_u);
         let owned_ollama = owned_ollama_pid == Some(pid_u);
@@ -114,12 +144,26 @@ fn take_snapshot(self_pid: u32, owned_ollama_pid: Option<u32>) -> SystemSnapshot
             && (lower_cmd.contains("runner") || lower_cmd.contains("llama-server"));
         let is_ollama = lower_name == "ollama" || lower_name.starts_with("ollama");
 
+        let is_probable_renderer = is_probable_pointer_webkit_xpc(
+            &lower_name,
+            &lower_cmd,
+            parent_pid,
+            proc.start_time(),
+            pointer_start_time,
+        );
+
         let kind = if is_pointer_self {
             "pointer"
         } else if is_descendant
             && (lower_name.contains("pointer") || is_pointer_renderer(&lower_name, &lower_cmd))
         {
             "renderer"
+        } else if is_probable_renderer {
+            "renderer"
+        } else if is_descendant && is_language_server_process(&lower_name, &lower_cmd) {
+            "language_server"
+        } else if is_descendant && is_dev_server_process(&lower_name, &lower_cmd) {
+            "dev_server"
         } else if owned_ollama || is_ollama {
             "ollama"
         } else if is_ollama_runner {
@@ -131,7 +175,7 @@ fn take_snapshot(self_pid: u32, owned_ollama_pid: Option<u32>) -> SystemSnapshot
         };
 
         let cpu = proc.cpu_usage() / cpu_norm;
-        let mem = proc.memory();
+        let mem = physical_footprint_bytes(pid_u).unwrap_or_else(|| proc.memory());
         let info = ProcInfo {
             pid: pid_u,
             parent_pid,
@@ -142,8 +186,10 @@ fn take_snapshot(self_pid: u32, owned_ollama_pid: Option<u32>) -> SystemSnapshot
             mem_bytes: mem,
             owned_by_pointer: owned_ollama || is_descendant || is_pointer_self,
         };
-        pointer_cpu += cpu;
-        pointer_mem += mem;
+        if kind != "dev_server" {
+            pointer_cpu += cpu;
+            pointer_mem += mem;
+        }
         out.push(info);
     }
 
@@ -153,9 +199,11 @@ fn take_snapshot(self_pid: u32, owned_ollama_pid: Option<u32>) -> SystemSnapshot
         let order = |k: &str| match k {
             "pointer" => 0,
             "renderer" => 1,
-            "ollama" => 2,
-            "ollama_runner" => 3,
-            _ => 4,
+            "language_server" => 2,
+            "dev_server" => 3,
+            "ollama" => 4,
+            "ollama_runner" => 5,
+            _ => 6,
         };
         let oa = order(&a.kind);
         let ob = order(&b.kind);
@@ -182,11 +230,207 @@ fn take_snapshot(self_pid: u32, owned_ollama_pid: Option<u32>) -> SystemSnapshot
     }
 }
 
+fn take_load_snapshot(self_pid: u32, owned_ollama_pid: Option<u32>) -> SystemLoadSnapshot {
+    let mut sys = SYS.lock();
+    sys.refresh_cpu_all();
+    sys.refresh_memory();
+    sys.refresh_processes_specifics(
+        sysinfo::ProcessesToUpdate::All,
+        true,
+        load_process_refresh_kind(),
+    );
+    *LAST_REFRESH.lock() = Some(Instant::now());
+
+    let cpu_percent = sys.global_cpu_usage();
+    let cpu_count = sys.cpus().len() as u32;
+    let mem_total = sys.total_memory();
+    let mem_used = sys.used_memory();
+    let (pointer_cpu_percent, pointer_mem_bytes) =
+        pointer_load_rollup(&sys, self_pid, owned_ollama_pid, cpu_count);
+
+    SystemLoadSnapshot {
+        cpu_percent,
+        cpu_count,
+        mem_total,
+        mem_used,
+        pointer_cpu_percent,
+        pointer_mem_bytes,
+    }
+}
+
+fn process_refresh_kind() -> ProcessRefreshKind {
+    ProcessRefreshKind::new()
+        .with_memory()
+        .with_cpu()
+        .with_cmd(UpdateKind::OnlyIfNotSet)
+}
+
+fn load_process_refresh_kind() -> ProcessRefreshKind {
+    ProcessRefreshKind::new()
+        .with_memory()
+        .with_cpu()
+        .with_cmd(UpdateKind::OnlyIfNotSet)
+}
+
+fn pointer_load_rollup(
+    sys: &System,
+    self_pid: u32,
+    owned_ollama_pid: Option<u32>,
+    cpu_count: u32,
+) -> (f32, u64) {
+    let pointer_descendants = collect_descendants(sys, self_pid);
+    let pointer_start_time = sys
+        .process(sysinfo::Pid::from_u32(self_pid))
+        .map(|p| p.start_time())
+        .unwrap_or_default();
+    let cpu_norm = if cpu_count > 0 { cpu_count as f32 } else { 1.0 };
+    let mut cpu = 0.0;
+    let mut mem = 0;
+
+    for (pid, proc) in sys.processes() {
+        let pid_u = pid.as_u32();
+        let raw_name = proc.name().to_string_lossy().to_string();
+        let lower_name = raw_name.to_lowercase();
+        let lower_cmd = proc
+            .cmd()
+            .iter()
+            .map(|s| s.to_string_lossy().to_lowercase())
+            .collect::<Vec<_>>()
+            .join(" ");
+        let parent_pid = proc.parent().map(|p| p.as_u32());
+        let is_pointer_self = pid_u == self_pid;
+        let is_descendant = pointer_descendants.contains(&pid_u);
+        let owned_ollama = owned_ollama_pid == Some(pid_u);
+        let is_ollama_runner = lower_name.contains("ollama");
+        let is_ollama = lower_name == "ollama" || lower_name.starts_with("ollama");
+        let is_probable_renderer = is_probable_pointer_webkit_xpc(
+            &lower_name,
+            "",
+            parent_pid,
+            proc.start_time(),
+            pointer_start_time,
+        );
+        let is_dev_tooling = is_descendant && is_dev_server_process(&lower_name, &lower_cmd);
+
+        if is_pointer_self
+            || (is_descendant && !is_dev_tooling)
+            || owned_ollama
+            || is_ollama
+            || is_ollama_runner
+            || is_probable_renderer
+        {
+            cpu += proc.cpu_usage() / cpu_norm;
+            mem += physical_footprint_bytes(pid_u).unwrap_or_else(|| proc.memory());
+        }
+    }
+
+    (cpu, mem)
+}
+
+#[cfg(target_os = "macos")]
+fn physical_footprint_bytes(pid: u32) -> Option<u64> {
+    let mut info = std::mem::MaybeUninit::<libc::rusage_info_v2>::uninit();
+    let ok = unsafe {
+        libc::proc_pid_rusage(
+            pid as libc::c_int,
+            libc::RUSAGE_INFO_V2,
+            info.as_mut_ptr() as _,
+        )
+    };
+    if ok == 0 {
+        Some(unsafe { info.assume_init() }.ri_phys_footprint)
+    } else {
+        None
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+fn physical_footprint_bytes(_pid: u32) -> Option<u64> {
+    None
+}
+
 fn is_pointer_renderer(name: &str, cmd: &str) -> bool {
     name.contains("webview")
         || name.contains("webkit")
         || cmd.contains("WebKit")
         || cmd.contains("webview")
+}
+
+fn is_language_server_process(name: &str, cmd: &str) -> bool {
+    name.contains("language-server")
+        || cmd.contains("language-server")
+        || cmd.contains("tsserver.js")
+        || cmd.contains("typingsinstaller.js")
+        || cmd.contains("rust-analyzer")
+        || cmd.contains("gopls")
+        || cmd.contains("pyright")
+        || cmd.contains("pylsp")
+        || cmd.contains("clangd")
+        || cmd.contains("solargraph")
+        || cmd.contains("intelephense")
+        || cmd.contains("omnisharp")
+        || cmd.contains("lua-language-server")
+}
+
+fn is_dev_server_process(name: &str, cmd: &str) -> bool {
+    name == "vite"
+        || cmd.contains("/vite")
+        || cmd.contains(" vite ")
+        || cmd.contains("npm run dev")
+        || cmd.contains("npm run tauri:dev")
+        || cmd.contains("next dev")
+        || cmd.contains("webpack")
+        || cmd.contains("tauri dev")
+}
+
+fn friendly_process_name(raw_name: &str, lower_cmd: &str) -> String {
+    if lower_cmd.contains("typescript-language-server") {
+        "typescript-language-server".to_string()
+    } else if lower_cmd.contains("tsserver.js") && lower_cmd.contains("partialsemantic") {
+        "tsserver (partial)".to_string()
+    } else if lower_cmd.contains("tsserver.js") {
+        "tsserver".to_string()
+    } else if lower_cmd.contains("typingsinstaller.js") {
+        "typings installer".to_string()
+    } else if lower_cmd.contains("rust-analyzer") {
+        "rust-analyzer".to_string()
+    } else if lower_cmd.contains("gopls") {
+        "gopls".to_string()
+    } else if lower_cmd.contains("pyright") {
+        "pyright".to_string()
+    } else if lower_cmd.contains("pylsp") {
+        "pylsp".to_string()
+    } else if lower_cmd.contains("clangd") {
+        "clangd".to_string()
+    } else if lower_cmd.contains("vite") {
+        "vite dev server".to_string()
+    } else {
+        raw_name.to_string()
+    }
+}
+
+fn is_probable_pointer_webkit_xpc(
+    name: &str,
+    cmd: &str,
+    parent_pid: Option<u32>,
+    process_start_time: u64,
+    pointer_start_time: u64,
+) -> bool {
+    // macOS WebKit XPC helper processes are re-parented to launchd, so they
+    // are not descendants of the Tauri process even though Activity Monitor
+    // groups their memory under the app. We include the helpers that launch
+    // at the same time as Pointer so the in-app monitor explains the memory
+    // footprint users see at the OS level.
+    if !cfg!(target_os = "macos") {
+        return false;
+    }
+    if parent_pid != Some(1) || pointer_start_time == 0 || process_start_time == 0 {
+        return false;
+    }
+    let is_webkit_xpc = name.contains("webkit")
+        || cmd.contains("webkit.framework")
+        || cmd.contains("com.apple.webkit");
+    is_webkit_xpc && process_start_time.abs_diff(pointer_start_time) <= 120
 }
 
 fn collect_descendants(sys: &System, root: u32) -> std::collections::HashSet<u32> {
@@ -374,7 +618,12 @@ pub async fn kill_owned_process(state: State<'_, AppState>, pid: u32) -> AppResu
     }
     // For descendants of Pointer, SIGTERM directly.
     let self_pid = std::process::id();
-    let sys = SYS.lock();
+    let mut sys = SYS.lock();
+    sys.refresh_processes_specifics(
+        sysinfo::ProcessesToUpdate::All,
+        true,
+        load_process_refresh_kind(),
+    );
     let descendants = collect_descendants(&sys, self_pid);
     drop(sys);
     if descendants.contains(&pid) {

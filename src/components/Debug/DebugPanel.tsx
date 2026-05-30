@@ -1,4 +1,4 @@
-import { useMemo, useState } from "react";
+import { useMemo, useState } from "@/lib/preactSignalCompat";
 import {
   Bot,
   CircleDot,
@@ -8,7 +8,7 @@ import {
   Route,
   Send,
   Trash2,
-} from "lucide-react";
+} from "@/lib/lucide";
 import { inferDebuggerCapabilities } from "@/lib/debugCapabilities";
 import { sendBreakpointToAI, sendDebugValueToAI, type AiTarget } from "@/lib/sendToAI";
 import { useDebuggerStore, type Breakpoint, type DebugValue } from "@/store/debugger";
@@ -45,7 +45,11 @@ export function DebugPanel() {
   };
 
   return (
-    <div className="flex h-full flex-col bg-noir-bg font-sans text-noir-text">
+    <div
+      className="flex h-full flex-col bg-noir-bg font-sans text-noir-text"
+      role="region"
+      aria-label="Debug panel"
+    >
       <header className="border-b border-noir-line bg-noir-chrome/40 px-3 py-2">
         <div className="flex items-center gap-2 text-[12px] font-medium">
           <Route size={13} className="text-noir-accent" aria-hidden="true" />
@@ -66,6 +70,7 @@ export function DebugPanel() {
               {capabilities.map((cap) => (
                 <div
                   key={cap.language}
+                  data-debug-adapter-language={cap.language}
                   className="rounded-md border border-noir-line bg-noir-canvas/35 p-2"
                 >
                   <div className="flex items-center justify-between gap-2">
@@ -81,7 +86,6 @@ export function DebugPanel() {
                   </div>
                   <div className="mt-2 flex flex-wrap gap-1">
                     {Array.from(new Set([...cap.launchKinds, ...cap.frameworks]))
-                      .slice(0, 8)
                       .map((tag) => (
                       <span
                         key={tag}
@@ -178,9 +182,12 @@ export function DebugPanel() {
 
 function BreakpointRow({ breakpoint }: { breakpoint: Breakpoint }) {
   const removeBreakpoint = useDebuggerStore((s) => s.removeBreakpoint);
+  const updateBreakpoint = useDebuggerStore((s) => s.updateBreakpoint);
   return (
     <div
       draggable
+      data-debug-breakpoint-path={breakpoint.path}
+      data-debug-breakpoint-line={breakpoint.line}
       onDragStart={(e) => {
         e.dataTransfer.effectAllowed = "copy";
         e.dataTransfer.setData(
@@ -192,11 +199,20 @@ function BreakpointRow({ breakpoint }: { breakpoint: Breakpoint }) {
       className="group rounded-md border border-noir-line bg-noir-canvas/35 p-2"
     >
       <div className="flex items-center gap-2 min-w-0">
-        <CircleDot
-          size={12}
-          className={breakpoint.enabled ? "text-noir-err" : "text-noir-mute"}
-          aria-hidden="true"
-        />
+        <button
+          onClick={() =>
+            updateBreakpoint(breakpoint.id, { enabled: !breakpoint.enabled })
+          }
+          className="shrink-0 text-noir-mute hover:text-noir-err"
+          title={breakpoint.enabled ? "Disable breakpoint" : "Enable breakpoint"}
+          aria-label={breakpoint.enabled ? "Disable breakpoint" : "Enable breakpoint"}
+        >
+          <CircleDot
+            size={12}
+            className={breakpoint.enabled ? "text-noir-err" : "text-noir-mute"}
+            aria-hidden="true"
+          />
+        </button>
         <button
           onClick={() =>
             useEditorStore
@@ -219,11 +235,30 @@ function BreakpointRow({ breakpoint }: { breakpoint: Breakpoint }) {
           <Trash2 size={11} aria-hidden="true" />
         </button>
       </div>
-      {(breakpoint.condition || breakpoint.logMessage) && (
-        <div className="mt-1 truncate text-[10.5px] text-noir-mute">
-          {breakpoint.condition || breakpoint.logMessage}
-        </div>
-      )}
+      <div className="mt-2 grid grid-cols-2 gap-1.5">
+        <input
+          value={breakpoint.condition ?? ""}
+          onChange={(e) =>
+            updateBreakpoint(breakpoint.id, {
+              condition: e.currentTarget.value.trim() || undefined,
+            })
+          }
+          className="pn-input h-6 font-mono text-[10px]"
+          placeholder="condition"
+          aria-label="Breakpoint condition"
+        />
+        <input
+          value={breakpoint.logMessage ?? ""}
+          onChange={(e) =>
+            updateBreakpoint(breakpoint.id, {
+              logMessage: e.currentTarget.value.trim() || undefined,
+            })
+          }
+          className="pn-input h-6 font-mono text-[10px]"
+          placeholder="log message"
+          aria-label="Breakpoint log message"
+        />
+      </div>
     </div>
   );
 }
@@ -233,6 +268,7 @@ function DebugValueRow({ value }: { value: DebugValue }) {
   return (
     <div
       draggable
+      data-debug-value-name={value.name}
       onDragStart={(e) => {
         e.dataTransfer.effectAllowed = "copy";
         e.dataTransfer.setData(

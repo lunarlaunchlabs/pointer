@@ -1,5 +1,5 @@
-import { useEffect, useRef } from "react";
-import { createPortal } from "react-dom";
+import { useEffect, useRef } from "@/lib/preactSignalCompat";
+import { createPortal } from "@/lib/preactSignalDomCompat";
 
 export type MenuItem =
   | { kind: "item"; label: string; shortcut?: string; danger?: boolean; disabled?: boolean; onSelect: () => void; icon?: React.ReactNode }

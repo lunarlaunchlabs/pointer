@@ -1,4 +1,4 @@
-import { beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { detectPreviewKind, useEditorStore } from "@/store/editor";
 import { useSession } from "@/store/session";
 
@@ -54,6 +54,10 @@ describe("editor path rewrites", () => {
     });
   });
 
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
   it("preserves dirty buffers and session metadata when a folder moves", () => {
     useEditorStore.getState().rewritePathPrefix("/repo/src", "/repo/app");
 
@@ -97,6 +101,41 @@ describe("editor path rewrites", () => {
     });
     expect(useEditorStore.getState().tabs[1].language).toBe("typescript");
     expect(useEditorStore.getState().tabs[2].language).toBe("markdown");
+  });
+
+  it("stages keystroke content outside reactive tab state until typing goes idle", () => {
+    vi.useFakeTimers();
+    const notifications: Array<{ dirty: boolean; content: string }> = [];
+    const unsub = useEditorStore.subscribe((state) => {
+      const tab = state.tabs.find((t) => t.path === "/repo/src/components/Button.tsx");
+      if (tab) notifications.push({ dirty: tab.dirty, content: tab.content });
+    });
+
+    useEditorStore.getState().stageContent("/repo/src/components/Button.tsx", "first edit");
+    useEditorStore.getState().stageContent("/repo/src/components/Button.tsx", "second edit");
+
+    expect(useEditorStore.getState().tabs[1]).toMatchObject({
+      dirty: true,
+      content: "button",
+    });
+    expect(
+      useEditorStore.getState().getContent("/repo/src/components/Button.tsx"),
+    ).toBe("second edit");
+    expect(notifications).toEqual([
+      { dirty: true, content: "button" },
+    ]);
+
+    vi.advanceTimersByTime(449);
+    expect(useEditorStore.getState().tabs[1].content).toBe("button");
+
+    vi.advanceTimersByTime(1);
+    expect(useEditorStore.getState().tabs[1].content).toBe("second edit");
+    expect(notifications).toEqual([
+      { dirty: true, content: "button" },
+      { dirty: true, content: "second edit" },
+    ]);
+
+    unsub();
   });
 
   it("routes font and macOS icon blobs to the binary preview", () => {

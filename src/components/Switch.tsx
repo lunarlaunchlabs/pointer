@@ -17,7 +17,7 @@
  * the geometry.
  */
 
-import { forwardRef } from "react";
+import { forwardRef } from "@/lib/preactSignalCompat";
 
 export type SwitchProps = {
   checked: boolean;
@@ -36,20 +36,18 @@ export const Switch = forwardRef<HTMLButtonElement, SwitchProps>(function Switch
   ref,
 ) {
   const dims =
-    size === "md"
+        size === "md"
       ? {
           track: "h-5 w-9",
           knob: "h-4 w-4",
-          // Travel: track width 36 − knob 16 − padding 2*2 = 16px
-          off: "translate-x-[2px]",
-          on: "translate-x-[18px]",
+          // Travel: track width 36 - knob 16 - padding 2*2 = 16px
+          on: "translate-x-[16px]",
         }
       : {
           track: "h-[18px] w-8",
           knob: "h-[14px] w-[14px]",
-          // Travel: track width 32 − knob 14 − padding 2*2 = 14px
-          off: "translate-x-[2px]",
-          on: "translate-x-[16px]",
+          // Travel: track width 32 - knob 14 - padding 2*2 = 14px
+          on: "translate-x-[14px]",
         };
 
   return (
@@ -77,11 +75,11 @@ export const Switch = forwardRef<HTMLButtonElement, SwitchProps>(function Switch
       <span
         aria-hidden="true"
         className={[
-          "absolute top-1/2 -translate-y-1/2",
+          "absolute left-[2px] top-1/2 -translate-y-1/2",
           "rounded-full bg-white shadow-[0_1px_2px_rgba(0,0,0,0.45)]",
           "transition-transform duration-150 ease-out will-change-transform",
           dims.knob,
-          checked ? dims.on : dims.off,
+          checked ? dims.on : "translate-x-0",
         ].join(" ")}
       />
     </button>

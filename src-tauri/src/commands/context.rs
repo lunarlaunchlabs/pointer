@@ -2,8 +2,8 @@ use crate::error::{AppError, AppResult};
 use crate::services::indexer::{blob_to_vec, chunk_text, cosine, vec_to_blob, Chunk, ScoredChunk};
 use crate::services::inference::{acquire_inference, InferenceClaim, InferencePolicy};
 use crate::services::merkle::MerkleSnapshot;
+use crate::services::workspace_filter::workspace_walker;
 use crate::state::AppState;
-use ignore::WalkBuilder;
 use rusqlite::params;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -116,11 +116,7 @@ pub async fn index_workspace(
     to_process.extend(diff.changed.clone());
     // If no diff but no files indexed yet, fall back to a full scan.
     if to_process.is_empty() && state.indexer.state.lock().indexed_chunks == 0 {
-        let walker = WalkBuilder::new(&root)
-            .git_ignore(true)
-            .ignore(true)
-            .hidden(false)
-            .build();
+        let walker = workspace_walker(&root).build();
         for d in walker.flatten() {
             if d.file_type().map(|t| t.is_file()).unwrap_or(false) {
                 to_process.push(d.path().to_path_buf());

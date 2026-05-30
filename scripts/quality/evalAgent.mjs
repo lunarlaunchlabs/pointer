@@ -1271,6 +1271,7 @@ export async function driveAgent({
   let planBroadTestRedirectUsed = false;
   let planQualityRedirectCount = 0;
   let manifestRead = false;
+  let manifestMissing = false;
   let pendingSourceHygieneIssue = null;
   const runStart = Date.now();
   for (let turn = 0; turn < maxTurns; turn++) {
@@ -1360,6 +1361,8 @@ export async function driveAgent({
           : "") +
         (manifestRead
           ? "Use the underlying test runner from package.json, preserving required flags and replacing broad test globs with the target test file. If no relevant test/spec file is in context yet, emit exactly one read-only tool call now to find it (for example <glob>src/**/__tests__/*drag*.test.js</glob> or <grep glob=\"src/**/__tests__/*.js\">symbolName</grep>). If a UI state/render site is not in context yet, emit exactly one read-only tool call now to find it (for example <grep>showDropOverlay|drop-overlay</grep>). Otherwise emit only <plan>...</plan> followed by <final>...</final>."
+          : manifestMissing
+            ? "No package.json exists in this fixture. Do not request it again. Use the existing test/spec file you already found as the narrow verification target, or say no configured test command exists when that is the honest repo-grounded answer. Otherwise emit only <plan>...</plan> followed by <final>...</final>."
           : "If package.json is not in context, emit exactly one read-only tool call now: <read_file path=\"package.json\" />. Otherwise emit only <plan>...</plan> followed by <final>...</final>.");
       messages.push({
         role: "user",
@@ -1505,12 +1508,13 @@ export async function driveAgent({
     }
     const result = await toolRunner(fs_, call, mode);
     trace[trace.length - 1].result = result;
-    if (
-      result.status === "ok" &&
-      call.tool === "read_file" &&
-      /(^|\/)package\.json$/i.test(call.attrs.path ?? "")
-    ) {
-      manifestRead = true;
+    if (call.tool === "read_file" && /(^|\/)package\.json$/i.test(call.attrs.path ?? "")) {
+      if (result.status === "ok") {
+        manifestRead = true;
+        manifestMissing = false;
+      } else {
+        manifestMissing = true;
+      }
     }
     // Push the SANITIZED version of the model's turn into the
     // transcript so the model doesn't see its own hallucinated
@@ -1573,6 +1577,19 @@ export async function driveAgent({
         `\n\nThis is PLAN MODE — <${call.tool}> is forbidden and was not executed. Do NOT call run_shell, run_check, task, or mutating tools in Plan mode. If you already have the source file, test/spec file, and package.json context, emit a <plan> block with the exact source change and narrow verification command, followed by <final>.`;
     }
     messages.push({ role: "user", content: toolMessage });
+  }
+  if (mode === "plan") {
+    for (let i = trace.length - 1; i >= 0; i -= 1) {
+      const latestPlan = (
+        extractBlocks(trace[i].sanitized ?? trace[i].response ?? "", "plan").at(-1) ?? ""
+      ).trim();
+      if (latestPlan.length > 0) {
+        trace[i].final = latestPlan;
+        trace[i].planImpliedFinal = true;
+        trace[i].planMaxTurnFallback = true;
+        return { trace, fs: fs_, terminated: "final" };
+      }
+    }
   }
   return { trace, fs: fs_, terminated: "max-turns" };
 }

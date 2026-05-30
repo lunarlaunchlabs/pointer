@@ -1,4 +1,4 @@
-import { useMemo, useState } from "react";
+import { useMemo, useState } from "@/lib/preactSignalCompat";
 import {
   Bot,
   ChevronRight,
@@ -6,9 +6,9 @@ import {
   ScrollText,
   Search,
   Trash2,
-} from "lucide-react";
+} from "@/lib/lucide";
 import { useAssistant, type AssistantSession } from "@/store/assistant";
-import { useSettings } from "@/store/settings";
+import { isModelInInstalledList, useSettings } from "@/store/settings";
 import type { DockView } from "@/store/session";
 
 /** Hook returning a predicate that says whether a per-session model name
@@ -23,7 +23,7 @@ function useStaleSessionModelPredicate() {
     !!m &&
     ollamaReady &&
     installedModels.length > 0 &&
-    !installedModels.includes(m);
+    !isModelInInstalledList(m, installedModels);
 }
 
 /** Combined chat + agent history. Picking a session also routes the dock

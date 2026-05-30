@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "@/lib/preactSignalCompat";
 import {
   CaseSensitive,
   Loader2,
@@ -7,7 +7,7 @@ import {
   Search,
   WholeWord,
   X,
-} from "lucide-react";
+} from "@/lib/lucide";
 import { ipc, type TextHit, type SearchOptions } from "@/lib/ipc";
 import { useEditorStore } from "@/store/editor";
 import { useWorkspace } from "@/store/workspace";

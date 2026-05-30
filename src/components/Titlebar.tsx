@@ -1,5 +1,5 @@
-import { useEffect, useLayoutEffect, useRef, useState } from "react";
-import { createPortal } from "react-dom";
+import { useEffect, useLayoutEffect, useRef, useState } from "@/lib/preactSignalCompat";
+import { createPortal } from "@/lib/preactSignalDomCompat";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import {
   Bot,
@@ -13,12 +13,17 @@ import {
   ScrollText,
   Sparkles,
   Type,
-} from "lucide-react";
+} from "@/lib/lucide";
 import { useWorkspace } from "@/store/workspace";
-import { useSettings, type AiFeature } from "@/store/settings";
+import {
+  isModelInInstalledList,
+  useSettings,
+  type AiFeature,
+} from "@/store/settings";
 import { useGit } from "@/store/git";
 import { ipc } from "@/lib/ipc";
 import { modelFitness } from "@/lib/modelFitness";
+import { PointerMarkSvg } from "@/components/BrandLogo";
 
 type Purpose = "chat" | "agent" | "fim" | "embed" | "vision" | "document";
 
@@ -141,31 +146,23 @@ export function Titlebar({
   const anyMissing =
     ollamaReady &&
     models.length > 0 &&
-    assignments.some((a) => a.model && !models.includes(a.model));
+    assignments.some((a) => a.model && !isModelInInstalledList(a.model, models));
 
   return (
     <header
       data-tauri-drag-region
       onMouseDown={startDrag}
-      className="pn-titlebar h-11 flex items-center justify-between px-4 backdrop-blur-xl select-none"
+      className="pn-titlebar h-[40px] min-h-[40px] flex items-center justify-between px-4 pt-[4px] pb-[3px] select-none"
       style={{ WebkitAppRegion: "drag" } as React.CSSProperties}
       aria-label="Title bar"
     >
       <div className="flex items-center gap-3 pl-16 min-w-0 flex-1">
         <span className="inline-flex items-center gap-2 shrink-0">
-          <img
-            src="/brand/pointer-mark.png"
-            alt=""
-            draggable={false}
-            className="pn-brand-mark h-5 w-5 rounded-md object-cover"
-            aria-hidden="true"
+          <PointerMarkSvg
+            decorative
+            glow={false}
+            className="pn-brand-mark h-5 w-5"
           />
-          <span className="hidden sm:inline font-sans text-[12px] font-medium text-noir-text">
-            Pointer
-          </span>
-        </span>
-        <span className="hidden sm:inline text-noir-mute shrink-0" aria-hidden="true">
-          /
         </span>
         <button
           onClick={openFolder}
@@ -302,7 +299,7 @@ function ModelsPill({
   // wired up — the offline indicator to the left already explains why
   // nothing is actually running.
   const isLive = (m: string) =>
-    !!m && (!ollamaReady || installedModels.includes(m));
+    !!m && (!ollamaReady || isModelInInstalledList(m, installedModels));
   const effectiveModels = assignments
     .map((a) => (isLive(a.model) ? a.model : ""))
     .filter(Boolean);
@@ -310,7 +307,9 @@ function ModelsPill({
   // A slot is "needs attention" if it's unset OR set-but-uninstalled; in
   // either case we don't have a working model for that purpose.
   const anyUnset = assignments.some(
-    (a) => !a.model || (ollamaReady && !installedModels.includes(a.model)),
+    (a) =>
+      !a.model ||
+      (ollamaReady && !isModelInInstalledList(a.model, installedModels)),
   );
   const summary =
     uniqueModels.length === 0
@@ -435,7 +434,7 @@ function AssignmentRow({
     !unset &&
     ollamaReady &&
     installedModels.length > 0 &&
-    !installedModels.includes(model);
+    !isModelInInstalledList(model, installedModels);
   const flag = unset || missing;
   const fit = model ? modelFitness(model, feature) : null;
   // Only call attention when the user has a "real" model assigned and we

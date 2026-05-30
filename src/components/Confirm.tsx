@@ -1,6 +1,6 @@
-import { useCallback, useEffect, useState } from "react";
-import { createPortal } from "react-dom";
-import { AlertTriangle, X } from "lucide-react";
+import { useCallback, useEffect, useState } from "@/lib/preactSignalCompat";
+import { createPortal } from "@/lib/preactSignalDomCompat";
+import { AlertTriangle, X } from "@/lib/lucide";
 
 /**
  * In-app Confirm modal. Replaces `window.confirm()` so destructive prompts

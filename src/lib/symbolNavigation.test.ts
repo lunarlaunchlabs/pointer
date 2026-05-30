@@ -25,7 +25,7 @@ describe("symbolAtPosition", () => {
 describe("definitionSearchPatterns", () => {
   it("emits language-specific declaration regexes", () => {
     expect(definitionSearchPatterns("Router", "typescript")).toContain(
-      String.raw`^\s*(?:export\s+)?(?:default\s+)?class\s+Router\b`,
+      String.raw`^\s*(?:export\s+)?(?:default\s+)?(?:declare\s+)?class\s+Router\b`,
     );
     expect(
       definitionSearchPatterns("App", "tsx").some((pattern) =>
@@ -53,6 +53,22 @@ describe("findLocalDefinitions", () => {
         line: 1,
         column: 14,
         text: "export const makeUrl = (path: string) => path",
+      },
+    ]);
+  });
+
+  it("finds TypeScript declaration-file exports", () => {
+    expect(
+      findLocalDefinitions(
+        "export declare function PointerPackageApi(): string;",
+        "PointerPackageApi",
+        "typescript",
+      ),
+    ).toEqual([
+      {
+        line: 1,
+        column: 25,
+        text: "export declare function PointerPackageApi(): string;",
       },
     ]);
   });

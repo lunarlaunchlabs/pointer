@@ -20,7 +20,7 @@ import {
   Search,
   Table,
   X,
-} from "lucide-react";
+} from "@/lib/lucide";
 import type { Reference } from "@/store/chat";
 import { FileIconFor } from "@/lib/fileIcon";
 

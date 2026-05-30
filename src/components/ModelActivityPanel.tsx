@@ -1,12 +1,13 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useState } from "@/lib/preactSignalCompat";
 import {
   Activity,
   Box,
   Cpu,
   MemoryStick,
+  Power,
   Square,
   Zap,
-} from "lucide-react";
+} from "@/lib/lucide";
 import {
   useModelWorkflows,
   type ModelWorkflow,
@@ -17,7 +18,7 @@ import {
   type InferenceJob,
   type InferenceSnapshot,
   type LoadedModel,
-  type SystemSnapshot,
+  type SystemLoadSnapshot,
 } from "@/lib/ipc";
 import { toast } from "@/components/Toast";
 
@@ -25,13 +26,14 @@ type Sample = { t: number; cpu: number; mem: number };
 
 export function ModelActivityPanel() {
   const [snapshot, setSnapshot] = useState<InferenceSnapshot | null>(null);
-  const [system, setSystem] = useState<SystemSnapshot | null>(null);
+  const [system, setSystem] = useState<SystemLoadSnapshot | null>(null);
   const [loaded, setLoaded] = useState<LoadedModel[]>([]);
   const [samples, setSamples] = useState<Sample[]>([]);
   const [cancelling, setCancelling] = useState<string | null>(null);
   const [cancellingWorkflow, setCancellingWorkflow] = useState<string | null>(
     null,
   );
+  const [unloadingModel, setUnloadingModel] = useState<string | null>(null);
   const workflows = useModelWorkflows((s) => s.workflows);
   const cancelWorkflowById = useModelWorkflows((s) => s.cancelWorkflow);
 
@@ -46,7 +48,7 @@ export function ModelActivityPanel() {
       try {
         const [next, sys, ps] = await Promise.all([
           ipc.inferenceStatus(),
-          ipc.systemSnapshot(),
+          ipc.systemLoadSnapshot(),
           ipc.ollamaPs().catch(() => []),
         ]);
         if (!alive) return;
@@ -78,6 +80,10 @@ export function ModelActivityPanel() {
 
   const jobs = snapshot?.active ?? [];
   const modelCount = new Set(jobs.map((j) => j.model)).size;
+  const activeModels = useMemo(
+    () => new Set(jobs.map((job) => normalizeModelName(job.model))),
+    [jobs],
+  );
 
   const cancel = async (job: InferenceJob) => {
     setCancelling(job.request_id);
@@ -110,6 +116,22 @@ export function ModelActivityPanel() {
       });
     } finally {
       setCancellingWorkflow(null);
+    }
+  };
+
+  const unloadModel = async (name: string) => {
+    setUnloadingModel(name);
+    try {
+      await ipc.ollamaUnloadModel(name);
+      toast.success(`Unloaded ${name}`);
+      const ps = await ipc.ollamaPs().catch(() => []);
+      setLoaded(ps);
+    } catch (e) {
+      toast.error("Couldn't unload model", {
+        body: e instanceof Error ? e.message : String(e),
+      });
+    } finally {
+      setUnloadingModel(null);
     }
   };
 
@@ -197,25 +219,38 @@ export function ModelActivityPanel() {
             </div>
           ) : (
             <div className="rounded-md border border-noir-line overflow-hidden">
-              {loaded.map((model) => (
-                <div
-                  key={model.name}
-                  className="grid grid-cols-[1fr_54px_76px] gap-2 items-center px-3 py-2 border-b last:border-b-0 border-noir-line/45"
-                >
-                  <div className="min-w-0">
-                    <div className="font-mono text-[11.5px] text-noir-text truncate" title={model.name}>
-                      {model.name}
+              {loaded.map((model) => {
+                const busy = activeModels.has(normalizeModelName(model.name));
+                return (
+                  <div
+                    key={model.name}
+                    className="grid grid-cols-[1fr_54px_76px_34px] gap-2 items-center px-3 py-2 border-b last:border-b-0 border-noir-line/45"
+                  >
+                    <div className="min-w-0">
+                      <div className="font-mono text-[11.5px] text-noir-text truncate" title={model.name}>
+                        {model.name}
+                      </div>
+                      <div className="text-[10px] text-noir-mute">
+                        expires {model.expires_at ? relativeFromNow(model.expires_at) : "—"}
+                      </div>
                     </div>
-                    <div className="text-[10px] text-noir-mute">
-                      expires {model.expires_at ? relativeFromNow(model.expires_at) : "—"}
+                    <Processor processor={model.processor} />
+                    <div className="font-mono text-[10.5px] text-noir-subtext text-right">
+                      {fmtBytes(model.size_bytes)}
                     </div>
+                    <button
+                      type="button"
+                      onClick={() => unloadModel(model.name)}
+                      disabled={busy || unloadingModel === model.name}
+                      className="h-7 w-7 rounded-md inline-flex items-center justify-center text-noir-mute hover:text-noir-accent hover:bg-noir-accent/10 disabled:cursor-not-allowed disabled:opacity-35 disabled:hover:text-noir-mute disabled:hover:bg-transparent"
+                      title={busy ? "Cancel active work before unloading this model" : "Unload model from memory"}
+                      aria-label={`Unload ${model.name}`}
+                    >
+                      <Power size={11} aria-hidden="true" />
+                    </button>
                   </div>
-                  <Processor processor={model.processor} />
-                  <div className="font-mono text-[10.5px] text-noir-subtext text-right">
-                    {fmtBytes(model.size_bytes)}
-                  </div>
-                </div>
-              ))}
+                );
+              })}
             </div>
           )}
         </Section>
@@ -480,4 +515,8 @@ function fmtBytes(n: number): string {
   if (n < 1024 * 1024) return `${(n / 1024).toFixed(1)} KB`;
   if (n < 1024 * 1024 * 1024) return `${(n / 1024 / 1024).toFixed(0)} MB`;
   return `${(n / 1024 / 1024 / 1024).toFixed(2)} GB`;
+}
+
+function normalizeModelName(model: string): string {
+  return model.trim().replace(/^ollama\//, "");
 }

@@ -1,6 +1,6 @@
-import { useEffect, useState } from "react";
-import { createPortal } from "react-dom";
-import { AlertTriangle, CheckCircle2, Info, X, XCircle } from "lucide-react";
+import { useEffect, useState } from "@/lib/preactSignalCompat";
+import { createPortal } from "@/lib/preactSignalDomCompat";
+import { AlertTriangle, CheckCircle2, Info, X, XCircle } from "@/lib/lucide";
 
 /**
  * Lightweight, non-blocking notification system.

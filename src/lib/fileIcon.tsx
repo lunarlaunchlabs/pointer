@@ -21,7 +21,7 @@
  * ignores it. Existing call sites continue to work unchanged.
  */
 
-import type { FunctionComponent } from "react";
+import type { FunctionComponent } from "@/lib/preactSignalCompat";
 import {
   IconAnsible,
   IconArchive,

@@ -1,28 +1,35 @@
-import { useEffect, useState } from "react";
+import { useEffect, useState } from "@/lib/preactSignalCompat";
 import {
   Check,
   ChevronLeft,
   Download,
   Loader2,
+  Palette,
   Server,
   Sparkles,
   ChevronRight,
   AlertCircle,
-} from "lucide-react";
-import { ipc } from "@/lib/ipc";
-import { useSettings } from "@/store/settings";
+} from "@/lib/lucide";
+import { ipc, type ModelRecommendation } from "@/lib/ipc";
+import {
+  isModelInInstalledList,
+  resolveInstalledModelName,
+  useSettings,
+} from "@/store/settings";
 import { usePulls } from "@/store/pulls";
 import { confirm } from "@/components/Confirm";
+import { PointerMarkSvg, PointerWordmarkSvg } from "@/components/BrandLogo";
+import { POINTER_THEMES, type AppThemeId } from "@/theme/themes";
 
-type Step = "intro" | "ollama" | "models" | "done";
-const ORDER: Step[] = ["intro", "ollama", "models", "done"];
+type Step = "intro" | "theme" | "ollama" | "models" | "done";
+const ORDER: Step[] = ["intro", "theme", "ollama", "models", "done"];
 
 export function Onboarding({ onDone }: { onDone: () => void }) {
   const [step, setStep] = useState<Step>("intro");
   // Mirrors live state from substeps so the footer can lock Skip while
   // something important (an install, a pull) is happening.
   const [busy, setBusy] = useState(false);
-  const setOllamaReady = useSettings((s) => s.setOllamaReady);
+  const onboarded = useSettings((s) => s.onboarded);
 
   const idx = ORDER.indexOf(step);
   const canBack = idx > 0 && step !== "done";
@@ -52,32 +59,31 @@ export function Onboarding({ onDone }: { onDone: () => void }) {
         className="pn-premium-panel w-[640px] max-w-[92vw] rounded-lg shadow-soft overflow-hidden"
       >
         <header className="px-5 py-4 border-b border-noir-line/70 flex items-center gap-3">
-          <img
-            src="/brand/pointer-mark.png"
-            alt=""
-            draggable={false}
-            className="pn-brand-mark h-5 w-5 rounded-md object-cover"
-            aria-hidden="true"
+          <PointerMarkSvg
+            decorative
+            className="pn-brand-mark h-5 w-5 rounded-md"
           />
           <h2
             id="onboarding-title"
             className="font-sans text-[14px] text-noir-text"
           >
-            Welcome to Pointer
+            {onboarded ? "Review Pointer setup" : "Welcome to Pointer"}
           </h2>
           <div className="flex-1" />
           <Stepper step={step} />
         </header>
 
         <div className="p-6 min-h-[280px]">
-          {step === "intro" && <Intro onNext={() => setStep("ollama")} />}
+          {step === "intro" && (
+            <Intro rerun={onboarded} onNext={() => setStep("theme")} />
+          )}
+          {step === "theme" && (
+            <ThemeStep onNext={() => setStep("ollama")} />
+          )}
           {step === "ollama" && (
             <OllamaStep
               onBusyChange={setBusy}
-              onNext={() => {
-                setOllamaReady(true);
-                setStep("models");
-              }}
+              onNext={() => setStep("models")}
             />
           )}
           {step === "models" && (
@@ -140,27 +146,24 @@ function Stepper({ step }: { step: Step }) {
   );
 }
 
-function Intro({ onNext }: { onNext: () => void }) {
+function Intro({ rerun, onNext }: { rerun: boolean; onNext: () => void }) {
   return (
     <div className="space-y-4">
-      <img
-        src="/brand/pointer-logo-wide.png"
-        alt=""
-        draggable={false}
+      <PointerWordmarkSvg
+        decorative
         className="pn-brand-logo h-auto w-[min(330px,100%)] select-none"
-        aria-hidden="true"
       />
       <h1 className="font-sans text-[20px] tracking-tight text-noir-text">
         A code editor that thinks with you.
       </h1>
       <p className="font-sans text-[13px] text-noir-subtext leading-relaxed">
-        Pointer is AI-first: chat, inline edit, tab completion, and an agent all
-        run locally through Ollama models. Nothing leaves your machine.
-        Let&apos;s set up your local model in two quick steps.
+        {rerun
+          ? "Review your local runtime and model assignments. Pointer will preserve working choices and only fill missing or uninstalled slots."
+          : "Pointer is AI-first: chat, inline edit, tab completion, and an agent all run locally through Ollama models. Nothing leaves your machine. Let's set up your workspace in a few quick steps."}
       </p>
       <div className="flex justify-end">
         <button onClick={onNext} className="pn-button-accent font-sans flex items-center gap-1.5">
-          Get started <ChevronRight size={12} />
+          {rerun ? "Review setup" : "Get started"} <ChevronRight size={12} />
         </button>
       </div>
     </div>
@@ -178,13 +181,30 @@ function OllamaStep({
   const [installing, setInstalling] = useState(false);
   const [starting, setStarting] = useState(false);
   const [err, setErr] = useState<string | null>(null);
+  const setOllamaReady = useSettings((s) => s.setOllamaReady);
+  const setInstalledModels = useSettings((s) => s.setInstalledModels);
 
   const check = async () => {
     try {
       const s = await ipc.ollamaStatus();
       setStatus(s);
+      setOllamaReady(s.running);
+      if (!s.running) {
+        setInstalledModels([]);
+        return;
+      }
+      try {
+        const models = await ipc.ollamaListModels();
+        setInstalledModels(models.map((m) => m.name));
+      } catch (e) {
+        console.warn(e);
+        setInstalledModels([]);
+      }
+      setErr(null);
     } catch (e) {
       console.warn(e);
+      setOllamaReady(false);
+      setInstalledModels([]);
     }
   };
 
@@ -323,16 +343,22 @@ function ModelsStep({
   onBusyChange: (b: boolean) => void;
 }) {
   const [recs, setRecs] = useState<
-    { id: string; purpose: string; size_gb: number; min_ram_gb: number; description: string; recommended: boolean }[]
+    ModelRecommendation[]
   >([]);
   const [ramGb, setRamGb] = useState<number | null>(null);
-  const [installed, setInstalled] = useState<Set<string>>(new Set());
   const [error, setError] = useState<string | null>(null);
   const [ollamaRunning, setOllamaRunning] = useState<boolean | null>(null);
+  const installedModels = useSettings((s) => s.installedModels);
+  const chatModel = useSettings((s) => s.chatModel);
+  const agentModel = useSettings((s) => s.agentModel);
+  const fimModel = useSettings((s) => s.fimModel);
+  const embedModel = useSettings((s) => s.embedModel);
   const setChatModel = useSettings((s) => s.setChatModel);
   const setFimModel = useSettings((s) => s.setFimModel);
   const setEmbedModel = useSettings((s) => s.setEmbedModel);
   const setAgentModel = useSettings((s) => s.setAgentModel);
+  const setOllamaReady = useSettings((s) => s.setOllamaReady);
+  const setInstalledModels = useSettings((s) => s.setInstalledModels);
   // Share the global pull state so a download started here keeps streaming if
   // the user navigates away (and the AI panel can pick it up later).
   const activePulls = usePulls((s) => s.active);
@@ -350,14 +376,26 @@ function ModelsStep({
     try {
       const status = await ipc.ollamaStatus();
       setOllamaRunning(status.running);
+      setOllamaReady(status.running);
       if (!status.running) {
-        setInstalled(new Set());
+        setInstalledModels([]);
         return;
       }
-      const m = await ipc.ollamaListModels();
-      setInstalled(new Set(m.map((x) => x.name)));
     } catch (e) {
       setError(extractErrorMessage(e));
+      setOllamaReady(false);
+      setOllamaRunning(false);
+      setInstalledModels([]);
+      return;
+    }
+
+    try {
+      const m = await ipc.ollamaListModels();
+      setInstalledModels(m.map((x) => x.name));
+      setError(null);
+    } catch (e) {
+      setError(extractErrorMessage(e));
+      setInstalledModels([]);
     }
   };
 
@@ -390,27 +428,51 @@ function ModelsStep({
     });
   };
 
+  const fallbackForPurpose = (purpose: ModelRecommendation["purpose"]) =>
+    recs
+      .filter((r) => r.purpose === purpose)
+      .sort((a, b) => Number(b.recommended) - Number(a.recommended))
+      .map((r) => resolveInstalledModelName(r.id, installedModels))
+      .find(Boolean) ?? "";
+
+  const firstInstalledChatModel = () =>
+    installedModels.find((name) => !/embed/i.test(name)) ?? "";
+
   const apply = () => {
-    for (const r of recs) {
-      if (!installed.has(r.id)) continue;
-      if (r.purpose === "chat") {
-        setChatModel(r.id);
-        setAgentModel(r.id);
-      }
-      if (r.purpose === "fim") setFimModel(r.id);
-      if (r.purpose === "embed") setEmbedModel(r.id);
+    const chatFallback = fallbackForPurpose("chat") || firstInstalledChatModel();
+    if (!isModelInInstalledList(chatModel, installedModels) && chatFallback) {
+      setChatModel(chatFallback);
+    }
+    if (!isModelInInstalledList(agentModel, installedModels) && chatFallback) {
+      setAgentModel(chatFallback);
+    }
+
+    const fimFallback = fallbackForPurpose("fim");
+    if (!isModelInInstalledList(fimModel, installedModels) && fimFallback) {
+      setFimModel(fimFallback);
+    }
+
+    const embedFallback = fallbackForPurpose("embed");
+    if (!isModelInInstalledList(embedModel, installedModels) && embedFallback) {
+      setEmbedModel(embedFallback);
     }
     onNext();
   };
 
-  const anyInstalled = installed.size > 0;
+  const anyInstalled = installedModels.length > 0;
   const canProceed = ollamaRunning === true && anyInstalled;
+  const assignments = [
+    { label: "Chat", model: chatModel },
+    { label: "Agent", model: agentModel },
+    { label: "Tab completion", model: fimModel },
+    { label: "Codebase indexing", model: embedModel },
+  ];
 
   return (
     <div className="space-y-3">
       <div className="flex items-center gap-3">
         <Download size={20} className="text-noir-accent" />
-        <h3 className="font-sans text-[16px] text-noir-text">Choose your models</h3>
+        <h3 className="font-sans text-[16px] text-noir-text">Review your models</h3>
       </div>
       {ramGb !== null && (
         <p className="font-sans text-[12px] text-noir-subtext">
@@ -433,9 +495,53 @@ function ModelsStep({
           <AlertCircle size={11} className="mt-0.5 shrink-0" /> <span>{error}</span>
         </div>
       )}
+      <div className="rounded-lg border border-noir-line bg-noir-canvas/40 p-3 space-y-2">
+        <div className="flex items-center justify-between gap-3">
+          <span className="font-sans text-[11px] uppercase tracking-[0.16em] text-noir-mute">
+            Current setup
+          </span>
+          <span className="font-sans text-[11px] text-noir-subtext">
+            {installedModels.length === 0
+              ? "No local models detected"
+              : `${installedModels.length} local model${installedModels.length === 1 ? "" : "s"}`}
+          </span>
+        </div>
+        <div className="grid grid-cols-2 gap-2">
+          {assignments.map((a) => {
+            const installedName = resolveInstalledModelName(a.model, installedModels);
+            return (
+              <div
+                key={a.label}
+                className="rounded-md bg-noir-chrome/55 px-2.5 py-2"
+              >
+                <div className="font-sans text-[10px] uppercase tracking-[0.12em] text-noir-mute">
+                  {a.label}
+                </div>
+                <div className="mt-1 truncate font-mono text-[11px] text-noir-text">
+                  {a.model || "Not selected"}
+                </div>
+                <div
+                  className={`mt-1 font-sans text-[10px] ${
+                    installedName ? "text-noir-ok" : "text-noir-warn"
+                  }`}
+                >
+                  {installedName
+                    ? installedName === a.model
+                      ? "Installed"
+                      : `Installed as ${installedName}`
+                    : a.model
+                      ? "Not installed"
+                      : "Needs a model"}
+                </div>
+              </div>
+            );
+          })}
+        </div>
+      </div>
       <div className="space-y-2 max-h-[280px] overflow-y-auto">
         {recs.map((r) => {
-          const isInstalled = installed.has(r.id);
+          const installedName = resolveInstalledModelName(r.id, installedModels);
+          const isInstalled = !!installedName;
           const p = activePulls[r.id];
           return (
             <div
@@ -504,7 +610,7 @@ function ModelsStep({
       <div className="flex items-center justify-between">
         <div className="text-[11px] font-sans text-noir-mute">
           {canProceed
-            ? `${installed.size} model${installed.size === 1 ? "" : "s"} installed`
+            ? `${installedModels.length} model${installedModels.length === 1 ? "" : "s"} installed`
             : "Pull at least one model to continue, or skip for now."}
         </div>
         <button
@@ -512,7 +618,7 @@ function ModelsStep({
           disabled={!canProceed}
           className="pn-button-accent font-sans flex items-center gap-1.5 disabled:opacity-40"
         >
-          Use selected <ChevronRight size={12} />
+          Use current setup <ChevronRight size={12} />
         </button>
       </div>
     </div>
@@ -522,12 +628,9 @@ function ModelsStep({
 function Done({ onClose }: { onClose: () => void }) {
   return (
     <div className="space-y-4 text-center pt-8">
-      <img
-        src="/brand/pointer-mark.png"
-        alt=""
-        draggable={false}
-        className="pn-brand-mark mx-auto h-12 w-12 rounded-lg object-cover"
-        aria-hidden="true"
+      <PointerMarkSvg
+        decorative
+        className="pn-brand-mark mx-auto h-12 w-12 rounded-lg"
       />
       <h2 className="font-sans text-[18px] text-noir-text">You&apos;re set.</h2>
       <p className="font-sans text-[12.5px] text-noir-subtext leading-relaxed max-w-md mx-auto">

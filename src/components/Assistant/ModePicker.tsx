@@ -11,7 +11,7 @@
  * doesn't have to guess (the difference between Plan and Agent
  * is non-obvious otherwise).
  */
-import { Bot, ClipboardList, MessageSquare } from "lucide-react";
+import { Bot, ClipboardList, MessageSquare } from "@/lib/lucide";
 import type { AssistantMode } from "@/store/assistant";
 
 const OPTIONS: Array<{

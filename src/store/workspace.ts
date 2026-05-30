@@ -1,4 +1,4 @@
-import { create } from "zustand";
+import { create } from "@/lib/signalStore";
 import { open } from "@tauri-apps/plugin-dialog";
 import { ipc, type FsEntry } from "@/lib/ipc";
 import { useSession } from "@/store/session";

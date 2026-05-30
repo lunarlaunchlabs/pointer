@@ -1,12 +1,13 @@
 import { Command } from "cmdk";
-import { useEffect, useState } from "react";
+import { useEffect, useState } from "@/lib/preactSignalCompat";
 import { useWorkspace } from "@/store/workspace";
 import { useEditorStore } from "@/store/editor";
 import { useSettings } from "@/store/settings";
 import { useSession } from "@/store/session";
 import { dispatchAction } from "@/lib/actions";
 import { usePaletteRecents } from "@/store/paletteRecents";
-import { Clock } from "lucide-react";
+import { POINTER_THEMES, themeActionId } from "@/theme/themes";
+import { Clock } from "@/lib/lucide";
 
 export function CommandPalette({
   onClose,
@@ -29,6 +30,8 @@ export function CommandPalette({
   const saveAll = useEditorStore((s) => s.saveAll);
   const fimEnabled = useSettings((s) => s.fimEnabled);
   const setFimEnabled = useSettings((s) => s.setFimEnabled);
+  const fimTriggerMode = useSettings((s) => s.fimTriggerMode);
+  const setFimTriggerMode = useSettings((s) => s.setFimTriggerMode);
   const treeCollapsed = useSession((s) => s.treeCollapsed);
   const noteTreeCollapsed = useSession((s) => s.noteTreeCollapsed);
   const recents = usePaletteRecents((s) => s.recents);
@@ -606,6 +609,17 @@ export function CommandPalette({
                   run("shortcuts", () => dispatchAction("help:shortcuts"))
                 }
               />
+              {POINTER_THEMES.map((theme) => (
+                <Item
+                  key={theme.id}
+                  label={`Theme: ${theme.menuLabel}`}
+                  onSelect={() =>
+                    run(`theme-${theme.id}`, () =>
+                      dispatchAction(themeActionId(theme.id)),
+                    )
+                  }
+                />
+              ))}
             </Command.Group>
 
             <Command.Group heading="AI" className="text-noir-mute">
@@ -653,6 +667,23 @@ export function CommandPalette({
                 label={`Tab Completion: ${fimEnabled ? "On" : "Off"}`}
                 onSelect={() =>
                   run("tab", () => setFimEnabled(!fimEnabled))
+                }
+              />
+              <Item
+                label="Request Tab Completion"
+                shortcut="⌘⇧Space"
+                onSelect={() =>
+                  run("request-tab", () => dispatchAction("ai:request_fim"))
+                }
+              />
+              <Item
+                label={`Tab Completion Mode: ${fimTriggerMode === "automatic" ? "Automatic" : "Manual"}`}
+                onSelect={() =>
+                  run("tab-mode", () =>
+                    setFimTriggerMode(
+                      fimTriggerMode === "automatic" ? "manual" : "automatic",
+                    ),
+                  )
                 }
               />
               {root && (

@@ -1,4 +1,4 @@
-import { useMemo, useState } from "react";
+import { useMemo, useState } from "@/lib/preactSignalCompat";
 import {
   AlertTriangle,
   Check,
@@ -10,7 +10,7 @@ import {
   Search as SearchIcon,
   ShieldAlert,
   X,
-} from "lucide-react";
+} from "@/lib/lucide";
 import type { HardwareProfile } from "@/lib/ipc";
 import type { AiFeature } from "@/store/settings";
 import { CATALOG, type CatalogEntry } from "@/lib/modelCatalog";
@@ -22,6 +22,9 @@ import {
   type MarketplaceFilters,
   type MarketplaceRow,
 } from "@/lib/marketplace";
+
+const INITIAL_VISIBLE_ROWS = 80;
+const VISIBLE_ROWS_STEP = 80;
 
 /**
  * Inline model marketplace.
@@ -67,6 +70,7 @@ export function Marketplace({
     hideInstalled: false,
     sort: "best",
   });
+  const [visibleLimit, setVisibleLimit] = useState(INITIAL_VISIBLE_ROWS);
 
   const hardwareLike: HardwareLike | null = useMemo(() => {
     if (!hardware) return null;
@@ -89,6 +93,11 @@ export function Marketplace({
       }),
     [catalog, filters, hardwareLike, installedModelIds],
   );
+  const visibleRows = useMemo(
+    () => rows.slice(0, visibleLimit),
+    [rows, visibleLimit],
+  );
+  const hiddenRowCount = Math.max(0, rows.length - visibleRows.length);
 
   // Live tally for the "X of Y" subtitle in the header.
   const total = useMemo(
@@ -220,7 +229,12 @@ export function Marketplace({
           onChange={(v) => setFilters((f) => ({ ...f, hideInstalled: v }))}
           label="Hide installed"
         />
-        <div className="ml-auto" role="status" aria-live="polite" aria-label={`${rows.length} of ${total} models shown`}>
+        <div
+          className="ml-auto"
+          role="status"
+          aria-live="polite"
+          aria-label={`${rows.length} matching models, ${visibleRows.length} rendered, ${total} in scope`}
+        >
           <span className="text-noir-subtext">{rows.length}</span> of {total}
         </div>
       </div>
@@ -242,17 +256,33 @@ export function Marketplace({
               : "No models match the current filters."}
           </div>
         ) : (
-          rows.map((row) => (
-            <ModelCard
-              key={row.entry.id}
-              row={row}
-              ollamaRunning={ollamaRunning}
-              pulling={!!activePulls[row.entry.id]}
-              pullProgress={activePulls[row.entry.id]?.pct}
-              pullError={activePulls[row.entry.id]?.error ?? null}
-              onPull={onPull}
-            />
-          ))
+          <>
+            {visibleRows.map((row) => (
+              <ModelCard
+                key={row.entry.id}
+                row={row}
+                ollamaRunning={ollamaRunning}
+                pulling={!!activePulls[row.entry.id]}
+                pullProgress={activePulls[row.entry.id]?.pct}
+                pullError={activePulls[row.entry.id]?.error ?? null}
+                onPull={onPull}
+              />
+            ))}
+            {hiddenRowCount > 0 && (
+              <div className="px-3 py-2 bg-noir-canvas/35">
+                <button
+                  type="button"
+                  onClick={() =>
+                    setVisibleLimit((n) => Math.min(rows.length, n + VISIBLE_ROWS_STEP))
+                  }
+                  className="pn-button w-full justify-center font-sans text-[11px]"
+                  aria-label={`Show ${Math.min(VISIBLE_ROWS_STEP, hiddenRowCount)} more models`}
+                >
+                  Show {Math.min(VISIBLE_ROWS_STEP, hiddenRowCount)} more
+                </button>
+              </div>
+            )}
+          </>
         )}
       </div>
     </div>

@@ -14,7 +14,7 @@
  *     level lets us hide the view without unmounting the xterm instance.
  */
 
-import { create } from "zustand";
+import { create } from "@/lib/signalStore";
 
 export type TerminalTab = {
   id: string;

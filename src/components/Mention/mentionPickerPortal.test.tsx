@@ -14,7 +14,7 @@
  * overflow-hidden / backdrop-blur wrapper), and pass after.
  */
 
-import { useRef } from "react";
+import { useRef } from "@/lib/preactSignalCompat";
 import { describe, expect, it } from "vitest";
 import { render, screen } from "@testing-library/react";
 import { MentionPicker } from "./MentionPicker";

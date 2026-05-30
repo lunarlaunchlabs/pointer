@@ -1,4 +1,4 @@
-import { create } from "zustand";
+import { create } from "@/lib/signalStore";
 
 /**
  * Editor navigation history — the "back" / "forward" arrows users

@@ -1,27 +1,16 @@
-//! Language-aware format-on-save.
+//! Repo-aware format-on-save.
 //!
-//! Rather than bundle every formatter (impractical: 100MB+ for the
-//! common set), we shell out to whatever is already on the user's
-//! PATH. Each formatter is identified by extension and runs as a
-//! pipe: stdin in, formatted source out, never touching the file
-//! on disk. The frontend writes the result back through the
-//! existing `write_text_file` command so dirty/clean state stays
-//! consistent.
+//! Pointer does not bundle every formatter. Instead, it shells out to
+//! repo-local tools first (`node_modules/.bin`, virtualenvs, vendor bins)
+//! and lets those tools discover their own checked-in configuration:
+//! `.prettierrc`, `biome.json`, `ruff.toml`, `pyproject.toml`,
+//! `.clang-format`, `rustfmt.toml`, `.stylua.toml`, etc.
 //!
-//! Languages currently supported (when the binary is on PATH):
-//!   • JS/TS/TSX/CSS/JSON/HTML/Markdown: prettier
-//!   • Rust: rustfmt
-//!   • Go: gofmt
-//!   • Python: black (preferred), ruff format (fallback)
-//!   • Shell: shfmt
-//!   • Lua: stylua
-//!   • Ruby: rufo
-//!   • YAML: prettier (treats it natively)
-//!   • TOML: taplo fmt -
-//!
-//! Anything not in the table returns `formatted: false` with no
-//! error — the caller falls back to the cheap "trim trailing
-//! whitespace" pass we already ship.
+//! The selection rule is intentionally conservative:
+//!   1. If a nearby repo config clearly names a formatter family, try that.
+//!   2. Prefer tools that support stdin/stdout so unsaved buffers can format.
+//!   3. Fall back to language-standard formatters where safe.
+//!   4. Never mutate the file directly; frontend writes the returned content.
 
 use crate::error::AppResult;
 use serde::{Deserialize, Serialize};
@@ -43,36 +32,16 @@ pub struct FormatResult {
 
 #[tauri::command]
 pub async fn format_text(path: String, content: String) -> AppResult<FormatResult> {
-    // Resolve which formatter to use from the extension. Returns
-    // None for files we don't know — the frontend then keeps the
-    // minimal whitespace pass.
-    let ext = Path::new(&path)
+    let source_path = Path::new(&path);
+    let ext = source_path
         .extension()
         .and_then(|s| s.to_str())
         .unwrap_or("")
         .to_ascii_lowercase();
-
-    let candidates: Vec<FormatterCmd> = match ext.as_str() {
-        // Prettier handles a huge chunk of the JS/Web/Data ecosystem.
-        "js" | "jsx" | "ts" | "tsx" | "mjs" | "cjs" | "css" | "scss" | "less" | "json"
-        | "jsonc" | "html" | "htm" | "md" | "mdx" | "yaml" | "yml" | "vue" | "svelte" => {
-            vec![FormatterCmd::new("prettier", &["--stdin-filepath", &path])]
-        }
-        "rs" => vec![FormatterCmd::new(
-            "rustfmt",
-            &["--emit", "stdout", "--edition", "2021"],
-        )],
-        "go" => vec![FormatterCmd::new("gofmt", &[])],
-        "py" => vec![
-            FormatterCmd::new("black", &["--quiet", "-"]),
-            FormatterCmd::new("ruff", &["format", "-"]),
-        ],
-        "sh" | "bash" | "zsh" => vec![FormatterCmd::new("shfmt", &["-i", "2"])],
-        "lua" => vec![FormatterCmd::new("stylua", &["-"])],
-        "rb" => vec![FormatterCmd::new("rufo", &["-x"])],
-        "toml" => vec![FormatterCmd::new("taplo", &["fmt", "-"])],
-        _ => return Ok(FormatResult::skipped()),
-    };
+    let candidates = formatter_candidates(source_path, &ext);
+    if candidates.is_empty() {
+        return Ok(FormatResult::skipped());
+    }
 
     let mut last_err: Option<String> = None;
     for cmd in &candidates {
@@ -81,7 +50,7 @@ pub async fn format_text(path: String, content: String) -> AppResult<FormatResul
                 return Ok(FormatResult {
                     content: out,
                     formatted: true,
-                    formatter: cmd.bin.to_string(),
+                    formatter: cmd.label(),
                     error: None,
                 });
             }
@@ -108,6 +77,7 @@ pub async fn format_text(path: String, content: String) -> AppResult<FormatResul
 struct FormatterCmd {
     bin: &'static str,
     args: Vec<String>,
+    cwd: Option<PathBuf>,
 }
 
 impl FormatterCmd {
@@ -115,8 +85,133 @@ impl FormatterCmd {
         Self {
             bin,
             args: args.iter().map(|s| s.to_string()).collect(),
+            cwd: None,
         }
     }
+
+    fn in_dir(mut self, cwd: Option<PathBuf>) -> Self {
+        self.cwd = cwd;
+        self
+    }
+
+    fn with_args(bin: &'static str, args: Vec<String>, cwd: Option<PathBuf>) -> Self {
+        Self { bin, args, cwd }
+    }
+
+    fn label(&self) -> String {
+        self.bin.to_string()
+    }
+}
+
+fn formatter_candidates(source_path: &Path, ext: &str) -> Vec<FormatterCmd> {
+    let cwd = formatter_cwd(source_path);
+    let path = source_path.display().to_string();
+    let mut out = Vec::new();
+
+    if is_webish(ext) {
+        if has_config(source_path, &["biome.json", "biome.jsonc"])
+            || package_mentions(source_path, &["@biomejs/biome", "biome"])
+        {
+            out.push(FormatterCmd::with_args(
+                "biome",
+                vec!["format".into(), "--stdin-file-path".into(), path.clone()],
+                cwd.clone(),
+            ));
+        }
+        if has_config(source_path, &["dprint.json", "dprint.jsonc"])
+            || package_mentions(source_path, &["dprint"])
+        {
+            out.push(FormatterCmd::with_args(
+                "dprint",
+                vec!["fmt".into(), "--stdin".into(), path.clone()],
+                cwd.clone(),
+            ));
+        }
+        // Keep Prettier as the broad web/data fallback even when a
+        // stricter configured formatter is preferred above. If Biome
+        // or dprint isn't installed locally, a repo that still has
+        // Prettier available should not lose format-on-save entirely.
+        out.push(FormatterCmd::with_args(
+            "prettier",
+            vec!["--stdin-filepath".into(), path.clone()],
+            cwd.clone(),
+        ));
+        return out;
+    }
+
+    match ext {
+        "rs" => {
+            out.push(FormatterCmd::new("rustfmt", &["--emit", "stdout"]).in_dir(cwd));
+        }
+        "go" => {
+            out.push(FormatterCmd::new("gofmt", &[]).in_dir(cwd));
+        }
+        "py" | "pyi" => {
+            if has_ruff_signal(source_path) {
+                out.push(FormatterCmd::with_args(
+                    "ruff",
+                    vec!["format".into(), "--stdin-filename".into(), path.clone(), "-".into()],
+                    cwd.clone(),
+                ));
+            }
+            out.push(FormatterCmd::with_args(
+                "black",
+                vec!["--quiet".into(), "--stdin-filename".into(), path.clone(), "-".into()],
+                cwd.clone(),
+            ));
+            if !has_ruff_signal(source_path) {
+                out.push(FormatterCmd::with_args(
+                    "ruff",
+                    vec!["format".into(), "--stdin-filename".into(), path.clone(), "-".into()],
+                    cwd.clone(),
+                ));
+            }
+            out.push(FormatterCmd::with_args(
+                "yapf",
+                vec!["--filename".into(), path.clone()],
+                cwd.clone(),
+            ));
+        }
+        "sh" | "bash" | "zsh" | "ksh" => {
+            out.push(FormatterCmd::with_args(
+                "shfmt",
+                vec!["--filename".into(), path.clone()],
+                cwd.clone(),
+            ));
+            out.push(FormatterCmd::new("shfmt", &["-i", "2"]).in_dir(cwd));
+        }
+        "lua" => {
+            out.push(FormatterCmd::with_args(
+                "stylua",
+                vec!["--stdin-filepath".into(), path.clone(), "-".into()],
+                cwd.clone(),
+            ));
+        }
+        "rb" => {
+            out.push(FormatterCmd::new("rufo", &["-x"]).in_dir(cwd.clone()));
+            out.push(FormatterCmd::new("standardrb", &["--fix", "--stdin"]).in_dir(cwd));
+        }
+        "toml" => {
+            out.push(FormatterCmd::new("taplo", &["fmt", "-"]).in_dir(cwd));
+        }
+        "tf" | "tfvars" => {
+            out.push(FormatterCmd::new("terraform", &["fmt", "-"]).in_dir(cwd));
+        }
+        "nix" => {
+            out.push(FormatterCmd::new("nixfmt", &[]).in_dir(cwd.clone()));
+            out.push(FormatterCmd::new("alejandra", &["-q"]).in_dir(cwd));
+        }
+        _ if is_clang_format_family(ext) => {
+            out.push(FormatterCmd::with_args(
+                "clang-format",
+                vec![format!("--assume-filename={path}")],
+                cwd,
+            ));
+        }
+        _ => {}
+    }
+
+    out
 }
 
 /// Run a formatter, piping `content` to stdin and reading the
@@ -131,6 +226,9 @@ fn run_formatter(
 ) -> Result<Option<String>, String> {
     let mut child = match Command::new(cmd.bin)
         .args(&cmd.args)
+        .current_dir(cmd.cwd.as_deref().unwrap_or_else(|| {
+            source_path.parent().unwrap_or_else(|| Path::new("."))
+        }))
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -169,6 +267,134 @@ fn run_formatter(
         ));
     }
     Ok(Some(String::from_utf8_lossy(&output.stdout).into_owned()))
+}
+
+fn is_webish(ext: &str) -> bool {
+    matches!(
+        ext,
+        "js" | "jsx"
+            | "ts"
+            | "tsx"
+            | "mts"
+            | "cts"
+            | "mjs"
+            | "cjs"
+            | "css"
+            | "scss"
+            | "sass"
+            | "less"
+            | "json"
+            | "jsonc"
+            | "json5"
+            | "html"
+            | "htm"
+            | "md"
+            | "mdx"
+            | "yaml"
+            | "yml"
+            | "vue"
+            | "svelte"
+            | "astro"
+            | "graphql"
+            | "gql"
+    )
+}
+
+fn is_clang_format_family(ext: &str) -> bool {
+    matches!(
+        ext,
+        "c" | "h"
+            | "cc"
+            | "cpp"
+            | "cxx"
+            | "hh"
+            | "hpp"
+            | "hxx"
+            | "m"
+            | "mm"
+            | "java"
+            | "proto"
+            | "cs"
+            | "glsl"
+            | "vert"
+            | "frag"
+            | "metal"
+    )
+}
+
+fn has_ruff_signal(source_path: &Path) -> bool {
+    has_config(source_path, &["ruff.toml", ".ruff.toml"])
+        || package_mentions(source_path, &["ruff"])
+        || ancestor_files(source_path)
+            .into_iter()
+            .any(|dir| dir.join("pyproject.toml").read_to_string_lossy().contains("[tool.ruff"))
+}
+
+fn has_config(source_path: &Path, names: &[&str]) -> bool {
+    ancestor_files(source_path)
+        .into_iter()
+        .any(|dir| names.iter().any(|name| dir.join(name).is_file()))
+}
+
+fn package_mentions(source_path: &Path, packages: &[&str]) -> bool {
+    ancestor_files(source_path).into_iter().any(|dir| {
+        let package = dir.join("package.json").read_to_string_lossy();
+        !package.is_empty()
+            && packages
+                .iter()
+                .any(|name| package.contains(&format!("\"{name}\"")))
+    })
+}
+
+fn formatter_cwd(source_path: &Path) -> Option<PathBuf> {
+    let markers = [
+        ".git",
+        "package.json",
+        "deno.json",
+        "deno.jsonc",
+        "biome.json",
+        "dprint.json",
+        "Cargo.toml",
+        "go.mod",
+        "pyproject.toml",
+        "ruff.toml",
+        ".clang-format",
+        "rustfmt.toml",
+        ".stylua.toml",
+    ];
+    ancestor_files(source_path)
+        .into_iter()
+        .find(|dir| markers.iter().any(|marker| dir.join(marker).exists()))
+        .or_else(|| source_path.parent().map(Path::to_path_buf))
+}
+
+fn ancestor_files(source_path: &Path) -> Vec<PathBuf> {
+    let mut dirs = Vec::new();
+    let mut dir = if source_path.is_dir() {
+        source_path.to_path_buf()
+    } else {
+        source_path
+            .parent()
+            .unwrap_or_else(|| Path::new(""))
+            .to_path_buf()
+    };
+    for _ in 0..24 {
+        dirs.push(dir.clone());
+        if !dir.pop() {
+            break;
+        }
+    }
+    dirs
+}
+
+trait ReadLossy {
+    fn read_to_string_lossy(&self) -> String;
+}
+
+impl ReadLossy for PathBuf {
+    fn read_to_string_lossy(&self) -> String {
+        std::fs::read_to_string(self).unwrap_or_default()
+    }
 }
 
 /// Build a PATH that includes the common locations user-installed
@@ -271,5 +497,38 @@ mod tests {
         std::fs::create_dir_all(&bin).unwrap();
         let path = augmented_path(&nested.join("module.py"));
         assert!(path.split(':').any(|p| p == bin.display().to_string()));
+    }
+
+    #[test]
+    fn formatter_candidates_prefer_biome_when_configured() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("biome.json"), "{}").unwrap();
+        let file = dir.path().join("src/app.ts");
+        std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+        let candidates = formatter_candidates(&file, "ts");
+        assert_eq!(candidates.first().map(|c| c.bin), Some("biome"));
+        assert!(candidates.iter().any(|c| c.bin == "prettier"));
+    }
+
+    #[test]
+    fn formatter_candidates_use_ruff_before_black_when_configured() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("ruff.toml"), "line-length = 100").unwrap();
+        let file = dir.path().join("pkg/module.py");
+        std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+        let candidates = formatter_candidates(&file, "py");
+        assert_eq!(candidates.first().map(|c| c.bin), Some("ruff"));
+        assert!(candidates.iter().any(|c| c.bin == "black"));
+    }
+
+    #[test]
+    fn formatter_candidates_use_clang_format_for_c_family() {
+        let file = PathBuf::from("/repo/src/main.cpp");
+        let candidates = formatter_candidates(&file, "cpp");
+        assert_eq!(candidates.first().map(|c| c.bin), Some("clang-format"));
+        assert!(candidates[0]
+            .args
+            .iter()
+            .any(|arg| arg.starts_with("--assume-filename=")));
     }
 }

@@ -18,6 +18,8 @@ import {
   isFeatureUsable,
   isModelInstalled,
   effectiveAssignedModel,
+  resolveInstalledModelName,
+  runnableModelForFeature,
   type AiFeature,
 } from "./settings";
 
@@ -76,6 +78,15 @@ describe("featureCapability", () => {
     const s = stub({ chatModel: "qwen3:30b" });
     expect(featureCapability("chat", s)).toBe("model_missing");
     expect(featureBlockReason("chat", s)).toMatch(/qwen3:30b/);
+  });
+
+  it("treats an untagged configured model as installed when Ollama reports :latest", () => {
+    const s = stub({
+      chatModel: "qwen3",
+      installedModels: ["qwen3:latest"],
+    });
+    expect(featureCapability("chat", s)).toBe("on");
+    expect(isFeatureUsable("chat", s)).toBe(true);
   });
 
   // Vision / document have no toggle — they're enabled implicitly when
@@ -151,6 +162,14 @@ describe("isModelInstalled", () => {
     ).toBe(true);
   });
 
+  it("returns true when the configured model omits Ollama's :latest tag", () => {
+    const s = stub({
+      chatModel: "nomic-embed-text",
+      installedModels: ["nomic-embed-text:latest"],
+    });
+    expect(isModelInstalled("nomic-embed-text", s)).toBe(true);
+  });
+
   it("returns false when Ollama is offline (we can't verify)", () => {
     // Even if the install list happens to still contain the name, we
     // can't know if the daemon would actually serve it — treating this
@@ -216,6 +235,31 @@ describe("effectiveAssignedModel", () => {
     expect(effectiveAssignedModel("indexing", base)).toBe("embed:1b");
     expect(effectiveAssignedModel("vision", base)).toBe("vision:1b");
     expect(effectiveAssignedModel("document", base)).toBe("doc:1b");
+  });
+});
+
+describe("resolveInstalledModelName / runnableModelForFeature", () => {
+  it("returns the exact installed model name for a :latest alias", () => {
+    expect(
+      resolveInstalledModelName("nomic-embed-text", [
+        "nomic-embed-text:latest",
+      ]),
+    ).toBe("nomic-embed-text:latest");
+  });
+
+  it("returns an empty string for a missing model", () => {
+    expect(resolveInstalledModelName("missing:1b", ["chat:1b"])).toBe("");
+  });
+
+  it("returns the runnable installed name only when the feature is usable", () => {
+    const usable = stub({
+      chatModel: "qwen3",
+      installedModels: ["qwen3:latest"],
+    });
+    expect(runnableModelForFeature("chat", usable)).toBe("qwen3:latest");
+
+    const missing = stub({ chatModel: "qwen3", installedModels: ["other:1b"] });
+    expect(runnableModelForFeature("chat", missing)).toBe("");
   });
 });
 

@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "@/lib/preactSignalCompat";
 import {
   ArrowDownToLine,
   ArrowUpToLine,
@@ -21,7 +21,7 @@ import {
   Trash2,
   Undo2,
   X,
-} from "lucide-react";
+} from "@/lib/lucide";
 import { useGit, gitStatusColor, gitStatusLetter } from "@/store/git";
 import { useWorkspace } from "@/store/workspace";
 import { useEditorStore } from "@/store/editor";
@@ -38,7 +38,6 @@ import {
 import { languageFromPath } from "@/lib/lang";
 import {
   buildCommitMessagePrompt,
-  buildChangeConsolidationPrompt,
   buildDiffChunkSummaryPrompt,
   buildFileConsolidationPrompt,
   changedFilesForCommit,
@@ -57,8 +56,9 @@ import {
   type CommitGenerationMemory,
 } from "@/lib/gitWorkflow";
 import { GitCommitHarness, type CommitFileCandidate } from "@/lib/gitCommitHarness";
-import { isFeatureUsable, useSettings } from "@/store/settings";
+import { isFeatureUsable, runnableModelForFeature, useSettings } from "@/store/settings";
 import { useModelWorkflows } from "@/store/modelWorkflows";
+import { useSourceControl } from "@/store/sourceControl";
 import { toast } from "@/components/Toast";
 import { confirm } from "@/components/Confirm";
 
@@ -83,7 +83,9 @@ export function SourceControlPanel() {
   const refresh = useGit((s) => s.refresh);
   const openFile = useEditorStore((s) => s.openFile);
   const showDiff = useDiffViewer((s) => s.show);
-  const chatModel = useSettings((s) => s.chatModel);
+  const chatModel = useSettings(
+    (s) => runnableModelForFeature("chat", s) || s.chatModel,
+  );
   const chatUsable = useSettings((s) => isFeatureUsable("chat", s));
   const activeCommitWorkflow = useModelWorkflows((s) =>
     s.workflows.find((workflow) => workflow.kind === "git_commit"),
@@ -142,20 +144,23 @@ export function SourceControlPanel() {
     }
   };
 
-  const [commitMessage, setCommitMessage] = useState("");
-  const [output, setOutput] = useState<{ kind: "info" | "error"; body: string } | null>(
-    null,
-  );
+  const commitMessage = useSourceControl((s) => s.commitMessage);
+  const setCommitMessage = useSourceControl((s) => s.setCommitMessage);
+  const output = useSourceControl((s) => s.output);
+  const setOutput = useSourceControl((s) => s.setOutput);
+  const commitDraft = useSourceControl((s) => s.commitDraft);
+  const setCommitDraft = useSourceControl((s) => s.setCommitDraft);
+  const setSourceControlWorkspace = useSourceControl((s) => s.setWorkspaceRoot);
+  const resetComposer = useSourceControl((s) => s.resetComposer);
   const [busy, setBusy] = useState(false);
   const [activeCommand, setActiveCommand] = useState<string | null>(null);
-  const [commitGenerating, setCommitGenerating] = useState(false);
   const [commitNow, setCommitNow] = useState(Date.now());
-  const [commitDraft, setCommitDraft] = useState<CommitGenerationMemory | null>(null);
   const [showStaged, setShowStaged] = useState(true);
   const [showUnstaged, setShowUnstaged] = useState(true);
   const [branches, setBranches] = useState<GitBranchT[] | null>(null);
   const [branchOpen, setBranchOpen] = useState(false);
   const branchRef = useRef<HTMLDivElement | null>(null);
+  const commitGenerating = Boolean(activeCommitWorkflow);
 
   const staged = useMemo(
     () => status.entries.filter((e) => e.staged),
@@ -168,6 +173,10 @@ export function SourceControlPanel() {
   const commitElapsedMs = activeCommitWorkflow
     ? Math.max(0, commitNow - activeCommitWorkflow.startedAtMs)
     : 0;
+
+  useEffect(() => {
+    setSourceControlWorkspace(root ?? "");
+  }, [root, setSourceControlWorkspace]);
 
   useEffect(() => {
     if (!commitGenerating && !activeCommitWorkflow) return;
@@ -280,8 +289,7 @@ export function SourceControlPanel() {
       ipc.gitCommit(root, commitMessage),
     );
     if (committed) {
-      setCommitMessage("");
-      setCommitDraft(null);
+      resetComposer();
     }
   };
 
@@ -299,7 +307,6 @@ export function SourceControlPanel() {
       return;
     }
 
-    setCommitGenerating(true);
     const workflowId = newRequestId("git_commit_run");
     useModelWorkflows.getState().startWorkflow({
       id: workflowId,
@@ -396,21 +403,15 @@ export function SourceControlPanel() {
           const rawChunk = await runCommitModel(
             buildDiffChunkSummaryPrompt(chunk),
             `Summarize ${file.path} ${chunk.index}/${chunk.total}`,
-            72,
+            56,
             workflowId,
-          );
-          const chunkSummary = await maybeRetryShortSummary(
-            rawChunk,
-            `Compress ${file.path} ${chunk.index}/${chunk.total}`,
-            24,
-            1,
-            workflowId,
+            ["\n"],
           );
           chunkSummaries.push({
             index: chunk.index,
             lineRange: `${chunk.startLine}-${chunk.endLine}`,
             summary: normalizeChunkSummary(
-              chunkSummary,
+              rawChunk,
               file.path,
               file.status,
               chunkFallback,
@@ -437,18 +438,12 @@ export function SourceControlPanel() {
             : await runCommitModel(
                 buildFileConsolidationPrompt(file.path, chunkSummaries),
                 `Consolidate ${file.path}`,
-                96,
+                80,
                 workflowId,
+                ["\n"],
               );
-        const fileSummary = await maybeRetryShortSummary(
-          rawFileSummary,
-          `Shorten ${file.path}`,
-          35,
-          2,
-          workflowId,
-        );
         const normalizedFileSummary = normalizeFileSummary(
-          fileSummary,
+          rawFileSummary,
           file.path,
           file.status,
           fallback,
@@ -479,21 +474,8 @@ export function SourceControlPanel() {
           fallback,
         }),
       );
-      const rawConsolidated = await runCommitModel(
-        buildChangeConsolidationPrompt(summaries),
-        "Consolidate commit memory",
-        180,
-        workflowId,
-      );
-      const shortenedConsolidated = await maybeRetryShortSummary(
-        rawConsolidated,
-        "Shorten commit memory",
-        65,
-        3,
-        workflowId,
-      );
       const consolidatedSummary = normalizeChangeSummary(
-        shortenedConsolidated,
+        "",
         summaries,
       );
       const fileSummaryMemoryIds = harness.memory
@@ -511,7 +493,7 @@ export function SourceControlPanel() {
       const generated = await runCommitModel(
         buildCommitMessagePrompt(summaries, consolidatedSummary),
         "Draft commit message",
-        180,
+        160,
         workflowId,
       );
       const rawDraft = harness.rememberDraft(
@@ -571,7 +553,6 @@ export function SourceControlPanel() {
       toast.error("Commit generation failed", { body });
     } finally {
       useModelWorkflows.getState().finishWorkflow(workflowId);
-      setCommitGenerating(false);
     }
   };
 
@@ -594,6 +575,7 @@ export function SourceControlPanel() {
     title: string,
     numPredict: number,
     workflowId: string,
+    stop?: string[],
   ): Promise<string> => {
     assertCommitDraftNotCancelled(workflowId);
     const requestId = newRequestId("git_commit");
@@ -620,6 +602,8 @@ export function SourceControlPanel() {
           "You are Pointer's git assistant. Be concise, specific, and accurate. Never invent changes not shown in the diff.",
         temperature: 0.1,
         num_predict: numPredict,
+        stop,
+        think: false,
         purpose: "git_commit",
         title,
       });
@@ -639,30 +623,6 @@ export function SourceControlPanel() {
       off();
       useModelWorkflows.getState().detachRequest(workflowId, requestId);
     }
-  };
-
-  const maybeRetryShortSummary = async (
-    raw: string,
-    title: string,
-    maxWords: number,
-    maxSentences: number,
-    workflowId: string,
-  ): Promise<string> => {
-    if (sentenceCount(raw) <= maxSentences && wordCount(raw) <= maxWords + 6) {
-      return raw;
-    }
-    return runCommitModel(
-      [
-        "Compress this summary. Return only the compressed summary.",
-        `Use at most ${maxSentences} sentence${maxSentences === 1 ? "" : "s"} and ${maxWords} words.`,
-        "Do not add new facts, file paths, filenames, or changed symbols.",
-        "",
-        raw.trim(),
-      ].join("\n"),
-      title,
-      Math.max(48, Math.min(120, maxWords * 3)),
-      workflowId,
-    );
   };
 
   const cancelCommitGeneration = async () => {
@@ -1174,19 +1134,6 @@ function CommitDraftOption({
       </p>
     </section>
   );
-}
-
-function sentenceCount(text: string): number {
-  return (
-    text
-      .replace(/\s+/g, " ")
-      .trim()
-      .match(/[^.!?]+[.!?]+|[^.!?]+$/g)?.length ?? 0
-  );
-}
-
-function wordCount(text: string): number {
-  return text.split(/\s+/).filter(Boolean).length;
 }
 
 type GitCommandRunner = (

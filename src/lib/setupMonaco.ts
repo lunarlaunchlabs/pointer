@@ -22,12 +22,20 @@
 
 import type { Monaco } from "@monaco-editor/react";
 import { setupShikiMonaco } from "@/lib/shikiMonaco";
+import type { AppThemeId } from "@/theme/themes";
 
-let installed = false;
+const installedMonacos = new WeakSet<object>();
+const javascriptTypeScriptTokenRefreshMonacos = new WeakSet<object>();
+const JAVASCRIPT_TYPESCRIPT_TOKEN_LANGUAGES = ["javascript", "typescript"] as const;
+const JAVASCRIPT_TYPESCRIPT_TOKEN_REFRESH_DELAYS = [0, 50, 250, 1000, 2500] as const;
 
-export function setupMonaco(monaco: Monaco) {
-  if (installed) return;
-  installed = true;
+export function setupMonaco(
+  monaco: Monaco,
+  initialLanguage?: string | null,
+  themeId?: AppThemeId,
+) {
+  if (installedMonacos.has(monaco as object)) return;
+  installedMonacos.add(monaco as object);
 
   registerMdx(monaco);
   registerVue(monaco);
@@ -36,8 +44,246 @@ export function setupMonaco(monaco: Monaco) {
   registerPrisma(monaco);
   registerExtensionAliases(monaco);
   configureTypescript(monaco);
+  registerJavaScriptTypeScriptTokens(monaco);
+  scheduleJavaScriptTypeScriptTokenRefresh(monaco);
   configureJson(monaco);
-  void setupShikiMonaco(monaco);
+  void setupShikiMonaco(monaco, initialLanguage, themeId);
+}
+
+function registerJavaScriptTypeScriptTokens(monaco: Monaco) {
+  const language = javascriptTypeScriptMonarch() as any;
+  for (const id of JAVASCRIPT_TYPESCRIPT_TOKEN_LANGUAGES) {
+    monaco.languages.setMonarchTokensProvider(id, language);
+  }
+}
+
+function scheduleJavaScriptTypeScriptTokenRefresh(monaco: Monaco) {
+  if (javascriptTypeScriptTokenRefreshMonacos.has(monaco as object)) return;
+  if (typeof globalThis.setTimeout !== "function") return;
+  javascriptTypeScriptTokenRefreshMonacos.add(monaco as object);
+  for (const delay of JAVASCRIPT_TYPESCRIPT_TOKEN_REFRESH_DELAYS) {
+    globalThis.setTimeout(() => {
+      registerJavaScriptTypeScriptTokens(monaco);
+    }, delay);
+  }
+}
+
+export function javascriptTypeScriptMonarch() {
+  return {
+    defaultToken: "identifier",
+    tokenPostfix: ".ts",
+    keywords: [
+      "as",
+      "async",
+      "await",
+      "break",
+      "case",
+      "catch",
+      "class",
+      "const",
+      "continue",
+      "default",
+      "delete",
+      "do",
+      "else",
+      "enum",
+      "export",
+      "extends",
+      "false",
+      "finally",
+      "for",
+      "from",
+      "function",
+      "if",
+      "implements",
+      "import",
+      "in",
+      "instanceof",
+      "interface",
+      "let",
+      "new",
+      "null",
+      "of",
+      "package",
+      "private",
+      "protected",
+      "public",
+      "readonly",
+      "return",
+      "satisfies",
+      "static",
+      "super",
+      "switch",
+      "this",
+      "throw",
+      "true",
+      "try",
+      "type",
+      "typeof",
+      "undefined",
+      "var",
+      "void",
+      "while",
+      "with",
+      "yield",
+    ],
+    typeKeywords: [
+      "any",
+      "bigint",
+      "boolean",
+      "never",
+      "number",
+      "object",
+      "string",
+      "symbol",
+      "unknown",
+      "void",
+    ],
+    constants: ["NaN", "Infinity", "globalThis", "window", "document", "console"],
+    operators: [
+      "=>",
+      "===",
+      "!==",
+      "==",
+      "!=",
+      "<=",
+      ">=",
+      "&&",
+      "||",
+      "??",
+      "?.",
+      "+",
+      "-",
+      "*",
+      "/",
+      "%",
+      "=",
+      "!",
+      "<",
+      ">",
+      "&",
+      "|",
+      "^",
+      "~",
+      "?",
+      ":",
+    ],
+    symbols: /[=><!~?:&|+\-*\/\^%]+/,
+    escapes: /\\(?:[abfnrtv\\"'`]|x[0-9A-Fa-f]{2}|u\{?[0-9A-Fa-f]{4,6}\}?)/,
+    tokenizer: {
+      root: [
+        [/[{}()\[\]]/, "@brackets"],
+        [/\/\*/, { token: "comment", next: "@comment" }],
+        [/\/\/.*$/, "comment"],
+        [/<\/[A-Za-z_$][\w$.-]*\s*>/, "tag"],
+        [/<[A-Za-z_$][\w$.-]*/, { token: "tag", next: "@jsxTag" }],
+        [/[A-Z][\w$]*(?=\s*[({<])/, "type.identifier"],
+        [/[A-Za-z_$][\w$]*(?=\s*\()/, "function"],
+        [
+          /[A-Za-z_$][\w$]*/,
+          {
+            cases: {
+              "@keywords": "keyword",
+              "@typeKeywords": "type.identifier",
+              "@constants": "constant.language",
+              "@default": "identifier",
+            },
+          },
+        ],
+        [/[0-9]+(?:\.[0-9]+)?(?:[eE][\-+]?[0-9]+)?/, "number"],
+        [/`/, { token: "string", next: "@template" }],
+        [/"([^"\\]|\\.)*$/, "string.invalid"],
+        [/'([^'\\]|\\.)*$/, "string.invalid"],
+        [/"/, { token: "string", next: "@stringDouble" }],
+        [/'/, { token: "string", next: "@stringSingle" }],
+        [/@symbols/, { cases: { "@operators": "operator", "@default": "delimiter" } }],
+        [/[;,.]/, "delimiter"],
+      ],
+      jsxTag: [
+        [/\/>/, { token: "delimiter.angle", next: "@pop" }],
+        [/>/, { token: "delimiter.angle", switchTo: "@jsxText" }],
+        [/[A-Za-z_$][\w$.-]*(?=\s*=)/, "attribute.name"],
+        [/[A-Za-z_$][\w$.-]*/, "tag"],
+        [/=/, "operator"],
+        [/"[^"]*"/, "attribute.value"],
+        [/'[^']*'/, "attribute.value"],
+        [/`/, { token: "attribute.value", next: "@template" }],
+        [/\{/, { token: "delimiter.bracket", next: "@jsxExpression" }],
+      ],
+      jsxText: [
+        [/<\/[A-Za-z_$][\w$.-]*\s*>/, { token: "tag", next: "@pop" }],
+        [/<[A-Za-z_$][\w$.-]*/, { token: "tag", next: "@jsxTag" }],
+        [/\{/, { token: "delimiter.bracket", next: "@jsxExpression" }],
+        [/[^<{]+/, ""],
+        [/./, ""],
+      ],
+      jsxExpression: [
+        [/\}/, { token: "delimiter.bracket", next: "@pop" }],
+        [/<\/[A-Za-z_$][\w$.-]*\s*>/, "tag"],
+        [/<[A-Za-z_$][\w$.-]*/, { token: "tag", next: "@jsxTag" }],
+        [/[{}()\[\]]/, "@brackets"],
+        [/[A-Za-z_$][\w$]*(?=\s*\()/, "function"],
+        [
+          /[A-Za-z_$][\w$]*/,
+          {
+            cases: {
+              "@keywords": "keyword",
+              "@typeKeywords": "type.identifier",
+              "@constants": "constant.language",
+              "@default": "identifier",
+            },
+          },
+        ],
+        [/[0-9]+(?:\.[0-9]+)?/, "number"],
+        [/`/, { token: "string", next: "@template" }],
+        [/"([^"\\]|\\.)*"/, "string"],
+        [/'([^'\\]|\\.)*'/, "string"],
+        [/@symbols/, { cases: { "@operators": "operator", "@default": "delimiter" } }],
+        [/[;,.]/, "delimiter"],
+      ],
+      template: [
+        [/\$\{/, { token: "delimiter.bracket", next: "@templateExpression" }],
+        [/`/, { token: "string", next: "@pop" }],
+        [/\\./, "string.escape"],
+        [/[^`$\\]+/, "string"],
+      ],
+      templateExpression: [
+        [/\}/, { token: "delimiter.bracket", next: "@pop" }],
+        [/[A-Za-z_$][\w$]*(?=\s*\()/, "function"],
+        [
+          /[A-Za-z_$][\w$]*/,
+          {
+            cases: {
+              "@keywords": "keyword",
+              "@typeKeywords": "type.identifier",
+              "@constants": "constant.language",
+              "@default": "identifier",
+            },
+          },
+        ],
+        [/[0-9]+(?:\.[0-9]+)?/, "number"],
+        [/@symbols/, { cases: { "@operators": "operator", "@default": "delimiter" } }],
+        [/[;,.]/, "delimiter"],
+      ],
+      stringDouble: [
+        [/[^\\"]+/, "string"],
+        [/@escapes/, "string.escape"],
+        [/\\./, "string.escape.invalid"],
+        [/"/, { token: "string", next: "@pop" }],
+      ],
+      stringSingle: [
+        [/[^\\']+/, "string"],
+        [/@escapes/, "string.escape"],
+        [/\\./, "string.escape.invalid"],
+        [/'/, { token: "string", next: "@pop" }],
+      ],
+      comment: [
+        [/[^\/*]+/, "comment"],
+        [/\*\//, { token: "comment", next: "@pop" }],
+        [/[\/*]/, "comment"],
+      ],
+    },
+  };
 }
 
 function registerVue(monaco: Monaco) {
@@ -462,6 +708,8 @@ function configureTypescript(monaco: Monaco) {
   ts.typescriptDefaults.setDiagnosticsOptions({
     noSemanticValidation: false,
     noSyntaxValidation: false,
+    noSuggestionDiagnostics: true,
+    onlyVisible: true,
     // 2307 = Cannot find module 'x'. Useful, but very noisy when editing a
     // file that imports from a sibling we haven't told the worker about.
     diagnosticCodesToIgnore: [2307, 2792],
@@ -469,6 +717,8 @@ function configureTypescript(monaco: Monaco) {
   ts.javascriptDefaults.setDiagnosticsOptions({
     noSemanticValidation: false,
     noSyntaxValidation: false,
+    noSuggestionDiagnostics: true,
+    onlyVisible: true,
     diagnosticCodesToIgnore: [2307, 2792, 7016],
   });
 

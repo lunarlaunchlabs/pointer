@@ -85,7 +85,7 @@ export type ProcInfo = {
   parent_pid: number | null;
   name: string;
   cmd: string;
-  /** "pointer" | "renderer" | "ollama" | "ollama_runner" | "other" */
+  /** "pointer" | "renderer" | "language_server" | "dev_server" | "ollama" | "ollama_runner" | "other" */
   kind: string;
   cpu_percent: number;
   mem_bytes: number;
@@ -218,6 +218,16 @@ export type SystemSnapshot = {
   pointer_mem_bytes: number;
 };
 
+export type SystemLoadSnapshot = Pick<
+  SystemSnapshot,
+  | "cpu_percent"
+  | "cpu_count"
+  | "mem_total"
+  | "mem_used"
+  | "pointer_cpu_percent"
+  | "pointer_mem_bytes"
+>;
+
 export type HardwareProfile = {
   cpu_count: number;
   cpu_name: string | null;
@@ -315,6 +325,17 @@ export type LanguageServerStatus = {
   capabilities: string[];
 };
 
+export type StoppedLanguageServer = {
+  language: string;
+  label: string;
+};
+
+export type LspStopIdleRequest = {
+  workspace?: string;
+  stopAll: boolean;
+  languages?: string[];
+};
+
 export type LspRange = {
   startLine: number;
   startColumn: number;
@@ -361,6 +382,44 @@ export type LspDocumentSymbol = {
   children: LspDocumentSymbol[];
 };
 
+export type LspDocumentHighlight = {
+  range: LspRange;
+  kind: number | null;
+};
+
+export type LspParameterInformation = {
+  label: string;
+  documentation: string | null;
+};
+
+export type LspSignatureInformation = {
+  label: string;
+  documentation: string | null;
+  parameters: LspParameterInformation[];
+};
+
+export type LspSignatureHelp = {
+  signatures: LspSignatureInformation[];
+  activeSignature: number | null;
+  activeParameter: number | null;
+};
+
+export type LspInlayHint = {
+  label: string;
+  tooltip: string | null;
+  line: number;
+  column: number;
+  kind: number | null;
+  paddingLeft: boolean;
+  paddingRight: boolean;
+};
+
+export type LspFileTextEdit = {
+  path: string;
+  range: LspRange;
+  newText: string;
+};
+
 export type LspDiagnosticEvent = {
   uri: string;
   path: string;
@@ -382,6 +441,18 @@ export type LspDocumentRequest = {
 export type LspTextDocumentRequest = LspDocumentRequest & {
   line: number;
   column: number;
+  limit?: number;
+};
+
+export type LspRenameRequest = LspTextDocumentRequest & {
+  newName: string;
+};
+
+export type LspInlayHintsRequest = LspDocumentRequest & {
+  startLine: number;
+  startColumn: number;
+  endLine: number;
+  endColumn: number;
   limit?: number;
 };
 
@@ -473,6 +544,8 @@ export const ipc = {
   deletePath: (path: string) => invoke<void>("delete_path", { path }),
   renamePath: (from: string, to: string) =>
     invoke<void>("rename_path", { from, to }),
+  copyPath: (from: string, to: string) =>
+    invoke<void>("copy_path", { from, to }),
   searchFiles: (query: string, limit = 50) =>
     invoke<FileHit[]>("search_files", { query, limit }),
   searchDirectories: (query: string, limit = 50) =>
@@ -512,6 +585,8 @@ export const ipc = {
   projectCheckRun: () => invoke<ProjectCheckResult>("project_check_run"),
   lspStatus: (workspace?: string) =>
     invoke<LanguageServerStatus[]>("lsp_status", { workspace }),
+  lspStopIdle: (request: LspStopIdleRequest) =>
+    invoke<StoppedLanguageServer[]>("lsp_stop_idle", { request }),
   lspDidOpen: (doc: LspDocumentRequest) =>
     invoke<void>("lsp_did_open", { doc }),
   lspDidChange: (doc: LspDocumentRequest) =>
@@ -529,6 +604,14 @@ export const ipc = {
   ) => invoke<LspCompletionItem>("lsp_completion_resolve", { req }),
   lspDocumentSymbols: (doc: LspDocumentRequest) =>
     invoke<LspDocumentSymbol[]>("lsp_document_symbols", { doc }),
+  lspSignatureHelp: (req: LspTextDocumentRequest) =>
+    invoke<LspSignatureHelp | null>("lsp_signature_help", { req }),
+  lspDocumentHighlight: (req: LspTextDocumentRequest) =>
+    invoke<LspDocumentHighlight[]>("lsp_document_highlight", { req }),
+  lspInlayHints: (req: LspInlayHintsRequest) =>
+    invoke<LspInlayHint[]>("lsp_inlay_hints", { req }),
+  lspRename: (req: LspRenameRequest) =>
+    invoke<LspFileTextEdit[]>("lsp_rename", { req }),
 
   // Git — read-only status. Always returns a value; errors are encoded
   // inline so callers don't need to wrap every poll in try/catch.
@@ -645,6 +728,7 @@ export const ipc = {
       temperature?: number;
       num_predict?: number;
       raw?: boolean;
+      think?: boolean;
       purpose?: string;
       title?: string;
     },
@@ -848,6 +932,7 @@ export const ipc = {
 
   // System monitor
   systemSnapshot: () => invoke<SystemSnapshot>("system_snapshot"),
+  systemLoadSnapshot: () => invoke<SystemLoadSnapshot>("system_load_snapshot"),
   killOwnedProcess: (pid: number) =>
     invoke<boolean>("kill_owned_process", { pid }),
   hardwareProfile: () => invoke<HardwareProfile>("hardware_profile"),
@@ -862,6 +947,10 @@ export const ipc = {
   }) => invoke<ProcessFileResult>("process_file", { args }),
 
   // App state / factory reset
+  setAppIconTheme: (themeId: string) =>
+    invoke<void>("set_app_icon_theme", { themeId }),
+  setThemeMenuActive: (themeId: string) =>
+    invoke<void>("set_theme_menu_active", { themeId }),
   resetAppState: (options?: ResetOptions) =>
     invoke<ResetReport>("reset_app_state", { options }),
 

@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "@/lib/preactSignalCompat";
 import {
   AlertCircle,
   ChevronDown,
@@ -16,7 +16,7 @@ import {
   Terminal,
   Trash2,
   X,
-} from "lucide-react";
+} from "@/lib/lucide";
 import { useMcp } from "@/store/mcp";
 import type { McpServerConfig, McpServerSnapshot, McpTool } from "@/lib/ipc";
 import { confirm } from "@/components/Confirm";

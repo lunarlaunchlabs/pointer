@@ -2,17 +2,23 @@
  * Git status store.
  *
  * Polls the backend on a coarse interval (5s) plus on demand (file save,
- * workspace switch, focus). We deliberately *don't* hook into the FS
- * watcher here because every keystroke that hits disk would queue a
- * status refresh and saturate the IPC channel for no visible benefit —
- * the 5s tick is good enough for the FileTree dot and the branch pill.
+ * workspace switch, focus, and debounced filesystem changes). Typing stays
+ * in Monaco's staged buffer, so watcher-driven refreshes track real disk/git
+ * changes without waking the git process for every keystroke.
  *
  * Errors are stored on the same object the UI reads, so components stay
  * declarative: "if isRepo show dots; if error swallow silently".
  */
 
-import { create } from "zustand";
+import { create } from "@/lib/signalStore";
 import { ipc, type GitStatus, type GitFileStatus } from "@/lib/ipc";
+
+export type GitFolderStatusSummary = {
+  total: number;
+  counts: Partial<Record<GitFileStatus, number>>;
+  statuses: GitFileStatus[];
+  dominant: GitFileStatus;
+};
 
 type State = {
   status: GitStatus;
@@ -25,6 +31,8 @@ type State = {
   refresh: () => Promise<void>;
   /** Cheap lookup used by FileTree decorations. */
   statusFor: (absolutePath: string) => GitFileStatus | null;
+  /** Roll-up lookup used by FileTree folder decorations. */
+  folderStatusFor: (absolutePath: string) => GitFolderStatusSummary | null;
 };
 
 const EMPTY: GitStatus = {
@@ -72,16 +80,73 @@ export const useGit = create<State>((set, get) => ({
     const ws = get().workspace;
     const status = get().status;
     if (!ws || !status.is_repo) return null;
-    if (!absolutePath.startsWith(ws)) return null;
-    // Strip leading workspace prefix + separator. Backend emits forward
-    // slashes; we normalise on the way in to match.
-    const rel = absolutePath
-      .slice(ws.length)
-      .replace(/^[\\/]+/, "")
-      .replace(/\\/g, "/");
+    const rel = relativeGitPath(ws, absolutePath);
+    if (rel == null || rel === "") return null;
     return status.files[rel] ?? null;
   },
+
+  folderStatusFor: (absolutePath) => {
+    const ws = get().workspace;
+    const status = get().status;
+    if (!ws || !status.is_repo) return null;
+    const rel = relativeGitPath(ws, absolutePath);
+    if (rel == null) return null;
+    return aggregateFolderStatus(status.files, rel);
+  },
 }));
+
+function relativeGitPath(workspace: string, absolutePath: string): string | null {
+  const ws = normalizeAbs(workspace);
+  const abs = normalizeAbs(absolutePath);
+  if (!ws) return null;
+  if (abs === ws) return "";
+  const prefix = ws.endsWith("/") ? ws : `${ws}/`;
+  if (!abs.startsWith(prefix)) return null;
+  return abs.slice(prefix.length).replace(/^\/+/, "");
+}
+
+function normalizeAbs(path: string): string {
+  const normal = path.replace(/\\/g, "/");
+  if (normal === "/") return normal;
+  return normal.replace(/\/+$/, "");
+}
+
+export function aggregateFolderStatus(
+  files: Record<string, GitFileStatus>,
+  folderRelPath: string,
+): GitFolderStatusSummary | null {
+  const folder = folderRelPath.replace(/\\/g, "/").replace(/^\/+|\/+$/g, "");
+  const prefix = folder ? `${folder}/` : "";
+  const counts: Partial<Record<GitFileStatus, number>> = {};
+  let total = 0;
+  for (const [rawPath, status] of Object.entries(files)) {
+    const path = rawPath.replace(/\\/g, "/").replace(/^\/+/, "");
+    const inFolder = folder
+      ? path === folder || path.startsWith(prefix)
+      : path.length > 0;
+    if (!inFolder) continue;
+    counts[status] = (counts[status] ?? 0) + 1;
+    total += 1;
+  }
+  if (total === 0) return null;
+  const statuses = GIT_STATUS_ORDER.filter((status) => (counts[status] ?? 0) > 0);
+  return {
+    total,
+    counts,
+    statuses,
+    dominant: statuses[0] ?? "modified",
+  };
+}
+
+const GIT_STATUS_ORDER: GitFileStatus[] = [
+  "conflicted",
+  "deleted",
+  "added",
+  "modified",
+  "renamed",
+  "untracked",
+  "ignored",
+];
 
 /**
  * Returns the noir-palette colour for a given git status. Centralised so
@@ -94,15 +159,46 @@ export function gitStatusColor(s: GitFileStatus): string {
       return "text-noir-ok"; // green
     case "modified":
     case "renamed":
-      return "text-amber-400";
+      return "text-noir-warn";
     case "deleted":
-      return "text-noir-warn"; // red
+      return "text-noir-err";
     case "untracked":
       return "text-noir-accent"; // pointer pink
     case "conflicted":
-      return "text-noir-warn";
+      return "text-noir-err";
     case "ignored":
       return "text-noir-mute";
+  }
+}
+
+export function gitStatusNameClass(
+  status: GitFileStatus | null,
+  options: { isFolder?: boolean } = {},
+): string {
+  if (!status) return "text-noir-text";
+  if (status === "deleted" && !options.isFolder) {
+    return "text-noir-err line-through decoration-noir-err/70";
+  }
+  if (status === "ignored") return "text-noir-mute";
+  return gitStatusColor(status);
+}
+
+export function gitStatusBorderClass(status: GitFileStatus | null): string {
+  switch (status) {
+    case "added":
+      return "border-l-noir-ok";
+    case "modified":
+    case "renamed":
+      return "border-l-noir-warn";
+    case "deleted":
+    case "conflicted":
+      return "border-l-noir-err";
+    case "untracked":
+      return "border-l-noir-accent";
+    case "ignored":
+      return "border-l-noir-mute";
+    default:
+      return "border-l-transparent";
   }
 }
 
@@ -123,4 +219,31 @@ export function gitStatusLetter(s: GitFileStatus): string {
     case "ignored":
       return "·";
   }
+}
+
+export function gitStatusLabel(s: GitFileStatus): string {
+  switch (s) {
+    case "added":
+      return "added";
+    case "modified":
+      return "modified";
+    case "deleted":
+      return "deleted";
+    case "renamed":
+      return "renamed";
+    case "untracked":
+      return "untracked";
+    case "conflicted":
+      return "conflicted";
+    case "ignored":
+      return "ignored";
+  }
+}
+
+export function gitFolderStatusTitle(summary: GitFolderStatusSummary): string {
+  const parts = summary.statuses.map((status) => {
+    const count = summary.counts[status] ?? 0;
+    return `${count} ${gitStatusLabel(status)}`;
+  });
+  return `Git changes in folder: ${parts.join(", ")}`;
 }

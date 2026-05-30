@@ -7,7 +7,7 @@
  * receives for each interaction.
  */
 
-import { useRef } from "react";
+import { useRef } from "@/lib/preactSignalCompat";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { cleanup, fireEvent, render, screen } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
@@ -111,7 +111,8 @@ describe("MentionPicker", () => {
         { path: "src/Other.tsx" },
       ],
     });
-    expect(screen.getByText("src/App.tsx")).toBeInTheDocument();
+    expect(screen.getByText("App.tsx")).toBeInTheDocument();
+    expect(screen.getByText("src")).toBeInTheDocument();
     // The non-matching file is filtered out by the picker's
     // case-insensitive substring match.
     expect(screen.queryByText("src/Other.tsx")).not.toBeInTheDocument();

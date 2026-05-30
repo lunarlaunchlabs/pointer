@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -20,6 +20,13 @@ pub struct LanguageServerStatus {
     pub command: Option<String>,
     pub source: String,
     pub capabilities: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct StoppedLanguageServer {
+    pub language: String,
+    pub label: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -87,6 +94,56 @@ pub struct LspDocumentSymbol {
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
+pub struct LspDocumentHighlight {
+    pub range: LspRange,
+    pub kind: Option<u32>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LspParameterInformation {
+    pub label: String,
+    pub documentation: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LspSignatureInformation {
+    pub label: String,
+    pub documentation: Option<String>,
+    pub parameters: Vec<LspParameterInformation>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LspSignatureHelp {
+    pub signatures: Vec<LspSignatureInformation>,
+    pub active_signature: Option<u32>,
+    pub active_parameter: Option<u32>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LspInlayHint {
+    pub label: String,
+    pub tooltip: Option<String>,
+    pub line: u32,
+    pub column: u32,
+    pub kind: Option<u32>,
+    pub padding_left: bool,
+    pub padding_right: bool,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LspFileTextEdit {
+    pub path: String,
+    pub range: LspRange,
+    pub new_text: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct LspDiagnosticEvent {
     pub uri: String,
     pub path: String,
@@ -129,6 +186,30 @@ pub struct LspCompletionResolveRequest {
     pub language: String,
     pub content: String,
     pub item: LspCompletionItem,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LspRenameRequest {
+    pub path: String,
+    pub language: String,
+    pub content: String,
+    pub line: u32,
+    pub column: u32,
+    pub new_name: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LspInlayHintsRequest {
+    pub path: String,
+    pub language: String,
+    pub content: String,
+    pub start_line: u32,
+    pub start_column: u32,
+    pub end_line: u32,
+    pub end_column: u32,
+    pub limit: Option<usize>,
 }
 
 #[derive(Debug, Clone)]
@@ -198,6 +279,18 @@ impl LspManager {
             "fsharp",
             "swift",
             "objective-c",
+            "zig",
+            "nix",
+            "haskell",
+            "erlang",
+            "elm",
+            "ocaml",
+            "crystal",
+            "nim",
+            "d",
+            "stylus",
+            "latex",
+            "racket",
             "powershell",
             "bat",
             "lua",
@@ -217,6 +310,50 @@ impl LspManager {
             out.push(status_for_language(root, lang, running));
         }
         out
+    }
+
+    pub async fn stop_idle(
+        &self,
+        root: &Path,
+        stop_all: bool,
+        languages: &[String],
+    ) -> Vec<StoppedLanguageServer> {
+        let target_languages = languages
+            .iter()
+            .map(|language| normalize_language(language))
+            .collect::<HashSet<_>>();
+        if !stop_all && target_languages.is_empty() {
+            return vec![];
+        }
+
+        let mut clients = self.clients.lock().await;
+        let mut stopped = vec![];
+        let mut removed = vec![];
+        let mut keys = vec![];
+        for (key, client) in clients.iter() {
+            if client.root != root {
+                continue;
+            }
+            let language = normalize_language(client.spec.language);
+            if stop_all || target_languages.contains(language) {
+                stopped.push(StoppedLanguageServer {
+                    language: language.to_string(),
+                    label: client.spec.label.to_string(),
+                });
+                keys.push(key.clone());
+            }
+        }
+        for key in keys {
+            if let Some(client) = clients.remove(&key) {
+                removed.push(client);
+            }
+        }
+        drop(clients);
+
+        for client in removed {
+            client.shutdown().await;
+        }
+        stopped
     }
 
     pub async fn did_open_or_change(
@@ -269,16 +406,27 @@ impl LspManager {
         client
             .sync_document(&req.path, &req.language, &req.content)
             .await?;
-        let result = client
-            .request(
-                "textDocument/definition",
-                json!({
-                    "textDocument": { "uri": file_uri(Path::new(&req.path)) },
-                    "position": lsp_position(req.line, req.column),
-                }),
-            )
-            .await?;
-        Ok(parse_locations(&result))
+        let params = text_position_params(&req.path, req.line, req.column);
+        let mut locations = vec![];
+        for method in [
+            "textDocument/definition",
+            "textDocument/declaration",
+            "textDocument/typeDefinition",
+            "textDocument/implementation",
+        ] {
+            match client.request(method, params.clone()).await {
+                Ok(result) => {
+                    locations.extend(parse_locations(&result));
+                    if !locations.is_empty() {
+                        break;
+                    }
+                }
+                Err(e) => {
+                    log::debug!("lsp {} {method} unavailable: {e}", client.spec.label);
+                }
+            }
+        }
+        Ok(dedupe_locations(locations))
     }
 
     pub async fn references(
@@ -374,6 +522,140 @@ impl LspManager {
             )
             .await?;
         Ok(parse_document_symbols(&result))
+    }
+
+    pub async fn signature_help(
+        &self,
+        app: AppHandle,
+        root: &Path,
+        req: LspTextDocumentRequest,
+    ) -> Result<Option<LspSignatureHelp>, String> {
+        let Some(client) = self.ensure_client(app, root, &req.language).await? else {
+            return Ok(None);
+        };
+        client
+            .sync_document(&req.path, &req.language, &req.content)
+            .await?;
+        match client
+            .request(
+                "textDocument/signatureHelp",
+                text_position_params(&req.path, req.line, req.column),
+            )
+            .await
+        {
+            Ok(result) => Ok(parse_signature_help(&result)),
+            Err(e) => {
+                log::debug!(
+                    "lsp {} signatureHelp unavailable for {}: {e}",
+                    client.spec.label,
+                    req.language
+                );
+                Ok(None)
+            }
+        }
+    }
+
+    pub async fn document_highlight(
+        &self,
+        app: AppHandle,
+        root: &Path,
+        req: LspTextDocumentRequest,
+    ) -> Result<Vec<LspDocumentHighlight>, String> {
+        let Some(client) = self.ensure_client(app, root, &req.language).await? else {
+            return Ok(vec![]);
+        };
+        client
+            .sync_document(&req.path, &req.language, &req.content)
+            .await?;
+        match client
+            .request(
+                "textDocument/documentHighlight",
+                text_position_params(&req.path, req.line, req.column),
+            )
+            .await
+        {
+            Ok(result) => Ok(parse_document_highlights(&result)),
+            Err(e) => {
+                log::debug!(
+                    "lsp {} documentHighlight unavailable for {}: {e}",
+                    client.spec.label,
+                    req.language
+                );
+                Ok(vec![])
+            }
+        }
+    }
+
+    pub async fn inlay_hints(
+        &self,
+        app: AppHandle,
+        root: &Path,
+        req: LspInlayHintsRequest,
+    ) -> Result<Vec<LspInlayHint>, String> {
+        let Some(client) = self.ensure_client(app, root, &req.language).await? else {
+            return Ok(vec![]);
+        };
+        client
+            .sync_document(&req.path, &req.language, &req.content)
+            .await?;
+        match client
+            .request(
+                "textDocument/inlayHint",
+                json!({
+                    "textDocument": { "uri": file_uri(Path::new(&req.path)) },
+                    "range": {
+                        "start": lsp_position(req.start_line, req.start_column),
+                        "end": lsp_position(req.end_line, req.end_column),
+                    },
+                }),
+            )
+            .await
+        {
+            Ok(result) => Ok(parse_inlay_hints(&result, req.limit.unwrap_or(250))),
+            Err(e) => {
+                log::debug!(
+                    "lsp {} inlayHint unavailable for {}: {e}",
+                    client.spec.label,
+                    req.language
+                );
+                Ok(vec![])
+            }
+        }
+    }
+
+    pub async fn rename(
+        &self,
+        app: AppHandle,
+        root: &Path,
+        req: LspRenameRequest,
+    ) -> Result<Vec<LspFileTextEdit>, String> {
+        let Some(client) = self.ensure_client(app, root, &req.language).await? else {
+            return Ok(vec![]);
+        };
+        client
+            .sync_document(&req.path, &req.language, &req.content)
+            .await?;
+        let result = client
+            .request(
+                "textDocument/rename",
+                json!({
+                    "textDocument": { "uri": file_uri(Path::new(&req.path)) },
+                    "position": lsp_position(req.line, req.column),
+                    "newName": req.new_name,
+                }),
+            )
+            .await;
+        match result {
+            Ok(value) => Ok(parse_workspace_edit(&value)),
+            Err(e) => {
+                log::debug!(
+                    "lsp {} rename unavailable for {}: {e}",
+                    client.spec.label,
+                    req.language
+                );
+                Ok(vec![])
+            }
+        }
     }
 
     pub async fn shutdown_all(&self) {
@@ -666,7 +948,22 @@ impl LspClient {
                             "synchronization": { "didSave": true, "dynamicRegistration": false },
                             "hover": { "contentFormat": ["markdown", "plaintext"] },
                             "definition": { "linkSupport": true },
+                            "declaration": { "linkSupport": true },
+                            "typeDefinition": { "linkSupport": true },
+                            "implementation": { "linkSupport": true },
                             "references": { "dynamicRegistration": false },
+                            "documentHighlight": { "dynamicRegistration": false },
+                            "inlayHint": { "dynamicRegistration": false, "resolveSupport": { "properties": ["tooltip", "textEdits", "label.tooltip", "label.location", "label.command"] } },
+                            "rename": { "dynamicRegistration": false, "prepareSupport": false },
+                            "signatureHelp": {
+                                "dynamicRegistration": false,
+                                "signatureInformation": {
+                                    "documentationFormat": ["markdown", "plaintext"],
+                                    "parameterInformation": { "labelOffsetSupport": true },
+                                    "activeParameterSupport": true
+                                },
+                                "contextSupport": true
+                            },
                             "completion": {
                                 "contextSupport": true,
                                 "completionItem": {
@@ -1115,7 +1412,16 @@ fn status_for_language(root: &Path, language: &str, running: bool) -> LanguageSe
     }
 
     match normal {
-        "javascript" | "typescript" | "css" | "html" | "json" => LanguageServerStatus {
+        "javascript" | "typescript" => LanguageServerStatus {
+            language: normal.into(),
+            label: "TypeScript service".into(),
+            status: "monaco".into(),
+            detail: "Using Monaco's built-in TypeScript language service for syntax, diagnostics, hover, completion, definitions, and references. External TypeScript LSP is not started by default to avoid running a duplicate tsserver.".into(),
+            command: None,
+            source: "bundled".into(),
+            capabilities: vec!["syntax".into(), "hover".into(), "completion".into(), "definition".into(), "references".into(), "diagnostics".into()],
+        },
+        "css" | "html" | "json" => LanguageServerStatus {
             language: normal.into(),
             label: "Monaco worker".into(),
             status: "monaco".into(),
@@ -1123,6 +1429,15 @@ fn status_for_language(root: &Path, language: &str, running: bool) -> LanguageSe
             command: None,
             source: "bundled".into(),
             capabilities: vec!["syntax".into(), "hover".into(), "completion".into(), "definition".into(), "references".into(), "diagnostics".into()],
+        },
+        _ if language_has_semantic_server(normal) => LanguageServerStatus {
+            language: normal.into(),
+            label: "Language server".into(),
+            status: "missing".into(),
+            detail: missing_language_server_detail(normal),
+            command: None,
+            source: "missing".into(),
+            capabilities: vec!["syntax".into()],
         },
         "vue" => LanguageServerStatus {
             language: normal.into(),
@@ -1166,6 +1481,23 @@ fn status_for_language(root: &Path, language: &str, running: bool) -> LanguageSe
 fn external_spec_for(root: &Path, language: &str) -> Option<ExternalSpec> {
     let normal = normalize_language(language);
     let caps = |xs: &[&str]| xs.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+    let full_caps = || {
+        caps(&[
+            "hover",
+            "definition",
+            "declaration",
+            "type-definition",
+            "implementation",
+            "references",
+            "completion",
+            "signature-help",
+            "document-highlight",
+            "inlay-hints",
+            "rename",
+            "diagnostics",
+            "symbols",
+        ])
+    };
     let found = |bin: &str| resolve_bin(root, bin);
     match normal {
         "rust" => found("rust-analyzer").map(|(command, source)| ExternalSpec {
@@ -1174,14 +1506,7 @@ fn external_spec_for(root: &Path, language: &str) -> Option<ExternalSpec> {
             command,
             args: vec![],
             source,
-            capabilities: caps(&[
-                "hover",
-                "definition",
-                "references",
-                "completion",
-                "diagnostics",
-                "symbols",
-            ]),
+            capabilities: full_caps(),
         }),
         "javascript" | "typescript" => {
             found("typescript-language-server").map(|(command, source)| ExternalSpec {
@@ -1190,14 +1515,7 @@ fn external_spec_for(root: &Path, language: &str) -> Option<ExternalSpec> {
                 command,
                 args: vec!["--stdio".into()],
                 source,
-                capabilities: caps(&[
-                    "hover",
-                    "definition",
-                    "references",
-                    "completion",
-                    "diagnostics",
-                    "symbols",
-                ]),
+                capabilities: full_caps(),
             })
         }
         "vue" => found("vue-language-server").map(|(command, source)| ExternalSpec {
@@ -1212,14 +1530,7 @@ fn external_spec_for(root: &Path, language: &str) -> Option<ExternalSpec> {
                 args
             },
             source,
-            capabilities: caps(&[
-                "hover",
-                "definition",
-                "references",
-                "completion",
-                "diagnostics",
-                "symbols",
-            ]),
+            capabilities: full_caps(),
         }),
         "css" => found("vscode-css-language-server").map(|(command, source)| ExternalSpec {
             language: "css",
@@ -1267,14 +1578,7 @@ fn external_spec_for(root: &Path, language: &str) -> Option<ExternalSpec> {
             command,
             args: vec!["start".into()],
             source,
-            capabilities: caps(&[
-                "hover",
-                "definition",
-                "references",
-                "completion",
-                "diagnostics",
-                "symbols",
-            ]),
+            capabilities: full_caps(),
         }),
         "dockerfile" => found("docker-langserver").map(|(command, source)| ExternalSpec {
             language: "dockerfile",
@@ -1284,55 +1588,10 @@ fn external_spec_for(root: &Path, language: &str) -> Option<ExternalSpec> {
             source,
             capabilities: caps(&["hover", "completion", "diagnostics", "symbols"]),
         }),
-        "markdown" => found("marksman").map(|(command, source)| ExternalSpec {
-            language: "markdown",
-            label: "marksman",
-            command,
-            args: vec!["server".into()],
-            source,
-            capabilities: caps(&[
-                "hover",
-                "definition",
-                "references",
-                "completion",
-                "diagnostics",
-                "symbols",
-            ]),
-        }),
-        "lua" => found("lua-language-server").map(|(command, source)| ExternalSpec {
-            language: "lua",
-            label: "lua-language-server",
-            command,
-            args: vec![],
-            source,
-            capabilities: caps(&[
-                "hover",
-                "definition",
-                "references",
-                "completion",
-                "diagnostics",
-                "symbols",
-            ]),
-        }),
-        "go" => found("gopls").map(|(command, source)| ExternalSpec {
-            language: "go",
-            label: "gopls",
-            command,
-            args: vec![],
-            source,
-            capabilities: caps(&[
-                "hover",
-                "definition",
-                "references",
-                "completion",
-                "diagnostics",
-                "symbols",
-            ]),
-        }),
-        "python" => found("pyright-langserver")
+        "markdown" => found("vscode-markdown-language-server")
             .map(|(command, source)| ExternalSpec {
-                language: "python",
-                label: "pyright-langserver",
+                language: "markdown",
+                label: "vscode-markdown-language-server",
                 command,
                 args: vec!["--stdio".into()],
                 source,
@@ -1346,20 +1605,48 @@ fn external_spec_for(root: &Path, language: &str) -> Option<ExternalSpec> {
                 ]),
             })
             .or_else(|| {
+                found("marksman").map(|(command, source)| ExternalSpec {
+                    language: "markdown",
+                    label: "marksman",
+                    command,
+                    args: vec!["server".into()],
+                    source,
+                    capabilities: full_caps(),
+                })
+            }),
+        "lua" => found("lua-language-server").map(|(command, source)| ExternalSpec {
+            language: "lua",
+            label: "lua-language-server",
+            command,
+            args: vec![],
+            source,
+            capabilities: full_caps(),
+        }),
+        "go" => found("gopls").map(|(command, source)| ExternalSpec {
+            language: "go",
+            label: "gopls",
+            command,
+            args: vec![],
+            source,
+            capabilities: full_caps(),
+        }),
+        "python" => found("pyright-langserver")
+            .map(|(command, source)| ExternalSpec {
+                language: "python",
+                label: "pyright-langserver",
+                command,
+                args: vec!["--stdio".into()],
+                source,
+                capabilities: full_caps(),
+            })
+            .or_else(|| {
                 found("pylsp").map(|(command, source)| ExternalSpec {
                     language: "python",
                     label: "pylsp",
                     command,
                     args: vec![],
                     source,
-                    capabilities: caps(&[
-                        "hover",
-                        "definition",
-                        "references",
-                        "completion",
-                        "diagnostics",
-                        "symbols",
-                    ]),
+                    capabilities: full_caps(),
                 })
             }),
         "c" | "cpp" => found("clangd").map(|(command, source)| ExternalSpec {
@@ -1368,14 +1655,7 @@ fn external_spec_for(root: &Path, language: &str) -> Option<ExternalSpec> {
             command,
             args: vec![],
             source,
-            capabilities: caps(&[
-                "hover",
-                "definition",
-                "references",
-                "completion",
-                "diagnostics",
-                "symbols",
-            ]),
+            capabilities: full_caps(),
         }),
         "ruby" => found("solargraph").map(|(command, source)| ExternalSpec {
             language: "ruby",
@@ -1383,14 +1663,7 @@ fn external_spec_for(root: &Path, language: &str) -> Option<ExternalSpec> {
             command,
             args: vec!["stdio".into()],
             source,
-            capabilities: caps(&[
-                "hover",
-                "definition",
-                "references",
-                "completion",
-                "diagnostics",
-                "symbols",
-            ]),
+            capabilities: full_caps(),
         }),
         "php" => found("intelephense").map(|(command, source)| ExternalSpec {
             language: "php",
@@ -1398,14 +1671,265 @@ fn external_spec_for(root: &Path, language: &str) -> Option<ExternalSpec> {
             command,
             args: vec!["--stdio".into()],
             source,
-            capabilities: caps(&[
-                "hover",
-                "definition",
-                "references",
-                "completion",
-                "diagnostics",
-                "symbols",
-            ]),
+            capabilities: full_caps(),
+        }),
+        "svelte" => found("svelteserver")
+            .map(|(command, source)| ExternalSpec {
+                language: "svelte",
+                label: "svelteserver",
+                command,
+                args: vec!["--stdio".into()],
+                source,
+                capabilities: full_caps(),
+            })
+            .or_else(|| {
+                found("svelte-language-server").map(|(command, source)| ExternalSpec {
+                    language: "svelte",
+                    label: "svelte-language-server",
+                    command,
+                    args: vec!["--stdio".into()],
+                    source,
+                    capabilities: full_caps(),
+                })
+            }),
+        "astro" => found("astro-ls")
+            .map(|(command, source)| ExternalSpec {
+                language: "astro",
+                label: "astro-ls",
+                command,
+                args: vec!["--stdio".into()],
+                source,
+                capabilities: full_caps(),
+            })
+            .or_else(|| {
+                found("astro-language-server").map(|(command, source)| ExternalSpec {
+                    language: "astro",
+                    label: "astro-language-server",
+                    command,
+                    args: vec!["--stdio".into()],
+                    source,
+                    capabilities: full_caps(),
+                })
+            }),
+        "graphql" => found("graphql-lsp").map(|(command, source)| ExternalSpec {
+            language: "graphql",
+            label: "graphql-lsp",
+            command,
+            args: vec!["server".into(), "-m".into(), "stream".into()],
+            source,
+            capabilities: full_caps(),
+        }),
+        "prisma" => found("prisma-language-server").map(|(command, source)| ExternalSpec {
+            language: "prisma",
+            label: "prisma-language-server",
+            command,
+            args: vec!["--stdio".into()],
+            source,
+            capabilities: full_caps(),
+        }),
+        "sql" => found("sqls").map(|(command, source)| ExternalSpec {
+            language: "sql",
+            label: "sqls",
+            command,
+            args: vec![],
+            source,
+            capabilities: full_caps(),
+        }),
+        "java" => found("jdtls").map(|(command, source)| ExternalSpec {
+            language: "java",
+            label: "jdtls",
+            command,
+            args: vec![],
+            source,
+            capabilities: full_caps(),
+        }),
+        "kotlin" => found("kotlin-language-server").map(|(command, source)| ExternalSpec {
+            language: "kotlin",
+            label: "kotlin-language-server",
+            command,
+            args: vec![],
+            source,
+            capabilities: full_caps(),
+        }),
+        "scala" => found("metals").map(|(command, source)| ExternalSpec {
+            language: "scala",
+            label: "metals",
+            command,
+            args: vec!["--stdio".into()],
+            source,
+            capabilities: full_caps(),
+        }),
+        "clojure" => found("clojure-lsp").map(|(command, source)| ExternalSpec {
+            language: "clojure",
+            label: "clojure-lsp",
+            command,
+            args: vec![],
+            source,
+            capabilities: full_caps(),
+        }),
+        "csharp" => found("csharp-ls")
+            .map(|(command, source)| ExternalSpec {
+                language: "csharp",
+                label: "csharp-ls",
+                command,
+                args: vec![],
+                source,
+                capabilities: full_caps(),
+            })
+            .or_else(|| {
+                found("omnisharp").map(|(command, source)| ExternalSpec {
+                    language: "csharp",
+                    label: "omnisharp",
+                    command,
+                    args: vec!["--languageserver".into()],
+                    source,
+                    capabilities: full_caps(),
+                })
+            }),
+        "fsharp" => found("fsautocomplete").map(|(command, source)| ExternalSpec {
+            language: "fsharp",
+            label: "fsautocomplete",
+            command,
+            args: vec!["--adaptive-lsp-server-enabled".into()],
+            source,
+            capabilities: full_caps(),
+        }),
+        "swift" | "objective-c" => found("sourcekit-lsp").map(|(command, source)| ExternalSpec {
+            language: normal,
+            label: "sourcekit-lsp",
+            command,
+            args: vec![],
+            source,
+            capabilities: full_caps(),
+        }),
+        "dart" => found("dart").map(|(command, source)| ExternalSpec {
+            language: "dart",
+            label: "dart language-server",
+            command,
+            args: vec!["language-server".into(), "--protocol=lsp".into()],
+            source,
+            capabilities: full_caps(),
+        }),
+        "hcl" => found("terraform-ls").map(|(command, source)| ExternalSpec {
+            language: "hcl",
+            label: "terraform-ls",
+            command,
+            args: vec!["serve".into()],
+            source,
+            capabilities: full_caps(),
+        }),
+        "elixir" => found("elixir-ls")
+            .map(|(command, source)| ExternalSpec {
+                language: "elixir",
+                label: "elixir-ls",
+                command,
+                args: vec![],
+                source,
+                capabilities: full_caps(),
+            })
+            .or_else(|| {
+                found("elixir-ls-language-server").map(|(command, source)| ExternalSpec {
+                    language: "elixir",
+                    label: "elixir-ls-language-server",
+                    command,
+                    args: vec![],
+                    source,
+                    capabilities: full_caps(),
+                })
+            }),
+        "zig" => found("zls").map(|(command, source)| ExternalSpec {
+            language: "zig",
+            label: "zls",
+            command,
+            args: vec![],
+            source,
+            capabilities: full_caps(),
+        }),
+        "nix" => found("nil")
+            .map(|(command, source)| ExternalSpec {
+                language: "nix",
+                label: "nil",
+                command,
+                args: vec![],
+                source,
+                capabilities: full_caps(),
+            })
+            .or_else(|| {
+                found("nixd").map(|(command, source)| ExternalSpec {
+                    language: "nix",
+                    label: "nixd",
+                    command,
+                    args: vec![],
+                    source,
+                    capabilities: full_caps(),
+                })
+            }),
+        "haskell" => found("haskell-language-server-wrapper")
+            .map(|(command, source)| ExternalSpec {
+                language: "haskell",
+                label: "haskell-language-server",
+                command,
+                args: vec!["--lsp".into()],
+                source,
+                capabilities: full_caps(),
+            })
+            .or_else(|| {
+                found("haskell-language-server").map(|(command, source)| ExternalSpec {
+                    language: "haskell",
+                    label: "haskell-language-server",
+                    command,
+                    args: vec!["--lsp".into()],
+                    source,
+                    capabilities: full_caps(),
+                })
+            }),
+        "ocaml" => found("ocamllsp").map(|(command, source)| ExternalSpec {
+            language: "ocaml",
+            label: "ocamllsp",
+            command,
+            args: vec![],
+            source,
+            capabilities: full_caps(),
+        }),
+        "erlang" => found("elp").map(|(command, source)| ExternalSpec {
+            language: "erlang",
+            label: "elp",
+            command,
+            args: vec!["server".into()],
+            source,
+            capabilities: full_caps(),
+        }),
+        "elm" => found("elm-language-server").map(|(command, source)| ExternalSpec {
+            language: "elm",
+            label: "elm-language-server",
+            command,
+            args: vec![],
+            source,
+            capabilities: full_caps(),
+        }),
+        "crystal" => found("crystalline").map(|(command, source)| ExternalSpec {
+            language: "crystal",
+            label: "crystalline",
+            command,
+            args: vec![],
+            source,
+            capabilities: full_caps(),
+        }),
+        "nim" => found("nimlangserver").map(|(command, source)| ExternalSpec {
+            language: "nim",
+            label: "nimlangserver",
+            command,
+            args: vec![],
+            source,
+            capabilities: full_caps(),
+        }),
+        "perl" => found("perlnavigator").map(|(command, source)| ExternalSpec {
+            language: "perl",
+            label: "perlnavigator",
+            command,
+            args: vec!["--stdio".into()],
+            source,
+            capabilities: full_caps(),
         }),
         _ => None,
     }
@@ -1620,6 +2144,18 @@ fn normalize_language(language: &str) -> &'static str {
         "fsharp" => "fsharp",
         "swift" => "swift",
         "objective-c" => "objective-c",
+        "zig" => "zig",
+        "nix" => "nix",
+        "haskell" | "hs" => "haskell",
+        "erlang" | "erl" => "erlang",
+        "elm" => "elm",
+        "ocaml" | "ml" | "mli" => "ocaml",
+        "crystal" | "cr" => "crystal",
+        "nim" => "nim",
+        "d" => "d",
+        "stylus" | "styl" => "stylus",
+        "latex" | "tex" => "latex",
+        "racket" | "rkt" => "racket",
         "powershell" => "powershell",
         "bat" => "bat",
         "lua" => "lua",
@@ -1673,6 +2209,18 @@ fn syntax_only_language(language: &str) -> bool {
             | "fsharp"
             | "swift"
             | "objective-c"
+            | "zig"
+            | "nix"
+            | "haskell"
+            | "erlang"
+            | "elm"
+            | "ocaml"
+            | "crystal"
+            | "nim"
+            | "d"
+            | "stylus"
+            | "latex"
+            | "racket"
             | "powershell"
             | "bat"
             | "lua"
@@ -1693,6 +2241,103 @@ fn syntax_only_language(language: &str) -> bool {
     )
 }
 
+fn language_has_semantic_server(language: &str) -> bool {
+    matches!(
+        language,
+        "javascript"
+            | "typescript"
+            | "vue"
+            | "rust"
+            | "css"
+            | "html"
+            | "json"
+            | "yaml"
+            | "toml"
+            | "shell"
+            | "dockerfile"
+            | "markdown"
+            | "lua"
+            | "go"
+            | "python"
+            | "c"
+            | "cpp"
+            | "ruby"
+            | "php"
+            | "svelte"
+            | "astro"
+            | "graphql"
+            | "prisma"
+            | "sql"
+            | "java"
+            | "kotlin"
+            | "scala"
+            | "clojure"
+            | "csharp"
+            | "fsharp"
+            | "swift"
+            | "objective-c"
+            | "dart"
+            | "hcl"
+            | "elixir"
+            | "zig"
+            | "nix"
+            | "haskell"
+            | "ocaml"
+            | "erlang"
+            | "elm"
+            | "crystal"
+            | "nim"
+            | "perl"
+    )
+}
+
+fn missing_language_server_detail(language: &str) -> String {
+    let servers = match language {
+        "typescript" | "javascript" => "typescript-language-server",
+        "vue" => "vue-language-server",
+        "rust" => "rust-analyzer",
+        "yaml" => "yaml-language-server",
+        "toml" => "taplo",
+        "shell" => "bash-language-server",
+        "dockerfile" => "docker-langserver",
+        "markdown" => "vscode-markdown-language-server or marksman",
+        "lua" => "lua-language-server",
+        "go" => "gopls",
+        "python" => "pyright-langserver or pylsp",
+        "c" | "cpp" => "clangd",
+        "ruby" => "solargraph",
+        "php" => "intelephense",
+        "svelte" => "svelteserver",
+        "astro" => "astro-ls",
+        "graphql" => "graphql-lsp",
+        "prisma" => "prisma-language-server",
+        "sql" => "sqls",
+        "java" => "jdtls",
+        "kotlin" => "kotlin-language-server",
+        "scala" => "metals",
+        "clojure" => "clojure-lsp",
+        "csharp" => "csharp-ls or omnisharp",
+        "fsharp" => "fsautocomplete",
+        "swift" | "objective-c" => "sourcekit-lsp",
+        "dart" => "dart language-server",
+        "hcl" => "terraform-ls",
+        "elixir" => "elixir-ls",
+        "zig" => "zls",
+        "nix" => "nil or nixd",
+        "haskell" => "haskell-language-server-wrapper",
+        "ocaml" => "ocamllsp",
+        "erlang" => "elp",
+        "elm" => "elm-language-server",
+        "crystal" => "crystalline",
+        "nim" => "nimlangserver",
+        "perl" => "perlnavigator",
+        _ => "a compatible language server",
+    };
+    format!(
+        "Syntax highlighting is active. Install {servers} in the workspace, Pointer install, or PATH to enable hover, definitions, references, completion, diagnostics, rename, and signature help."
+    )
+}
+
 fn lsp_language_id(path: &Path, language: &str) -> String {
     let ext = path.extension().and_then(|s| s.to_str()).unwrap_or("");
     match ext {
@@ -1706,6 +2351,13 @@ fn lsp_language_id(path: &Path, language: &str) -> String {
 
 fn client_key(root: &Path, language: &str) -> String {
     format!("{}::{}", root.display(), normalize_language(language))
+}
+
+fn text_position_params(path: &str, line: u32, column: u32) -> Value {
+    json!({
+        "textDocument": { "uri": file_uri(Path::new(path)) },
+        "position": lsp_position(line, column),
+    })
 }
 
 fn lsp_position(line: u32, column: u32) -> Value {
@@ -1735,14 +2387,14 @@ fn hover_contents_to_string(value: &Value) -> String {
         return s.to_string();
     }
     if let Some(obj) = value.as_object() {
-        if let Some(v) = obj.get("value").and_then(|v| v.as_str()) {
-            return v.to_string();
-        }
         if let (Some(lang), Some(v)) = (
             obj.get("language").and_then(|v| v.as_str()),
             obj.get("value").and_then(|v| v.as_str()),
         ) {
             return format!("```{lang}\n{v}\n```");
+        }
+        if let Some(v) = obj.get("value").and_then(|v| v.as_str()) {
+            return v.to_string();
         }
     }
     if let Some(arr) = value.as_array() {
@@ -1786,6 +2438,21 @@ fn parse_locations(value: &Value) -> Vec<LspLocation> {
         .collect()
 }
 
+fn dedupe_locations(locations: Vec<LspLocation>) -> Vec<LspLocation> {
+    let mut seen = std::collections::HashSet::new();
+    let mut out = Vec::with_capacity(locations.len());
+    for loc in locations {
+        let key = format!(
+            "{}:{}:{}:{}:{}",
+            loc.path, loc.line, loc.column, loc.end_line, loc.end_column
+        );
+        if seen.insert(key) {
+            out.push(loc);
+        }
+    }
+    out
+}
+
 fn parse_completion(value: &Value, limit: usize) -> Vec<LspCompletionItem> {
     let items = value
         .get("items")
@@ -1799,6 +2466,186 @@ fn parse_completion(value: &Value, limit: usize) -> Vec<LspCompletionItem> {
         .take(limit)
         .filter_map(parse_completion_item)
         .collect()
+}
+
+fn parse_signature_help(value: &Value) -> Option<LspSignatureHelp> {
+    if value.is_null() {
+        return None;
+    }
+    let signatures = value
+        .get("signatures")
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(parse_signature_information)
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    if signatures.is_empty() {
+        return None;
+    }
+    Some(LspSignatureHelp {
+        signatures,
+        active_signature: value
+            .get("activeSignature")
+            .and_then(|v| v.as_u64())
+            .map(|v| v as u32),
+        active_parameter: value
+            .get("activeParameter")
+            .and_then(|v| v.as_u64())
+            .map(|v| v as u32),
+    })
+}
+
+fn parse_signature_information(value: &Value) -> Option<LspSignatureInformation> {
+    let label = value.get("label").and_then(|v| v.as_str())?.to_string();
+    let documentation = value
+        .get("documentation")
+        .map(hover_contents_to_string)
+        .filter(|s| !s.trim().is_empty());
+    let parameters = value
+        .get("parameters")
+        .and_then(|v| v.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(parse_parameter_information)
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    Some(LspSignatureInformation {
+        label,
+        documentation,
+        parameters,
+    })
+}
+
+fn parse_parameter_information(value: &Value) -> Option<LspParameterInformation> {
+    let label_value = value.get("label")?;
+    let label = if let Some(s) = label_value.as_str() {
+        s.to_string()
+    } else if let Some(arr) = label_value.as_array() {
+        let a = arr.first().and_then(|v| v.as_u64()).unwrap_or_default();
+        let b = arr.get(1).and_then(|v| v.as_u64()).unwrap_or_default();
+        format!("{a}:{b}")
+    } else {
+        return None;
+    };
+    let documentation = value
+        .get("documentation")
+        .map(hover_contents_to_string)
+        .filter(|s| !s.trim().is_empty());
+    Some(LspParameterInformation {
+        label,
+        documentation,
+    })
+}
+
+fn parse_document_highlights(value: &Value) -> Vec<LspDocumentHighlight> {
+    let Some(arr) = value.as_array() else {
+        return vec![];
+    };
+    arr.iter()
+        .filter_map(|item| {
+            Some(LspDocumentHighlight {
+                range: parse_range(item.get("range")?)?,
+                kind: item.get("kind").and_then(|v| v.as_u64()).map(|v| v as u32),
+            })
+        })
+        .collect()
+}
+
+fn parse_inlay_hints(value: &Value, limit: usize) -> Vec<LspInlayHint> {
+    let Some(arr) = value.as_array() else {
+        return vec![];
+    };
+    arr.iter()
+        .take(limit)
+        .filter_map(|item| {
+            let position = item.get("position")?;
+            Some(LspInlayHint {
+                label: inlay_label_to_string(item.get("label")?)?,
+                tooltip: item
+                    .get("tooltip")
+                    .map(hover_contents_to_string)
+                    .filter(|s| !s.trim().is_empty()),
+                line: position.get("line")?.as_u64()? as u32 + 1,
+                column: position.get("character")?.as_u64()? as u32 + 1,
+                kind: item.get("kind").and_then(|v| v.as_u64()).map(|v| v as u32),
+                padding_left: item
+                    .get("paddingLeft")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false),
+                padding_right: item
+                    .get("paddingRight")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false),
+            })
+        })
+        .collect()
+}
+
+fn inlay_label_to_string(value: &Value) -> Option<String> {
+    if let Some(s) = value.as_str() {
+        return Some(s.to_string());
+    }
+    let Some(parts) = value.as_array() else {
+        return None;
+    };
+    let label = parts
+        .iter()
+        .filter_map(|part| part.get("value").and_then(|v| v.as_str()))
+        .collect::<Vec<_>>()
+        .join("");
+    if label.trim().is_empty() {
+        None
+    } else {
+        Some(label)
+    }
+}
+
+fn parse_workspace_edit(value: &Value) -> Vec<LspFileTextEdit> {
+    if value.is_null() {
+        return vec![];
+    }
+    let mut edits = vec![];
+    if let Some(changes) = value.get("changes").and_then(|v| v.as_object()) {
+        for (uri, uri_edits) in changes {
+            let Some(arr) = uri_edits.as_array() else {
+                continue;
+            };
+            for edit in arr {
+                if let Some(text_edit) = parse_text_edit(edit) {
+                    edits.push(LspFileTextEdit {
+                        path: uri_to_path(uri),
+                        range: text_edit.range,
+                        new_text: text_edit.new_text,
+                    });
+                }
+            }
+        }
+    }
+    if let Some(document_changes) = value.get("documentChanges").and_then(|v| v.as_array()) {
+        for change in document_changes {
+            if let Some(text_document) = change.get("textDocument") {
+                let Some(uri) = text_document.get("uri").and_then(|v| v.as_str()) else {
+                    continue;
+                };
+                let Some(arr) = change.get("edits").and_then(|v| v.as_array()) else {
+                    continue;
+                };
+                for edit in arr {
+                    if let Some(text_edit) = parse_text_edit(edit) {
+                        edits.push(LspFileTextEdit {
+                            path: uri_to_path(uri),
+                            range: text_edit.range,
+                            new_text: text_edit.new_text,
+                        });
+                    }
+                }
+            }
+        }
+    }
+    edits
 }
 
 fn parse_completion_item(item: &Value) -> Option<LspCompletionItem> {
@@ -2136,14 +2983,17 @@ mod tests {
     }
 
     #[test]
-    fn semantic_servers_advertise_references() {
+    fn semantic_statuses_prefer_workspace_typescript_language_server() {
         let dir = tempfile::tempdir().unwrap();
         let bin_dir = dir.path().join("node_modules/.bin");
         std::fs::create_dir_all(&bin_dir).unwrap();
         std::fs::write(bin_dir.join("typescript-language-server"), "").unwrap();
         let status = status_for_language(dir.path(), "typescript", false);
+        assert_eq!(status.status, "available");
+        assert_eq!(status.label, "typescript-language-server");
         assert!(status.capabilities.contains(&"definition".to_string()));
         assert!(status.capabilities.contains(&"references".to_string()));
+        assert!(status.capabilities.contains(&"rename".to_string()));
 
         let monaco = status_for_language(Path::new("/repo"), "javascript", false);
         assert_eq!(monaco.status, "monaco");
@@ -2201,6 +3051,85 @@ mod tests {
     }
 
     #[test]
+    fn parses_signature_highlight_and_workspace_rename_edits() {
+        let signature = parse_signature_help(&json!({
+            "signatures": [{
+                "label": "makeUrl(path: string)",
+                "documentation": { "kind": "markdown", "value": "Builds a URL." },
+                "parameters": [{ "label": "path", "documentation": "Route path." }]
+            }],
+            "activeSignature": 0,
+            "activeParameter": 0
+        }))
+        .unwrap();
+        assert_eq!(signature.signatures[0].label, "makeUrl(path: string)");
+        assert_eq!(
+            signature.signatures[0].parameters[0]
+                .documentation
+                .as_deref(),
+            Some("Route path.")
+        );
+
+        let highlights = parse_document_highlights(&json!([{
+            "range": {
+                "start": { "line": 2, "character": 4 },
+                "end": { "line": 2, "character": 11 }
+            },
+            "kind": 3
+        }]));
+        assert_eq!(highlights[0].range.start_line, 3);
+        assert_eq!(highlights[0].kind, Some(3));
+
+        let hints = parse_inlay_hints(
+            &json!([
+                {
+                    "position": { "line": 4, "character": 18 },
+                    "label": [
+                        { "value": ": " },
+                        { "value": "string", "tooltip": "type" }
+                    ],
+                    "tooltip": { "kind": "markdown", "value": "Inferred type" },
+                    "kind": 1,
+                    "paddingLeft": true
+                }
+            ]),
+            10,
+        );
+        assert_eq!(hints[0].label, ": string");
+        assert_eq!(hints[0].line, 5);
+        assert_eq!(hints[0].column, 19);
+        assert_eq!(hints[0].kind, Some(1));
+        assert_eq!(hints[0].tooltip.as_deref(), Some("Inferred type"));
+        assert!(hints[0].padding_left);
+
+        let edits = parse_workspace_edit(&json!({
+            "changes": {
+                "file:///tmp/a.ts": [{
+                    "range": {
+                        "start": { "line": 0, "character": 13 },
+                        "end": { "line": 0, "character": 20 }
+                    },
+                    "newText": "makeHref"
+                }]
+            },
+            "documentChanges": [{
+                "textDocument": { "uri": "file:///tmp/b.ts", "version": 1 },
+                "edits": [{
+                    "range": {
+                        "start": { "line": 1, "character": 0 },
+                        "end": { "line": 1, "character": 7 }
+                    },
+                    "newText": "makeHref"
+                }]
+            }]
+        }));
+        assert_eq!(edits.len(), 2);
+        assert_eq!(edits[0].path, "/tmp/a.ts");
+        assert_eq!(edits[0].range.start_column, 14);
+        assert_eq!(edits[1].path, "/tmp/b.ts");
+    }
+
+    #[test]
     fn resolves_workspace_local_language_server_binary() {
         let dir = tempfile::tempdir().unwrap();
         let bin_dir = dir.path().join("node_modules/.bin");
@@ -2234,12 +3163,12 @@ mod tests {
     fn reports_repo_config_languages_as_syntax_modes() {
         let yaml = status_for_language(Path::new("/repo"), "yaml", false);
         assert_eq!(yaml.language, "yaml");
-        assert_eq!(yaml.status, "syntax");
-        assert!(yaml.capabilities.contains(&"outline".to_string()));
+        assert_eq!(yaml.status, "missing");
+        assert!(yaml.detail.contains("yaml-language-server"));
 
         let dockerfile = status_for_language(Path::new("/repo"), "dockerfile", false);
         assert_eq!(dockerfile.language, "dockerfile");
-        assert_eq!(dockerfile.status, "syntax");
+        assert_eq!(dockerfile.status, "missing");
     }
 
     #[test]

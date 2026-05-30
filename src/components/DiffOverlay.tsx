@@ -1,7 +1,8 @@
 import { DiffEditor } from "@monaco-editor/react";
-import { Check, X, Zap } from "lucide-react";
-import { POINTER_NOIR_ID, pointerNoirTheme } from "@/theme/pointer-noir";
+import { Check, X, Zap } from "@/lib/lucide";
+import { setPointerMonacoTheme } from "@/lib/shikiMonaco";
 import { useEditorStore } from "@/store/editor";
+import { useSettings } from "@/store/settings";
 
 export function DiffOverlay({
   original,
@@ -19,6 +20,7 @@ export function DiffOverlay({
   onReject: () => void;
 }) {
   const active = useEditorStore((s) => s.getActive());
+  const appTheme = useSettings((s) => s.appTheme);
   const language = active?.language ?? "plaintext";
 
   return (
@@ -79,10 +81,8 @@ export function DiffOverlay({
           original={original}
           modified={proposed}
           language={language}
-          theme={POINTER_NOIR_ID}
-          beforeMount={(monaco) => {
-            monaco.editor.defineTheme(POINTER_NOIR_ID, pointerNoirTheme);
-          }}
+          theme={appTheme}
+          beforeMount={(monaco) => setPointerMonacoTheme(monaco, appTheme)}
           options={{
             renderSideBySide: true,
             readOnly: true,

@@ -7,7 +7,7 @@
  * so the user can pivot from "explain this code" to "now make the
  * change" without restarting.
  */
-import { useEffect, useRef } from "react";
+import { useEffect, useRef } from "@/lib/preactSignalCompat";
 import {
   AlertCircle,
   Bot,
@@ -23,7 +23,7 @@ import {
   Search,
   Trash2,
   Wrench,
-} from "lucide-react";
+} from "@/lib/lucide";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import { useAssistant, type AssistantSession } from "@/store/assistant";
@@ -32,6 +32,7 @@ import type { Phase } from "@/store/agentSessions";
 import {
   featureBlockReason,
   isFeatureUsable,
+  runnableModelForFeature,
   type AiFeature,
   useSettings,
 } from "@/store/settings";
@@ -70,10 +71,16 @@ export function AssistantView() {
   const removeRef = useAssistant((s) => s.removeRef);
   const phase = useAssistant((s) => s.phase);
 
-  const chatModel = useSettings((s) => s.chatModel);
-  const agentModel = useSettings((s) => s.agentModel);
+  const chatModel = useSettings(
+    (s) => runnableModelForFeature("chat", s) || s.chatModel,
+  );
+  const agentModel = useSettings(
+    (s) => runnableModelForFeature("agent", s) || s.agentModel,
+  );
   const indexUsable = useSettings((s) => isFeatureUsable("indexing", s));
-  const embedModel = useSettings((s) => s.embedModel);
+  const embedModel = useSettings(
+    (s) => runnableModelForFeature("indexing", s) || s.embedModel,
+  );
   const editor = useEditorStore((s) => s.getActive());
   const root = useWorkspace((s) => s.root);
 

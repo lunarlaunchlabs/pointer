@@ -1,4 +1,4 @@
-import { create } from "zustand";
+import { create } from "@/lib/signalStore";
 import { ipc, listenEvent, newRequestId } from "@/lib/ipc";
 
 /**

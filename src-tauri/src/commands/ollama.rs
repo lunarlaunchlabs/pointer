@@ -1,7 +1,5 @@
 use crate::error::{AppError, AppResult};
-use crate::services::context_lifecycle::{
-    compact_dialogue, CompactMessage, CompactOptions,
-};
+use crate::services::context_lifecycle::{compact_dialogue, CompactMessage, CompactOptions};
 use crate::services::inference::{acquire_inference, InferenceClaim, InferencePolicy};
 use crate::state::AppState;
 use futures_util::StreamExt;
@@ -141,6 +139,13 @@ pub async fn ollama_start(state: State<'_, AppState>) -> AppResult<()> {
     if let Some(path) = which_like("ollama") {
         let child = Command::new(path)
             .arg("serve")
+            // Keep Pointer-owned local model serving inside the IDE's
+            // orchestration budget. On large-memory Macs Ollama may otherwise
+            // choose a very large default context for OpenAI-compatible chat
+            // calls, which can allocate tens of GB of KV cache for a single
+            // Ask/Plan/Agent turn.
+            .env("OLLAMA_CONTEXT_LENGTH", "32768")
+            .env("OLLAMA_NUM_PARALLEL", "1")
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
             .spawn()
@@ -848,6 +853,8 @@ pub struct GenerateRequest {
     #[serde(default)]
     pub raw: Option<bool>,
     #[serde(default)]
+    pub think: Option<bool>,
+    #[serde(default)]
     pub purpose: Option<String>,
     #[serde(default)]
     pub title: Option<String>,
@@ -889,7 +896,7 @@ pub async fn ollama_generate(
     if let Some(stop) = &request.stop {
         options.insert("stop".into(), json!(stop));
     }
-    let body = json!({
+    let mut body = json!({
         "model": request.model,
         "prompt": request.prompt,
         "system": request.system,
@@ -897,6 +904,9 @@ pub async fn ollama_generate(
         "stream": true,
         "options": options,
     });
+    if let Some(think) = request.think {
+        body["think"] = json!(think);
+    }
     let resp = HTTP
         .post(format!("{OLLAMA_BASE}/api/generate"))
         .json(&body)

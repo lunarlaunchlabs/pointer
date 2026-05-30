@@ -47,12 +47,18 @@ function modelScore(name) {
   const n = name.toLowerCase();
   if (/(embed|nomic|bge|minilm|clip)/.test(n)) return -1000;
   let score = 0;
+  const isBase = /(^|[:._/-])base($|[:._/-])/.test(n);
+  const isInstruct = /\b(instruct|chat|it)\b/.test(n);
+  if (isBase && !isInstruct) score -= 160;
+  if (/(fim|fill-?in-?middle)/.test(n)) score -= 80;
+  if (isInstruct) score += 45;
   if (n.includes("qwen3-coder")) score += 120;
   else if (n.includes("qwen2.5-coder")) score += 110;
   else if (n.includes("qwen") && n.includes("coder")) score += 100;
   else if (n.includes("deepseek-coder")) score += 95;
   else if (n.includes("codestral") || n.includes("devstral")) score += 90;
   else if (n.includes("codellama")) score += 80;
+  else if (n.includes("gemma")) score += 75;
   else if (n.includes("qwen")) score += 70;
   else if (n.includes("llama")) score += 60;
   else score += 10;
@@ -88,50 +94,63 @@ async function postJson(url, body, { timeoutMs = 180_000 } = {}) {
  * and request raw mode so callers can pass the literal FIM template
  * unchanged.
  */
-export async function generateRaw({ prompt, options = {}, raw = true, timeoutMs }) {
+export async function generateRaw({ prompt, options = {}, raw = true, timeoutMs, think = false }) {
   const url = `${OLLAMA}/api/generate`;
   const body = {
     model: MODEL,
     prompt,
+    think,
     raw,
     stream: true,
     options: { temperature: 0.2, num_ctx: QUALITY_NUM_CTX, num_predict: 256, ...options },
   };
   const ctrl = new AbortController();
-  if (timeoutMs) setTimeout(() => ctrl.abort(), timeoutMs);
-  const r = await fetch(url, {
-    method: "POST",
-    headers: { "content-type": "application/json" },
-    body: JSON.stringify(body),
-    signal: ctrl.signal,
-  });
-  if (!r.ok) {
-    const t = await r.text();
-    throw new Error(`generate HTTP ${r.status}: ${t.slice(0, 300)}`);
-  }
-  const reader = r.body.getReader();
-  const dec = new TextDecoder();
-  let buf = "";
+  const timer = timeoutMs ? setTimeout(() => ctrl.abort(), timeoutMs) : null;
   let out = "";
-  while (true) {
-    const { value, done } = await reader.read();
-    if (done) break;
-    buf += dec.decode(value, { stream: true });
-    let nl;
-    while ((nl = buf.indexOf("\n")) !== -1) {
-      const line = buf.slice(0, nl);
-      buf = buf.slice(nl + 1);
-      if (!line) continue;
-      try {
-        const j = JSON.parse(line);
-        if (j.response) out += j.response;
-        if (j.done) return out;
-      } catch {
-        // partial line — keep accumulating
+  try {
+    const r = await fetch(url, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(body),
+      signal: ctrl.signal,
+    });
+    if (!r.ok) {
+      const t = await r.text();
+      throw new Error(`generate HTTP ${r.status}: ${t.slice(0, 300)}`);
+    }
+    const reader = r.body.getReader();
+    const dec = new TextDecoder();
+    let buf = "";
+    while (true) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      buf += dec.decode(value, { stream: true });
+      let nl;
+      while ((nl = buf.indexOf("\n")) !== -1) {
+        const line = buf.slice(0, nl);
+        buf = buf.slice(nl + 1);
+        if (!line) continue;
+        try {
+          const j = JSON.parse(line);
+          if (j.response) out += j.response;
+          if (j.done) return out;
+        } catch {
+          // partial line — keep accumulating
+        }
       }
     }
+    return out;
+  } catch (error) {
+    if (out.trim() && /terminated|other side closed|socket|aborted/i.test(error?.message ?? "")) {
+      return out;
+    }
+    if (error?.name === "AbortError") {
+      throw new Error(`generate timed out after ${timeoutMs}ms`);
+    }
+    throw error;
+  } finally {
+    if (timer) clearTimeout(timer);
   }
-  return out;
 }
 
 /** Hit the chat endpoint. Returns the assistant text. */
@@ -143,6 +162,7 @@ export async function chat({ system, messages, options = {}, timeoutMs = QUALITY
       ...(system ? [{ role: "system", content: system }] : []),
       ...messages,
     ],
+    think: false,
     stream: true,
     options: { temperature: 0.2, num_ctx: QUALITY_NUM_CTX, num_predict: 1500, ...options },
   };

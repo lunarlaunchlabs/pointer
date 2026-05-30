@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useState } from "@/lib/preactSignalCompat";
 import {
   Activity,
   Box,
@@ -8,7 +8,7 @@ import {
   Power,
   Skull,
   X,
-} from "lucide-react";
+} from "@/lib/lucide";
 import {
   ipc,
   type HardwareProfile,
@@ -94,7 +94,7 @@ export function SystemMonitor({ onClose }: { onClose: () => void }) {
   const kill = async (pid: number) => {
     const ok = await confirm({
       title: `Stop process ${pid}?`,
-      body: "Pointer can only stop subprocesses it started itself (currently: the Ollama daemon).",
+      body: "Pointer can only stop subprocesses it started itself, such as language servers, terminals, MCP servers, or the Ollama daemon.",
       confirmLabel: "Stop process",
       danger: true,
     });
@@ -113,7 +113,7 @@ export function SystemMonitor({ onClose }: { onClose: () => void }) {
 
   return (
     <div
-      className="fixed inset-0 z-pn-modal flex items-center justify-center bg-black/55 backdrop-blur-md"
+      className="fixed inset-0 z-pn-modal flex items-center justify-center bg-black/62"
       onClick={onClose}
     >
       <div
@@ -189,6 +189,8 @@ export function SystemMonitor({ onClose }: { onClose: () => void }) {
 
               {hardware && <HardwareStrip hardware={hardware} />}
 
+              <ProcessBreakdown processes={snap.processes} />
+
               <LoadedModels
                 models={loaded}
                 onUnload={unloadModel}
@@ -252,24 +254,26 @@ function Sparkline({ series }: { series: Series }) {
   const w = 760;
   const h = 90;
   const pad = 6;
+  const latest = series.length > 0 ? series[series.length - 1] : undefined;
 
-  const { cpuPath, memPath, cpuMax, memMax } = useMemo(() => {
+  const { cpuPath, memPath, cpuPeak, memPeak } = useMemo(() => {
     if (series.length < 2) {
-      return { cpuPath: "", memPath: "", cpuMax: 100, memMax: 0 };
+      return { cpuPath: "", memPath: "", cpuPeak: 0, memPeak: 0 };
     }
-    const cpuMax = Math.max(100, ...series.map((p) => p.cpu));
-    const memMax = Math.max(1, ...series.map((p) => p.mem));
+    const cpuPeak = Math.max(0, ...series.map((p) => p.cpu));
+    const cpuScale = Math.max(100, cpuPeak);
+    const memPeak = Math.max(1, ...series.map((p) => p.mem));
     const dx = (w - pad * 2) / (MAX_POINTS - 1);
     const toX = (i: number) => pad + i * dx;
     const toY = (v: number, max: number) =>
       h - pad - ((v / max) * (h - pad * 2));
     const cpuPath = series
-      .map((p, i) => `${i === 0 ? "M" : "L"}${toX(i)},${toY(p.cpu, cpuMax)}`)
+      .map((p, i) => `${i === 0 ? "M" : "L"}${toX(i)},${toY(p.cpu, cpuScale)}`)
       .join(" ");
     const memPath = series
-      .map((p, i) => `${i === 0 ? "M" : "L"}${toX(i)},${toY(p.mem, memMax)}`)
+      .map((p, i) => `${i === 0 ? "M" : "L"}${toX(i)},${toY(p.mem, memPeak)}`)
       .join(" ");
-    return { cpuPath, memPath, cpuMax, memMax };
+    return { cpuPath, memPath, cpuPeak, memPeak };
   }, [series]);
 
   return (
@@ -277,8 +281,13 @@ function Sparkline({ series }: { series: Series }) {
       <div className="flex items-center justify-between text-[10.5px] text-noir-mute mb-1">
         <span>Last {MAX_POINTS} samples</span>
         <span className="flex items-center gap-3 font-mono">
-          <span className="text-noir-accent">CPU {cpuMax.toFixed(0)}%</span>
-          <span className="text-noir-warn">MEM {fmtBytes(memMax)}</span>
+          <span className="text-noir-accent">
+            CPU {latest ? latest.cpu.toFixed(1) : "0.0"}%
+          </span>
+          <span className="text-noir-warn">
+            MEM {latest ? fmtBytes(latest.mem) : "0 B"}
+          </span>
+          <span>peak {cpuPeak.toFixed(1)}% · {fmtBytes(memPeak)}</span>
         </span>
       </div>
       <svg
@@ -304,6 +313,64 @@ function Sparkline({ series }: { series: Series }) {
           />
         )}
       </svg>
+    </div>
+  );
+}
+
+function ProcessBreakdown({ processes }: { processes: ProcInfo[] }) {
+  const totals = useMemo(() => {
+    const byKind = new Map<string, { cpu: number; mem: number; count: number }>();
+    for (const process of processes) {
+      const prev = byKind.get(process.kind) ?? { cpu: 0, mem: 0, count: 0 };
+      prev.cpu += process.cpu_percent;
+      prev.mem += process.mem_bytes;
+      prev.count += 1;
+      byKind.set(process.kind, prev);
+    }
+    const order = [
+      "renderer",
+      "language_server",
+      "pointer",
+      "dev_server",
+      "ollama",
+      "ollama_runner",
+      "other",
+    ];
+    const rank = (kind: string) => {
+      const idx = order.indexOf(kind);
+      return idx === -1 ? order.length : idx;
+    };
+    return Array.from(byKind.entries()).sort(([a], [b]) => rank(a) - rank(b));
+  }, [processes]);
+
+  if (totals.length === 0) return null;
+
+  return (
+    <div className="rounded-lg border border-noir-line bg-noir-canvas/40 px-3 py-2.5">
+      <div className="mb-2 text-[10.5px] uppercase tracking-wider text-noir-mute">
+        Pointer memory split
+      </div>
+      <div className="grid grid-cols-2 md:grid-cols-4 gap-2">
+        {totals.map(([kind, total]) => (
+          <div
+            key={kind}
+            className="rounded-md border border-noir-line/70 bg-noir-panel/35 px-2.5 py-2"
+          >
+            <div className="flex items-center justify-between gap-2">
+              <KindBadge kind={kind} />
+              <span className="font-mono text-[10px] text-noir-mute">
+                {total.count}
+              </span>
+            </div>
+            <div className="mt-1 font-mono text-[13px] text-noir-text">
+              {fmtBytes(total.mem)}
+            </div>
+            <div className="font-mono text-[10px] text-noir-mute">
+              {total.cpu.toFixed(1)}% CPU
+            </div>
+          </div>
+        ))}
+      </div>
     </div>
   );
 }
@@ -388,6 +455,8 @@ function KindBadge({ kind }: { kind: string }) {
   const map: Record<string, { color: string; label: string }> = {
     pointer: { color: "bg-noir-accent/15 text-noir-accent", label: "pointer" },
     renderer: { color: "bg-noir-accent/10 text-noir-accent", label: "renderer" },
+    language_server: { color: "bg-noir-warn/15 text-noir-warn", label: "LSP" },
+    dev_server: { color: "bg-noir-line text-noir-subtext", label: "dev" },
     ollama: { color: "bg-noir-ok/15 text-noir-ok", label: "ollama" },
     ollama_runner: { color: "bg-noir-ok/10 text-noir-ok", label: "runner" },
     other: { color: "bg-noir-line text-noir-mute", label: "other" },

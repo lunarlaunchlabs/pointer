@@ -7,7 +7,7 @@
  * boot under the new build. Remove the entire file in the release
  * after migration is confirmed safe in the wild.
  */
-import { create } from "zustand";
+import { create } from "@/lib/signalStore";
 import { ipc, listenEvent, newRequestId } from "@/lib/ipc";
 import { getItem, persistAsync } from "@/lib/persist";
 import { getWorkspaceBrief } from "@/lib/workspaceBrief";

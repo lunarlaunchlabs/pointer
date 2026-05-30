@@ -32,8 +32,8 @@ import {
   useLayoutEffect,
   useRef,
   useState,
-} from "react";
-import { createPortal } from "react-dom";
+} from "@/lib/preactSignalCompat";
+import { createPortal } from "@/lib/preactSignalDomCompat";
 
 /** The z-index "layer" a popover should occupy. Mirrors the named
  *  tokens defined in tailwind.config.ts so callers can pick the

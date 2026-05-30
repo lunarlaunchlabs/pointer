@@ -10,7 +10,7 @@
  * the visual cost of a tree adds friction.
  */
 
-import { useMemo } from "react";
+import { useMemo } from "@/lib/preactSignalCompat";
 import {
   AlertCircle,
   AlertTriangle,
@@ -22,7 +22,7 @@ import {
   RefreshCw,
   Sparkles,
   X,
-} from "lucide-react";
+} from "@/lib/lucide";
 import { useDiagnostics, type Diagnostic } from "@/store/diagnostics";
 import { useEditorStore } from "@/store/editor";
 import { FileIconFor } from "@/lib/fileIcon";

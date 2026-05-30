@@ -15,7 +15,7 @@
  * release as rollback safety — the migration is idempotent and
  * skipped once `assistant.sessions.v1` exists.
  */
-import { create } from "zustand";
+import { create } from "@/lib/signalStore";
 import {
   ipc,
   listenEvent,

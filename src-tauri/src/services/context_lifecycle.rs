@@ -58,9 +58,7 @@ pub fn compact_dialogue(
 
     let mut preserved_prefix = Vec::new();
     let mut body_start = 0usize;
-    while body_start < messages.len()
-        && messages[body_start].role.eq_ignore_ascii_case("system")
-    {
+    while body_start < messages.len() && messages[body_start].role.eq_ignore_ascii_case("system") {
         preserved_prefix.push(CompactMessage {
             role: messages[body_start].role.clone(),
             content: trim_message(&messages[body_start].content, options.max_message_chars),
@@ -121,7 +119,10 @@ pub fn compacted_history_packet(messages: &[CompactMessage], max_chars: usize) -
             role,
             collapse_whitespace(&message.content, 280)
         );
-        if out.len().saturating_add(line.len()).saturating_add("</compacted_context>".len())
+        if out
+            .len()
+            .saturating_add(line.len())
+            .saturating_add("</compacted_context>".len())
             > max_chars
         {
             out.push_str("…older turns omitted…\n");

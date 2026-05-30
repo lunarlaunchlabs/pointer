@@ -1,7 +1,7 @@
-import { useEffect, useState } from "react";
+import { useEffect, useState } from "@/lib/preactSignalCompat";
 import { Command } from "cmdk";
-import { createPortal } from "react-dom";
-import { Code2 } from "lucide-react";
+import { createPortal } from "@/lib/preactSignalDomCompat";
+import { Code2 } from "@/lib/lucide";
 import { useEditorStore } from "@/store/editor";
 import { toast } from "@/components/Toast";
 

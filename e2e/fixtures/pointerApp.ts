@@ -19,6 +19,16 @@ export const paths = {
   css: `${ROOT}/styles/theme.css`,
   json: `${ROOT}/package.json`,
   markdown: `${ROOT}/README.md`,
+  missingDepsTs: `${ROOT}/src/MissingDeps.ts`,
+  missingDepsPython: `${ROOT}/python/missing.py`,
+  missingDepsRust: `${ROOT}/rust/src/missing.rs`,
+  missingDepsGo: `${ROOT}/go/missing.go`,
+  missingDepsJava: `${ROOT}/java/src/main/java/com/example/MissingDeps.java`,
+  missingDepsCsharp: `${ROOT}/dotnet/MissingDeps.cs`,
+  missingDepsPhp: `${ROOT}/php/missing.php`,
+  missingDepsRuby: `${ROOT}/ruby/missing.rb`,
+  missingDepsDart: `${ROOT}/dart/lib/missing.dart`,
+  missingDepsSwift: `${ROOT}/swift/Sources/Missing.swift`,
 };
 
 export type PointerFixtures = {
@@ -53,6 +63,30 @@ export async function openE2EFile(page: Page, path: string) {
     (targetPath) => window.__POINTER_E2E__?.editor?.activeTab?.()?.path === targetPath,
     path,
   );
+  await page.waitForFunction(
+    (targetPath) => {
+      const editor = window.__POINTER_E2E__?.editor;
+      const active = editor?.activeTab?.() as { path?: string; content?: string } | undefined;
+      if (active?.path !== targetPath) return false;
+      return editor?.content?.() === active.content;
+    },
+    path,
+  );
+}
+
+export async function writeE2EFile(page: Page, path: string, content: string) {
+  await page.evaluate(
+    ({ targetPath, text }) => {
+      window.__POINTER_E2E__?.fs?.write?.(targetPath, text);
+    },
+    { targetPath: path, text: content },
+  );
+}
+
+export async function deleteE2EPath(page: Page, path: string) {
+  await page.evaluate((targetPath) => {
+    window.__POINTER_E2E__?.fs?.delete?.(targetPath);
+  }, path);
 }
 
 export async function activeTab(page: Page) {
@@ -61,6 +95,10 @@ export async function activeTab(page: Page) {
 
 export async function editorLanguage(page: Page) {
   return page.evaluate(() => window.__POINTER_E2E__?.editor?.language?.());
+}
+
+export async function editorCursor(page: Page) {
+  return page.evaluate(() => window.__POINTER_E2E__?.editor?.cursor?.() ?? null);
 }
 
 export async function editorMarkers(page: Page) {
@@ -219,6 +257,12 @@ function makeFixture() {
       "  return render",
       "}",
     ].join("\n"),
+    [paths.missingDepsTs]: [
+      "import React from 'react';",
+      "import leftPad from 'left-pad';",
+      "",
+      "export const paddedVersion = leftPad(React.version, 8);",
+    ].join("\n"),
     [paths.server]: [
       "import express from 'express';",
       "import { makeRouter } from './router.js';",
@@ -245,6 +289,26 @@ function makeFixture() {
       "def health() -> dict[str, bool]:",
       "    return {'ok': True}",
     ].join("\n"),
+    [`${ROOT}/python/pyproject.toml`]: [
+      "[project]",
+      'dependencies = ["fastapi>=0.110"]',
+    ].join("\n"),
+    [paths.missingDepsPython]: [
+      "from fastapi import FastAPI",
+      "import requests",
+      "import os",
+      "",
+      "app = FastAPI()",
+    ].join("\n"),
+    [`${ROOT}/rust/Cargo.toml`]: [
+      "[package]",
+      'name = "pointer-e2e-rust"',
+      'version = "0.1.0"',
+      'edition = "2021"',
+      "",
+      "[dependencies]",
+      'serde = "1"',
+    ].join("\n"),
     [paths.rust]: [
       "pub fn render_greeting(name: &str) -> String {",
       "    format!(\"Hello, {name}\")",
@@ -260,6 +324,23 @@ function makeFixture() {
       "    }",
       "}",
     ].join("\n"),
+    [paths.missingDepsRust]: [
+      "use serde::Serialize;",
+      "use anyhow::Result;",
+      "use std::fmt;",
+      "",
+      "#[derive(Serialize)]",
+      "pub struct Probe {",
+      "    name: String,",
+      "}",
+    ].join("\n"),
+    [`${ROOT}/go/go.mod`]: [
+      "module example.com/pointer-e2e",
+      "",
+      "go 1.22",
+      "",
+      "require github.com/gin-gonic/gin v1.10.0",
+    ].join("\n"),
     [paths.go]: [
       "package main",
       "",
@@ -273,6 +354,21 @@ function makeFixture() {
       "    fmt.Println(renderGreeting(\"Pointer\"))",
       "}",
     ].join("\n"),
+    [paths.missingDepsGo]: [
+      "package main",
+      "",
+      "import (",
+      "    \"fmt\"",
+      "    \"github.com/gin-gonic/gin\"",
+      "    \"github.com/labstack/echo/v4\"",
+      ")",
+      "",
+      "func probe() {",
+      "    _ = fmt.Sprintf",
+      "    _ = gin.New",
+      "    _ = echo.New",
+      "}",
+    ].join("\n"),
     [paths.java]: [
       "package com.example;",
       "",
@@ -282,12 +378,108 @@ function makeFixture() {
       "  }",
       "}",
     ].join("\n"),
+    [`${ROOT}/java/pom.xml`]: [
+      "<project>",
+      "  <dependencies>",
+      "    <dependency>",
+      "      <groupId>com.google.common</groupId>",
+      "      <artifactId>guava</artifactId>",
+      "      <version>33.0.0</version>",
+      "    </dependency>",
+      "  </dependencies>",
+      "</project>",
+    ].join("\n"),
+    [paths.missingDepsJava]: [
+      "package com.example;",
+      "",
+      "import com.google.common.collect.ImmutableList;",
+      "import org.apache.commons.lang3.StringUtils;",
+      "",
+      "public class MissingDeps { }",
+    ].join("\n"),
     [paths.csharp]: [
       "var builder = WebApplication.CreateBuilder(args);",
       "var app = builder.Build();",
       "",
       "app.MapGet(\"/health\", () => Results.Ok(new { ok = true }));",
       "app.Run();",
+    ].join("\n"),
+    [`${ROOT}/dotnet/PointerE2E.csproj`]: [
+      '<Project Sdk="Microsoft.NET.Sdk">',
+      "  <ItemGroup>",
+      '    <PackageReference Include="Newtonsoft.Json" Version="13.0.3" />',
+      "  </ItemGroup>",
+      "</Project>",
+    ].join("\n"),
+    [paths.missingDepsCsharp]: [
+      "using System;",
+      "using Newtonsoft.Json;",
+      "using Dapper;",
+      "",
+      "public class MissingDeps { }",
+    ].join("\n"),
+    [`${ROOT}/php/composer.json`]: JSON.stringify(
+      {
+        require: {
+          "monolog/monolog": "^3.0",
+        },
+        autoload: {
+          "psr-4": {
+            "Monolog\\": "src/Monolog/",
+          },
+        },
+      },
+      null,
+      2,
+    ),
+    [paths.missingDepsPhp]: [
+      "<?php",
+      "",
+      "use Monolog\\Logger;",
+      "use GuzzleHttp\\Client;",
+    ].join("\n"),
+    [`${ROOT}/ruby/Gemfile`]: [
+      'source "https://rubygems.org"',
+      "",
+      'gem "faraday"',
+    ].join("\n"),
+    [paths.missingDepsRuby]: [
+      'require "faraday"',
+      'require "httparty"',
+    ].join("\n"),
+    [`${ROOT}/dart/pubspec.yaml`]: [
+      "name: pointer_e2e",
+      "",
+      "dependencies:",
+      "  http: ^1.2.0",
+    ].join("\n"),
+    [paths.missingDepsDart]: [
+      "import 'package:http/http.dart';",
+      "import 'package:riverpod/riverpod.dart';",
+    ].join("\n"),
+    [`${ROOT}/swift/Package.swift`]: [
+      "// swift-tools-version: 5.9",
+      "import PackageDescription",
+      "",
+      "let package = Package(",
+      '  name: "PointerE2E",',
+      "  dependencies: [",
+      '    .package(url: "https://github.com/Alamofire/Alamofire.git", from: "5.8.0")',
+      "  ],",
+      "  targets: [",
+      "    .target(",
+      '      name: "PointerE2E",',
+      "      dependencies: [",
+      '        .product(name: "Alamofire", package: "Alamofire")',
+      "      ]",
+      "    )",
+      "  ]",
+      ")",
+    ].join("\n"),
+    [paths.missingDepsSwift]: [
+      "import Foundation",
+      "import Alamofire",
+      "import ArgumentParser",
     ].join("\n"),
     [paths.vue]: [
       "<template>",
@@ -413,7 +605,30 @@ function mockPointerDesktop(fixture: {
   const commandLog: Array<{ command: string; args: unknown; at: number }> = [];
   const unknownCommands: Array<{ command: string; args: unknown }> = [];
   let gitStatusOverride: Record<string, unknown> | null = null;
+  const gitHeadFiles = new Map<string, string>();
   const gitCommandOutputs = new Map<string, string>();
+  let loadedModels: Array<{
+    name: string;
+    processor: string;
+    size_bytes: number;
+    expires_at?: string | null;
+  }> = [];
+  let inferenceSnapshotOverride: {
+    active: Array<{
+      request_id: string;
+      model: string;
+      title: string;
+      kind: string;
+      started_at_ms: number;
+      updated_at_ms: number;
+      token_count?: number;
+      interruptible?: boolean;
+      cancellable?: boolean;
+      cancelling?: boolean;
+    }>;
+    active_count: number;
+    updated_at_ms: number;
+  } | null = null;
   let ollamaGenerateDelay = 10;
   let ollamaFimDelay = 20;
   let ollamaGenerateOverrides: Record<string, string> = {};
@@ -437,14 +652,24 @@ function mockPointerDesktop(fixture: {
     fs: {
       read: (path: string) => files.get(path),
       write: (path: string, content: string) => {
-        files.set(path, content);
-        ensureParentDirs(path);
+        writeTextFile(path, content);
+      },
+      copy: (from: string, to: string) => {
+        copyPath(from, to);
+      },
+      delete: (path: string) => {
+        deletePath(path);
       },
       entries: () => Array.from(files.keys()).sort(),
     },
     git: {
       setStatus: (status: Record<string, unknown> | null) => {
         gitStatusOverride = status;
+      },
+      setHeadFile: (path: string, content: string | null) => {
+        const key = normalizeFixtureGitPath(path);
+        if (content == null) gitHeadFiles.delete(key);
+        else gitHeadFiles.set(key, content);
       },
       setCommandOutput: (command: string, output: string | null) => {
         if (output == null) gitCommandOutputs.delete(command);
@@ -460,6 +685,15 @@ function mockPointerDesktop(fixture: {
     ai: {
       setFimDelay: (delay: number) => {
         ollamaFimDelay = delay;
+      },
+    },
+    modelActivity: {
+      setLoadedModels: (models: typeof loadedModels) => {
+        loadedModels = models;
+      },
+      setInferenceSnapshot: (snapshot: typeof inferenceSnapshotOverride) => {
+        inferenceSnapshotOverride = snapshot;
+        emitTauri("inference:changed", snapshot ?? { active: [], active_count: 0, updated_at_ms: Date.now() });
       },
     },
   };
@@ -531,6 +765,8 @@ function mockPointerDesktop(fixture: {
         return deletePath(args.path);
       case "rename_path":
         return renamePath(args.from, args.to);
+      case "copy_path":
+        return copyPath(args.from, args.to);
       case "search_files":
         return searchFiles(args.query, args.limit ?? 50);
       case "search_directories":
@@ -574,6 +810,14 @@ function mockPointerDesktop(fixture: {
         return lspCompletionResolve(args.req);
       case "lsp_document_symbols":
         return lspDocumentSymbols(args.doc);
+      case "lsp_document_highlight":
+        return lspDocumentHighlight(args.req);
+      case "lsp_signature_help":
+        return lspSignatureHelp(args.req);
+      case "lsp_inlay_hints":
+        return lspInlayHints(args.req);
+      case "lsp_rename":
+        return lspRename(args.req);
       case "git_status_for_workspace":
         return gitStatus();
       case "git_blame_file":
@@ -591,7 +835,9 @@ function mockPointerDesktop(fixture: {
       case "git_log":
         return [];
       case "git_diff":
+        return gitCommandOutputs.get(command) ?? "";
       case "git_show_file":
+        return gitShowFile(args.path, args.source);
       case "git_stage":
       case "git_unstage":
       case "git_commit":
@@ -630,16 +876,30 @@ function mockPointerDesktop(fixture: {
           { name: "nomic-embed-text", size: 274_000_000, modified_at: "2026-05-28T00:00:00Z" },
         ];
       case "ollama_ps":
-        return [];
+        return loadedModels;
       case "inference_status":
-        return { active: [], active_count: 0, updated_at_ms: Date.now() };
+        return inferenceSnapshotOverride ?? { active: [], active_count: 0, updated_at_ms: Date.now() };
       case "inference_cancel":
+        if (inferenceSnapshotOverride) {
+          inferenceSnapshotOverride = {
+            ...inferenceSnapshotOverride,
+            active: inferenceSnapshotOverride.active.map((job) =>
+              job.request_id === args.requestId ? { ...job, cancelling: true } : job,
+            ),
+            updated_at_ms: Date.now(),
+          };
+          emitTauri("inference:changed", inferenceSnapshotOverride);
+        }
+        return true;
       case "ollama_cancel":
       case "agent_cancel":
         return true;
       case "ollama_start":
       case "ollama_stop":
+        return null;
       case "ollama_unload_model":
+        loadedModels = loadedModels.filter((model) => model.name !== args.model);
+        return null;
       case "ollama_delete_model":
       case "ollama_install":
       case "ollama_pull":
@@ -675,6 +935,8 @@ function mockPointerDesktop(fixture: {
         };
       case "system_snapshot":
         return systemSnapshot();
+      case "system_load_snapshot":
+        return systemLoadSnapshot();
       case "classify_file":
         return { kind: "plain", required_purpose: null, label: "Text", reason: null };
       case "process_file":
@@ -735,6 +997,9 @@ function mockPointerDesktop(fixture: {
         return { steps: [] };
       case "kill_owned_process":
         return true;
+      case "set_app_icon_theme":
+      case "set_theme_menu_active":
+        return null;
       case "reveal_in_filer":
         return null;
       default:
@@ -940,6 +1205,36 @@ function mockPointerDesktop(fixture: {
     return null;
   }
 
+  function copyPath(from: string, to: string) {
+    if (files.has(to) || dirs.has(to)) {
+      throw new Error(`destination exists: ${to}`);
+    }
+    if (files.has(from)) {
+      files.set(to, files.get(from) ?? "");
+      ensureParentDirs(to);
+    } else if (dirs.has(from)) {
+      if (to === from || to.startsWith(`${from}/`)) {
+        throw new Error("cannot copy a folder into itself");
+      }
+      dirs.add(to);
+      ensureParentDirs(to);
+      for (const dir of Array.from(dirs)) {
+        if (dir.startsWith(`${from}/`)) {
+          dirs.add(`${to}${dir.slice(from.length)}`);
+        }
+      }
+      for (const [filePath, content] of Array.from(files.entries())) {
+        if (filePath.startsWith(`${from}/`)) {
+          files.set(`${to}${filePath.slice(from.length)}`, content);
+        }
+      }
+    } else {
+      throw new Error(`missing path: ${from}`);
+    }
+    emitTauri("fs:change", { kind: "copy", paths: [from, to] });
+    return null;
+  }
+
   function searchFiles(query = "", limit = 50) {
     const q = query.trim().toLowerCase();
     return Array.from(files.keys())
@@ -1026,8 +1321,10 @@ function mockPointerDesktop(fixture: {
   function lspHover(req: any) {
     const word = wordAt(req.content, req.line, req.column);
     if (!word) return null;
+    const symbol = extractSymbols(req.content).find((item) => item.name === word);
+    const detail = symbol?.detail ?? `${req.language ?? "language"} symbol`;
     return {
-      contents: `**${word}**\n\nE2E language service hover for ${word}.`,
+      contents: `**${word}**\n\n${detail}\n\nE2E language service hover for ${word}.`,
       range: null,
     };
   }
@@ -1040,6 +1337,8 @@ function mockPointerDesktop(fixture: {
     if (word === "makeRouter") return [loc(fixturePaths.router, 3, 17, 3, 27)];
     if (word === "health") return [loc(fixturePaths.python, 6, 5, 6, 11)];
     if (word === "render_greeting") return [loc(fixturePaths.rust, 1, 8, 1, 23)];
+    const definition = findDefinition(word, req.path);
+    if (definition) return [definition];
     return [];
   }
 
@@ -1051,13 +1350,17 @@ function mockPointerDesktop(fixture: {
     );
   }
 
-  function lspCompletion(_req: any) {
-    return [
+  function lspCompletion(req: any) {
+    const local = extractSymbols(req?.content ?? "").map((symbol) =>
+      completion(symbol.name, symbol.detail, `E2E symbol completion for ${symbol.name}`),
+    );
+    return uniqueCompletions([
+      ...local,
       completion("renderGreeting", "function renderGreeting(name: string): string", "Function"),
       completion("Button", "React component", "Class"),
       completion("makeRouter", "Express router factory", "Function"),
       completion("health", "FastAPI handler", "Function"),
-    ];
+    ]);
   }
 
   function lspCompletionResolve(args: any) {
@@ -1069,24 +1372,62 @@ function mockPointerDesktop(fixture: {
 
   function lspDocumentSymbols(doc: any) {
     const content = doc?.content ?? "";
-    const symbols: any[] = [];
-    for (const [index, line] of content.split(/\r?\n/).entries()) {
-      const match = line.match(/\b(function|class|const|def|fn|func)\s+([A-Za-z_]\w*)/);
-      if (match) {
-        const column = line.indexOf(match[2]) + 1;
-        symbols.push({
-          name: match[2],
-          kind: 12,
-          detail: match[1],
-          line: index + 1,
-          column,
-          endLine: index + 1,
-          endColumn: column + match[2].length,
-          children: [],
-        });
-      }
-    }
-    return symbols;
+    return extractSymbols(content).map((symbol) => ({
+      name: symbol.name,
+      kind: symbol.kind,
+      detail: symbol.detail,
+      line: symbol.line,
+      column: symbol.column,
+      endLine: symbol.line,
+      endColumn: symbol.endColumn,
+      children: [],
+    }));
+  }
+
+  function lspDocumentHighlight(req: any) {
+    const word = wordAt(req.content, req.line, req.column);
+    if (!word) return [];
+    return rangesForWord(req.content, word).map((range) => ({ range, kind: 2 }));
+  }
+
+  function lspSignatureHelp(req: any) {
+    const word = wordAt(req.content, req.line, Math.max(1, req.column - 1));
+    return {
+      signatures: [
+        {
+          label: `${word || "call"}(...)`,
+          documentation: `E2E signature help for ${word || req.language}.`,
+          parameters: [{ label: "value", documentation: "Synthetic parameter" }],
+        },
+      ],
+      activeSignature: 0,
+      activeParameter: 0,
+    };
+  }
+
+  function lspInlayHints(req: any) {
+    const symbols = extractSymbols(req.content).filter(
+      (symbol) => symbol.line >= req.startLine && symbol.line <= req.endLine,
+    );
+    return symbols.slice(0, req.limit ?? 20).map((symbol) => ({
+      label: ": inferred",
+      tooltip: `E2E inferred type for ${symbol.name}`,
+      line: symbol.line,
+      column: symbol.endColumn,
+      kind: 1,
+      paddingLeft: true,
+      paddingRight: false,
+    }));
+  }
+
+  function lspRename(req: any) {
+    const word = wordAt(req.content, req.line, req.column);
+    if (!word || !req.newName) return [];
+    return rangesForWord(req.content, word).map((range) => ({
+      path: req.path,
+      range,
+      newText: req.newName,
+    }));
   }
 
   function gitStatus() {
@@ -1104,6 +1445,24 @@ function mockPointerDesktop(fixture: {
     };
   }
 
+  function gitShowFile(path: string, source: string) {
+    if (source !== "head" && source !== "staged") return "";
+    const key = normalizeFixtureGitPath(path);
+    if (source === "head") return gitHeadFiles.get(key) ?? "";
+    const absolutePath = key.startsWith("/") ? key : `${fixture.root}/${key}`;
+    return files.get(absolutePath) ?? "";
+  }
+
+  function normalizeFixtureGitPath(path: string) {
+    const normalized = String(path ?? "").replace(/\\/g, "/").replace(/^\/+/, "");
+    const root = fixture.root.replace(/\\/g, "/").replace(/^\/+/, "");
+    if (normalized === root) return "";
+    const prefix = `${root}/`;
+    return normalized.startsWith(prefix)
+      ? normalized.slice(prefix.length)
+      : normalized;
+  }
+
   function systemSnapshot() {
     return {
       cpu_percent: 11,
@@ -1116,6 +1475,16 @@ function mockPointerDesktop(fixture: {
       host_name: "pointer-e2e",
       os_name: "macOS",
       processes: [],
+      pointer_cpu_percent: 3,
+      pointer_mem_bytes: 220_000_000,
+    };
+  }
+
+  function systemLoadSnapshot() {
+    return {
+      cpu_percent: 11,
+      mem_total: 34_359_738_368,
+      mem_used: 12_000_000_000,
       pointer_cpu_percent: 3,
       pointer_mem_bytes: 220_000_000,
     };
@@ -1314,13 +1683,127 @@ function mockPointerDesktop(fixture: {
     return path.split("/").pop() ?? path;
   }
 
+  function extractSymbols(content: string) {
+    const symbols: Array<{
+      name: string;
+      detail: string;
+      kind: number;
+      line: number;
+      column: number;
+      endColumn: number;
+      declaration: boolean;
+    }> = [];
+    const seen = new Set<string>();
+    const add = (
+      name: string | undefined,
+      detail: string,
+      line: string,
+      index: number,
+      kind = 12,
+      declaration = true,
+    ) => {
+      if (!name || !/^[A-Za-z_$][\w$]*$/.test(name)) return;
+      const key = `${name}:${index + 1}`;
+      if (seen.has(key)) return;
+      const column = line.indexOf(name) + 1;
+      if (column <= 0) return;
+      seen.add(key);
+      symbols.push({
+        name,
+        detail,
+        kind,
+        line: index + 1,
+        column,
+        endColumn: column + name.length,
+        declaration,
+      });
+    };
+
+    for (const [index, line] of content.split(/\r?\n/).entries()) {
+      const declaration =
+        line.match(
+          /\b(?:export\s+default\s+|export\s+|pub\s+|public\s+|private\s+|protected\s+|async\s+|static\s+)*(?:function|class|interface|type|enum|struct|trait|impl|mod|fn|def|func|proc|module|object|model|operation|resource|contract|namespace)\s+([A-Za-z_$][\w$]*)/,
+        ) ??
+        line.match(/\b(?:const|let|var|val|fun|def|my|local)\s+([A-Za-z_$][\w$]*)/) ??
+        line.match(/\b([A-Za-z_$][\w$]*)\s*(?:::=|::|<-|=)\s*/) ??
+        line.match(/^\s*([A-Za-z_$][\w$]*)\s*:/) ??
+        line.match(/\bCREATE\s+TABLE\s+([A-Za-z_$][\w$]*)/i) ??
+        line.match(/<([A-Za-z_$][\w$]*)\b/) ??
+        line.match(/\.([A-Za-z_$][\w$]*)\b/);
+      if (declaration) {
+        add(declaration[1], `E2E ${declaration[0].trim()} declaration`, line, index);
+      }
+
+      for (const match of line.matchAll(/\b(Pointer[A-Za-z0-9_$]*|pointerProbe|renderGreeting|Button|makeRouter|health|render_greeting)\b/g)) {
+        add(match[1], "E2E project symbol", line, index, 12, false);
+      }
+    }
+    return symbols;
+  }
+
+  function findDefinition(word: string, preferredPath?: string) {
+    if (!word) return null;
+    const candidates: Array<ReturnType<typeof loc>> = [];
+    const orderedEntries = Array.from(files.entries()).sort(([a], [b]) => {
+      if (a === preferredPath) return -1;
+      if (b === preferredPath) return 1;
+      return a.localeCompare(b);
+    });
+    for (const [path, content] of orderedEntries) {
+      for (const symbol of extractSymbols(content)) {
+        if (symbol.name !== word) continue;
+        candidates.push(
+          loc(path, symbol.line, symbol.column, symbol.line, symbol.endColumn),
+        );
+      }
+    }
+    return (
+      candidates.find((candidate) => {
+        const content = files.get(candidate.path) ?? "";
+        return extractSymbols(content).some(
+          (symbol) =>
+            symbol.declaration &&
+            symbol.name === word &&
+            symbol.line === candidate.line &&
+            symbol.column === candidate.column,
+        );
+      }) ??
+      candidates[0] ??
+      null
+    );
+  }
+
+  function rangesForWord(content: string, word: string) {
+    const escaped = word.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    const re = new RegExp(`\\b${escaped}\\b`, "g");
+    const ranges: Array<{
+      startLine: number;
+      startColumn: number;
+      endLine: number;
+      endColumn: number;
+    }> = [];
+    for (const [index, line] of content.split(/\r?\n/).entries()) {
+      for (const match of line.matchAll(re)) {
+        const start = (match.index ?? 0) + 1;
+        ranges.push({
+          startLine: index + 1,
+          startColumn: start,
+          endLine: index + 1,
+          endColumn: start + word.length,
+        });
+      }
+    }
+    return ranges;
+  }
+
   function wordAt(content: string, lineNumber: number, column: number) {
     const line = content.split(/\r?\n/)[lineNumber - 1] ?? "";
     let start = Math.max(0, column - 1);
     while (start > 0 && /[A-Za-z0-9_$]/.test(line[start - 1])) start -= 1;
     let end = Math.max(0, column - 1);
     while (end < line.length && /[A-Za-z0-9_$]/.test(line[end])) end += 1;
-    return line.slice(start, end);
+    const raw = line.slice(start, end);
+    return raw.startsWith("$") ? raw.slice(1) : raw;
   }
 
   function loc(path: string, line: number, column: number, endLine: number, endColumn: number) {
@@ -1343,6 +1826,15 @@ function mockPointerDesktop(fixture: {
       data: null,
     };
   }
+
+  function uniqueCompletions(items: ReturnType<typeof completion>[]) {
+    const seen = new Set<string>();
+    return items.filter((item) => {
+      if (seen.has(item.label)) return false;
+      seen.add(item.label);
+      return true;
+    });
+  }
 }
 
 declare global {
@@ -1351,36 +1843,111 @@ declare global {
       appReady?: boolean;
       commandLog?: Array<{ command: string; args: unknown; at: number }>;
       emitTauri?: (event: string, payload: unknown) => void;
+      fs?: {
+        read?: (path: string) => string | undefined;
+        write?: (path: string, content: string) => void;
+        copy?: (from: string, to: string) => void;
+        delete?: (path: string) => void;
+        entries?: () => string[];
+      };
       editor?: {
         activeTab?: () => unknown;
+        cursor?: () => unknown;
         openFile?: (path: string) => Promise<void>;
         language?: () => string | null;
         content?: () => string;
+        modelOptions?: () => { tabSize: number; insertSpaces: boolean } | null;
         markers?: () => unknown[];
         visibleTokenClasses?: () => string[];
-        visibleGhostText?: () => Array<{
+        visibleTokenStyles?: () => Array<{
           text: string;
+          className: string;
           color: string;
+          fontWeight: string;
+          fontStyle: string;
+        }>;
+          tokenStylesForLine?: (line: number) => Array<{
+            text: string;
+            className: string;
+            color: string;
+            fontWeight: string;
+            fontStyle: string;
+          }>;
+          setInlayHints?: (enabled: boolean) => void;
+          visibleGhostText?: () => Array<{
+            text: string;
+            color: string;
           backgroundColor: string;
           display: string;
           visibility: string;
         }>;
+        gitDiffDecorationClasses?: () => string[];
+        breakpointDecorationClasses?: () => string[];
+        toggleBreakpointAt?: (line: number, column?: number) => Promise<unknown[]>;
+        runAction?: (id: string) => Promise<void>;
         triggerSuggest?: (line: number, column: number) => Promise<void>;
+        clientPointForPosition?: (
+          line: number,
+          column: number,
+        ) => Promise<{ x: number; y: number } | null>;
+        visibleSuggestItems?: () => string[];
+        showHoverAt?: (line: number, column: number) => Promise<string>;
         triggerInlineSuggest?: (line: number, column: number) => Promise<void>;
         triggerInlineSuggestAtCursor?: () => Promise<void>;
         gotoDefinitionAt?: (line: number, column: number) => Promise<string | null>;
+        hoverAt?: (line: number, column: number) => Promise<unknown>;
+        completionItemsAt?: (line: number, column: number) => Promise<unknown[]>;
+        referencesAt?: (line: number, column: number) => Promise<unknown[]>;
+        documentHighlightsAt?: (line: number, column: number) => Promise<unknown[]>;
+        documentSymbols?: () => Promise<unknown[]>;
+        renameEditsAt?: (line: number, column: number, newName: string) => Promise<unknown[]>;
+        inlayHintsAt?: (
+          startLine: number,
+          startColumn: number,
+          endLine: number,
+          endColumn: number,
+        ) => Promise<unknown[]>;
       };
       assistant?: {
         pendingRefs?: () => unknown[];
       };
+      theme?: {
+        active?: () => string;
+        setTheme?: (themeId: string) => void;
+      };
       git?: {
         setStatus?: (status: Record<string, unknown> | null) => void;
+        setHeadFile?: (path: string, content: string | null) => void;
         setCommandOutput?: (command: string, output: string | null) => void;
         setGenerateDelay?: (delay: number) => void;
         setGenerateOverrides?: (overrides: Record<string, string> | null) => void;
       };
       ai?: {
         setFimDelay?: (delay: number) => void;
+      };
+      modelActivity?: {
+        setLoadedModels?: (models: Array<{
+          name: string;
+          processor: string;
+          size_bytes: number;
+          expires_at?: string | null;
+        }>) => void;
+        setInferenceSnapshot?: (snapshot: {
+          active: Array<{
+            request_id: string;
+            model: string;
+            title: string;
+            kind: string;
+            started_at_ms: number;
+            updated_at_ms: number;
+            token_count?: number;
+            interruptible?: boolean;
+            cancellable?: boolean;
+            cancelling?: boolean;
+          }>;
+          active_count: number;
+          updated_at_ms: number;
+        } | null) => void;
       };
       debug?: {
         breakpoints?: () => unknown[];

@@ -1,4 +1,4 @@
-import { useMemo, useState } from "react";
+import { useMemo, useState } from "@/lib/preactSignalCompat";
 import {
   Code,
   Eye,
@@ -12,10 +12,11 @@ import {
   Sparkles,
   Terminal,
   X,
-} from "lucide-react";
+} from "@/lib/lucide";
 import { useSettings } from "@/store/settings";
 import { Switch } from "@/components/Switch";
 import { dispatchAction } from "@/lib/actions";
+import { POINTER_THEMES } from "@/theme/themes";
 
 /**
  * Dedicated Settings page. A searchable, categorized view of every
@@ -293,16 +294,16 @@ export function SettingsPage({ onClose }: { onClose: () => void }) {
         id: "appTheme",
         category: "appearance",
         label: "Theme",
-        description: "Switch between Pointer Noir (dark) and Pointer Light.",
-        keywords: "theme dark light",
+        description: "Choose the global Pointer theme for app chrome and editor syntax.",
+        keywords: "theme dark light gray grey gris noir blanc magnet alien pastelle pastel paladin desert sage earthy salmon peach tumbleweed charleston green fall photon harmonic tide rocket meteor cola vampire monkey",
         render: () => (
           <Select
             value={s.appTheme}
             label="App theme"
-            options={[
-              { id: "noir", label: "Pointer Noir (dark)" },
-              { id: "light", label: "Pointer Light" },
-            ]}
+            options={POINTER_THEMES.map((theme) => ({
+              id: theme.id,
+              label: theme.menuLabel,
+            }))}
             onChange={(v) => s.setAppTheme(v as typeof s.appTheme)}
           />
         ),
@@ -427,6 +428,25 @@ export function SettingsPage({ onClose }: { onClose: () => void }) {
             label="Enable tab completion"
             checked={s.fimEnabled}
             onChange={s.setFimEnabled}
+          />
+        ),
+      },
+      {
+        id: "fimTriggerMode",
+        category: "ai",
+        label: "Tab completion trigger",
+        description:
+          "Automatic asks after you pause typing. Manual only asks when you press the request-completion shortcut.",
+        keywords: "ai fim manual automatic trigger shortcut tab completion",
+        render: () => (
+          <Select
+            value={s.fimTriggerMode}
+            label="Tab completion trigger mode"
+            options={[
+              { id: "automatic", label: "Automatic while typing" },
+              { id: "manual", label: "Manual request only (⌘⇧Space)" },
+            ]}
+            onChange={(v) => s.setFimTriggerMode(v as typeof s.fimTriggerMode)}
           />
         ),
       },

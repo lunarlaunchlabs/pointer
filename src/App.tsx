@@ -1,4 +1,4 @@
-import { lazy, Suspense, useCallback, useEffect, useRef, useState } from "react";
+import { lazy, Suspense, useCallback, useEffect, useRef, useState } from "@/lib/preactSignalCompat";
 
 /** Run `fn` exactly once for the lifetime of this module. We can't use a
  *  React ref because StrictMode unmounts/remounts; we need a process-wide
@@ -75,31 +75,19 @@ function navigateProblem(direction: "next" | "prev") {
     .revealAt(path, target.startLine, target.startCol)
     .catch(() => {});
 }
-import { Clock, Folder, Sparkles, X } from "lucide-react";
+import { Clock, Folder, Sparkles, X } from "@/lib/lucide";
 import { Titlebar } from "@/components/Titlebar";
 import { FileTree } from "@/components/FileTree";
 import { Outline } from "@/components/Outline";
 import { Tabs } from "@/components/Tabs";
 import { Breadcrumbs } from "@/components/Breadcrumbs";
-import { Editor } from "@/components/Editor";
-import { DiffView } from "@/components/DiffView";
-import { OpenRecentPicker } from "@/components/OpenRecentPicker";
-import { WorkspaceSymbols } from "@/components/WorkspaceSymbols";
-import { NotificationCenter } from "@/components/NotificationCenter";
-import { TasksPicker } from "@/components/TasksPicker";
-import { BookmarksPicker } from "@/components/BookmarksPicker";
-import { LanguagePicker } from "@/components/LanguagePicker";
 import { useTerminals, nextTerminalTitle } from "@/store/terminal";
-import { ProblemsPanel } from "@/components/Problems/ProblemsPanel";
 import { StatusBar } from "@/components/StatusBar";
-import { CommandPalette } from "@/components/CommandPalette";
-import { FileFinder } from "@/components/FileFinder";
-import { FindInFiles } from "@/components/FindInFiles";
-import { Onboarding } from "@/components/Onboarding/Wizard";
 import { RightDock } from "@/components/RightDock";
-import { ShortcutsHelp } from "@/components/ShortcutsHelp";
 import { ToastHost, toast } from "@/components/Toast";
+import { LspIdleManager } from "@/components/LspIdleManager";
 import { RefactorSuggestion } from "@/components/RefactorSuggestion";
+import { PointerMarkSvg, PointerWordmarkSvg } from "@/components/BrandLogo";
 import { createRefactorWatcher } from "@/lib/refactorWatcher";
 import { useWorkspace } from "@/store/workspace";
 import { useGit } from "@/store/git";
@@ -109,7 +97,7 @@ import {
   featureBlockReason,
   effectiveAssignedModel,
 } from "@/store/settings";
-import { useEditorStore, autoSaveOnFocusLoss } from "@/store/editor";
+import { useEditorStore, autoSaveOnFocusLoss, type Tab } from "@/store/editor";
 import { useDiffViewer } from "@/store/diffViewer";
 import { useDiagnostics, type Diagnostic } from "@/store/diagnostics";
 import { useSession } from "@/store/session";
@@ -119,11 +107,80 @@ import { ipc, listenEvent, type GitCredentialPrompt } from "@/lib/ipc";
 import { markE2EAppReady } from "@/lib/e2eHooks";
 import { choose, useConfirm, ConfirmModalHost } from "@/components/Confirm";
 import { secretPrompt, SecretPromptHost } from "@/components/SecretPrompt";
+import {
+  POINTER_THEMES,
+  applyPointerThemeToDocument,
+  themeActionId,
+} from "@/theme/themes";
 import { open as openDialog } from "@tauri-apps/plugin-dialog";
 import { open as shellOpen } from "@tauri-apps/plugin-shell";
 
 const MarkdownView = lazy(() =>
   import("@/components/MarkdownView").then((m) => ({ default: m.MarkdownView })),
+);
+const Editor = lazy(() =>
+  import("@/components/Editor").then((m) => ({ default: m.Editor })),
+);
+const DiffView = lazy(() =>
+  import("@/components/DiffView").then((m) => ({ default: m.DiffView })),
+);
+const CommandPalette = lazy(() =>
+  import("@/components/CommandPalette").then((m) => ({ default: m.CommandPalette })),
+);
+const FileFinder = lazy(() =>
+  import("@/components/FileFinder").then((m) => ({ default: m.FileFinder })),
+);
+const FindInFiles = lazy(() =>
+  import("@/components/FindInFiles").then((m) => ({ default: m.FindInFiles })),
+);
+const OpenRecentPicker = lazy(() =>
+  import("@/components/OpenRecentPicker").then((m) => ({
+    default: m.OpenRecentPicker,
+  })),
+);
+const WorkspaceSymbols = lazy(() =>
+  import("@/components/WorkspaceSymbols").then((m) => ({
+    default: m.WorkspaceSymbols,
+  })),
+);
+const NotificationCenter = lazy(() =>
+  import("@/components/NotificationCenter").then((m) => ({
+    default: m.NotificationCenter,
+  })),
+);
+const TasksPicker = lazy(() =>
+  import("@/components/TasksPicker").then((m) => ({ default: m.TasksPicker })),
+);
+const BookmarksPicker = lazy(() =>
+  import("@/components/BookmarksPicker").then((m) => ({
+    default: m.BookmarksPicker,
+  })),
+);
+const LanguagePicker = lazy(() =>
+  import("@/components/LanguagePicker").then((m) => ({
+    default: m.LanguagePicker,
+  })),
+);
+const ProblemsPanel = lazy(() =>
+  import("@/components/Problems/ProblemsPanel").then((m) => ({
+    default: m.ProblemsPanel,
+  })),
+);
+const ShortcutsHelp = lazy(() =>
+  import("@/components/ShortcutsHelp").then((m) => ({
+    default: m.ShortcutsHelp,
+  })),
+);
+const Onboarding = lazy(() =>
+  import("@/components/Onboarding/Wizard").then((m) => ({
+    default: m.Onboarding,
+  })),
+);
+const ImagePreview = lazy(() =>
+  import("@/components/Preview").then((m) => ({ default: m.ImagePreview })),
+);
+const BinaryPreview = lazy(() =>
+  import("@/components/Preview").then((m) => ({ default: m.BinaryPreview })),
 );
 const TerminalPanel = lazy(() =>
   import("@/components/Terminal/TerminalPanel").then((m) => ({
@@ -166,19 +223,18 @@ export default function App() {
   const reduceMotion = useSettings((s) => s.reduceMotion);
   const appTheme = useSettings((s) => s.appTheme);
 
-  // Apply two body-level flags so global CSS can react: the
-  // reduce-motion flag suppresses transitions everywhere, and the
-  // theme flag swaps the color palette (Pointer Noir vs Light).
+  // Apply body-level flags so global CSS can react. The theme registry owns
+  // every app + editor palette; this effect only publishes it to CSS vars.
   useEffect(() => {
     const cls = document.body.classList;
     cls.toggle("pn-reduce-motion", !!reduceMotion);
-    if (appTheme === "light") {
-      cls.add("pn-theme-light");
-      cls.remove("pn-theme-noir");
-    } else {
-      cls.add("pn-theme-noir");
-      cls.remove("pn-theme-light");
-    }
+    applyPointerThemeToDocument(appTheme);
+    void ipc.setAppIconTheme(appTheme).catch((err) => {
+      console.warn("failed to update themed app icon", err);
+    });
+    void ipc.setThemeMenuActive(appTheme).catch((err) => {
+      console.warn("failed to update active theme menu item", err);
+    });
   }, [reduceMotion, appTheme]);
 
   const initSession = useSession((s) => s.init);
@@ -210,6 +266,8 @@ export default function App() {
   const setActive = useEditorStore((s) => s.setActive);
   const saveActive = useEditorStore((s) => s.saveActive);
   const saveAll = useEditorStore((s) => s.saveAll);
+  const activeEditorTab = useEditorStore((s) => s.getActive());
+  const diffSpec = useDiffViewer((s) => s.spec);
   const setFimEnabled = useSettings((s) => s.setFimEnabled);
   const setChatEnabled = useSettings((s) => s.setChatEnabled);
   const setAgentEnabled = useSettings((s) => s.setAgentEnabled);
@@ -306,9 +364,31 @@ export default function App() {
     };
   }, [root]);
 
+  // Keep tree/tab git colors tight after external writes, agent patches,
+  // staging, and checkout-style changes. The watcher can emit bursts, so
+  // refresh git once after the dust settles instead of per event.
+  useEffect(() => {
+    let off: (() => void) | undefined;
+    let timer: number | undefined;
+    listenEvent<{ kind: string; paths: string[] }>("fs:change", () => {
+      if (!useGit.getState().workspace) return;
+      if (timer != null) window.clearTimeout(timer);
+      timer = window.setTimeout(() => {
+        timer = undefined;
+        void useGit.getState().refresh();
+      }, 350);
+    }).then((unlisten) => {
+      off = unlisten;
+    });
+    return () => {
+      if (timer != null) window.clearTimeout(timer);
+      off?.();
+    };
+  }, []);
+
   // Also refresh git status whenever the editor finishes a save. That's
   // the single highest-signal moment for "the dirty set probably changed",
-  // and far cheaper than reacting to every fs:change event from the watcher.
+  // so it should not wait for the coarse poll or watcher debounce.
   useEffect(() => {
     const unsub = useEditorStore.subscribe((state, prev) => {
       // Compare the count of dirty tabs to detect clean->dirty transitions
@@ -510,6 +590,13 @@ export default function App() {
         // key globally.
         e.preventDefault();
         armChord();
+        return;
+      }
+      if (mod && e.shiftKey && (e.code === "Space" || e.key === " ")) {
+        // ⌘⇧Space — explicitly ask the FIM model for a completion.
+        // This is the manual counterpart to automatic tab completion.
+        e.preventDefault();
+        dispatchAction("ai:request_fim");
         return;
       }
       if (mod && e.shiftKey && (e.key === "p" || e.key === "P")) {
@@ -855,6 +942,12 @@ export default function App() {
       // The AI panel still has its own opener (ai:show_ai / ⌘L et al).
       onAction("app:preferences", () => setShowSettings(true)),
       onAction("app:onboarding", () => setShowOnboarding(true)),
+      ...POINTER_THEMES.map((theme) =>
+        onAction(themeActionId(theme.id), () => {
+          useSettings.getState().setAppTheme(theme.id);
+          toast.info(`Theme: ${theme.label}`);
+        }),
+      ),
       onAction("file:new", () => beginCreateFromMenu("file")),
       onAction("file:new_folder", () => beginCreateFromMenu("folder")),
       onAction("file:open_folder", () => openFolder()),
@@ -882,6 +975,7 @@ export default function App() {
         }
         try {
           const fresh = await ipc.readTextFile(tab.path);
+          useEditorStore.getState().discardStagedContent(tab.path);
           useEditorStore.setState((s) => ({
             tabs: s.tabs.map((t) =>
               t.path === tab.path
@@ -923,6 +1017,15 @@ export default function App() {
         const next = !useSettings.getState().fimEnabled;
         setFimEnabled(next);
         toast.info(`Tab completion ${next ? "enabled" : "disabled"}`);
+      }),
+      onAction("ai:request_fim", () => {
+        if (!isFeatureUsable("fim")) {
+          toast.info("Tab completion isn't ready", {
+            body: featureBlockReason("fim") ?? undefined,
+          });
+          return;
+        }
+        window.dispatchEvent(new Event("pointer:request_fim"));
       }),
       onAction("ai:toggle_feature_chat", () => {
         const next = !useSettings.getState().chatEnabled;
@@ -1255,7 +1358,8 @@ export default function App() {
         const ed = useEditorStore.getState();
         const tab = ed.tabs.find((t) => t.path === ed.activePath);
         if (!tab) return;
-        const hasCRLF = /\r\n/.test(tab.content);
+        const content = ed.getContent(tab.path) ?? tab.content;
+        const hasCRLF = /\r\n/.test(content);
         const target = hasCRLF ? "LF" : "CRLF";
         const ok = await askConfirm({
           title: `Switch this file to ${target}?`,
@@ -1268,8 +1372,8 @@ export default function App() {
         if (!ok) return;
         const next =
           target === "LF"
-            ? tab.content.replace(/\r\n/g, "\n")
-            : tab.content.replace(/\r?\n/g, "\r\n");
+            ? content.replace(/\r\n/g, "\n")
+            : content.replace(/\r?\n/g, "\r\n");
         useEditorStore.getState().updateContent(tab.path, next);
         await useEditorStore.getState().saveActive();
         toast.info(`Line endings: ${target}`);
@@ -1398,7 +1502,7 @@ export default function App() {
         const line = ed.cursor?.line ?? 1;
         const tab = ed.tabs.find((t) => t.path === path);
         const preview = tab
-          ? tab.content.split("\n")[line - 1]?.trim().slice(0, 120) ?? ""
+          ? (ed.getContent(tab.path) ?? tab.content).split("\n")[line - 1]?.trim().slice(0, 120) ?? ""
           : "";
         const { useBookmarks } = await import("@/store/bookmarks");
         const present = useBookmarks
@@ -1531,10 +1635,10 @@ export default function App() {
   return (
     <div className="pn-app-shell h-screen w-screen flex flex-col bg-noir-canvas text-noir-text overflow-hidden">
       {!zenMode && <Titlebar onOpenAIPanel={() => noteDockView("ai")} />}
-      <div className="flex-1 min-h-0 flex">
+      <div className="flex-1 min-h-0 flex overflow-hidden">
         {!treeCollapsed && !zenMode && (
           <aside
-            className="shrink-0 relative border-r border-noir-line/80 bg-noir-panel/92 backdrop-blur-xl flex flex-col shadow-[1px_0_0_rgba(255,255,255,0.02)]"
+            className="shrink-0 min-h-0 overflow-hidden relative border-r border-noir-line/50 bg-noir-panel flex flex-col shadow-[1px_0_0_rgba(0,0,0,0.28)]"
             style={{ width: fileTreeWidth ?? 256 }}
           >
             {/* Sidebar view selector — Files vs Outline. Lightweight
@@ -1544,7 +1648,7 @@ export default function App() {
                 onClick={() => setSidebarView("files")}
                 className={`flex-1 h-7 rounded-md transition-colors ${
                   sidebarView === "files"
-                    ? "text-noir-text bg-noir-ridge/80 shadow-[inset_0_0_0_1px_rgba(255,255,255,0.035)]"
+                    ? "text-noir-text bg-noir-ridge/80 ring-1 ring-noir-accent/15"
                     : "text-noir-mute hover:text-noir-text hover:bg-noir-ridge/40"
                 }`}
               >
@@ -1554,7 +1658,7 @@ export default function App() {
                 onClick={() => setSidebarView("outline")}
                 className={`flex-1 h-7 rounded-md transition-colors ${
                   sidebarView === "outline"
-                    ? "text-noir-text bg-noir-ridge/80 shadow-[inset_0_0_0_1px_rgba(255,255,255,0.035)]"
+                    ? "text-noir-text bg-noir-ridge/80 ring-1 ring-noir-accent/15"
                     : "text-noir-mute hover:text-noir-text hover:bg-noir-ridge/40"
                 }`}
               >
@@ -1595,7 +1699,7 @@ export default function App() {
           <div className="flex-1 min-h-0 flex flex-col">
             <div className="flex-1 min-h-0 relative bg-noir-canvas">
               {root ? (
-                <Editor />
+                <EditorSurface activeTab={activeEditorTab} />
               ) : (
                 <Welcome
                   ready={ready}
@@ -1608,11 +1712,17 @@ export default function App() {
                   onShowAIPanel={() => noteDockView("ai")}
                 />
               )}
-              <DiffView />
+              {diffSpec && (
+                <Suspense fallback={null}>
+                  <DiffView />
+                </Suspense>
+              )}
               <ActiveMarkdownPreview state={mdPreview} setState={setMdPreview} />
             </div>
             {showProblems && (
-              <ProblemsPanel onClose={() => setShowProblems(false)} />
+              <Suspense fallback={null}>
+                <ProblemsPanel onClose={() => setShowProblems(false)} />
+              </Suspense>
             )}
             {!zenMode && terminalOpen && (
               <Suspense fallback={null}>
@@ -1635,21 +1745,29 @@ export default function App() {
       )}
 
       {showPalette && (
-        <CommandPalette
-          onClose={() => setShowPalette(false)}
-          openFinder={() => {
-            setShowPalette(false);
-            setShowFinder(true);
-          }}
-          toggleAssistant={() => toggleDockView("assistant")}
-          openOnboarding={() => setShowOnboarding(true)}
-          openAIPanel={() => noteDockView("ai")}
-          openMonitor={() => setShowMonitor(true)}
-        />
+        <Suspense fallback={null}>
+          <CommandPalette
+            onClose={() => setShowPalette(false)}
+            openFinder={() => {
+              setShowPalette(false);
+              setShowFinder(true);
+            }}
+            toggleAssistant={() => toggleDockView("assistant")}
+            openOnboarding={() => setShowOnboarding(true)}
+            openAIPanel={() => noteDockView("ai")}
+            openMonitor={() => setShowMonitor(true)}
+          />
+        </Suspense>
       )}
-      {showFinder && <FileFinder onClose={() => setShowFinder(false)} />}
+      {showFinder && (
+        <Suspense fallback={null}>
+          <FileFinder onClose={() => setShowFinder(false)} />
+        </Suspense>
+      )}
       {showFindInFiles && (
-        <FindInFiles onClose={() => setShowFindInFiles(false)} />
+        <Suspense fallback={null}>
+          <FindInFiles onClose={() => setShowFindInFiles(false)} />
+        </Suspense>
       )}
       {showMonitor && (
         <Suspense fallback={<OverlayLoading label="Opening monitor" />}>
@@ -1657,7 +1775,9 @@ export default function App() {
         </Suspense>
       )}
       {showShortcutsHelp && (
-        <ShortcutsHelp onClose={() => setShowShortcutsHelp(false)} />
+        <Suspense fallback={null}>
+          <ShortcutsHelp onClose={() => setShowShortcutsHelp(false)} />
+        </Suspense>
       )}
       {showSettings && (
         <Suspense fallback={<OverlayLoading label="Opening settings" />}>
@@ -1665,23 +1785,37 @@ export default function App() {
         </Suspense>
       )}
       {showOpenRecent && (
-        <OpenRecentPicker
-          onClose={() => setShowOpenRecent(false)}
-          onOpenRecent={switchWorkspaceRoot}
-        />
+        <Suspense fallback={<OverlayLoading label="Opening recent workspaces" />}>
+          <OpenRecentPicker
+            onClose={() => setShowOpenRecent(false)}
+            onOpenRecent={switchWorkspaceRoot}
+          />
+        </Suspense>
       )}
       {showWorkspaceSymbols && (
-        <WorkspaceSymbols onClose={() => setShowWorkspaceSymbols(false)} />
+        <Suspense fallback={null}>
+          <WorkspaceSymbols onClose={() => setShowWorkspaceSymbols(false)} />
+        </Suspense>
       )}
       {showNotifications && (
-        <NotificationCenter onClose={() => setShowNotifications(false)} />
+        <Suspense fallback={null}>
+          <NotificationCenter onClose={() => setShowNotifications(false)} />
+        </Suspense>
       )}
-      {showTasks && <TasksPicker onClose={() => setShowTasks(false)} />}
+      {showTasks && (
+        <Suspense fallback={null}>
+          <TasksPicker onClose={() => setShowTasks(false)} />
+        </Suspense>
+      )}
       {showBookmarks && (
-        <BookmarksPicker onClose={() => setShowBookmarks(false)} />
+        <Suspense fallback={null}>
+          <BookmarksPicker onClose={() => setShowBookmarks(false)} />
+        </Suspense>
       )}
       {showLanguagePicker && (
-        <LanguagePicker onClose={() => setShowLanguagePicker(false)} />
+        <Suspense fallback={null}>
+          <LanguagePicker onClose={() => setShowLanguagePicker(false)} />
+        </Suspense>
       )}
       {/* The wizard renders whenever `showOnboarding` is true. We don't
           gate on `!onboarded` here — that gate already lives in the boot
@@ -1690,17 +1824,77 @@ export default function App() {
           Onboarding…" and "Re-run Setup", which are exactly the entry
           points an already-onboarded user reaches for. */}
       {showOnboarding && (
-        <Onboarding
-          onDone={() => {
-            markOnboarded();
-            setShowOnboarding(false);
-          }}
-        />
+        <Suspense fallback={<OverlayLoading label="Opening setup" />}>
+          <Onboarding
+            onDone={() => {
+              markOnboarded();
+              setShowOnboarding(false);
+            }}
+          />
+        </Suspense>
       )}
       <ConfirmModalHost />
       <SecretPromptHost />
+      <LspIdleManager />
       <ToastHost />
       <RefactorSuggestion />
+    </div>
+  );
+}
+
+function EditorSurface({ activeTab }: { activeTab: Tab | null }) {
+  if (!activeTab) return <NoFileOpen />;
+  if (activeTab.preview === "image") {
+    return (
+      <Suspense fallback={<EditorLoading label="Opening image" />}>
+        <ImagePreview path={activeTab.path} />
+      </Suspense>
+    );
+  }
+  if (activeTab.preview === "binary") {
+    return (
+      <Suspense fallback={<EditorLoading label="Opening file" />}>
+        <BinaryPreview path={activeTab.path} />
+      </Suspense>
+    );
+  }
+  return (
+    <Suspense fallback={<EditorLoading label="Opening editor" />}>
+      <Editor />
+    </Suspense>
+  );
+}
+
+function NoFileOpen() {
+  return (
+    <div className="h-full w-full flex items-center justify-center font-sans">
+      <div className="text-center max-w-sm px-6">
+        <div className="mb-3 flex justify-center">
+          <PointerMarkSvg
+            decorative
+            className="pn-brand-mark h-7 w-7 text-noir-accent opacity-90"
+          />
+        </div>
+        <div className="text-[13px] text-noir-text mb-2">No file open</div>
+        <div className="text-[11.5px] text-noir-mute leading-relaxed space-y-1">
+          <div>
+            Pick a file from the tree, or press <span className="pn-kbd">⌘P</span>{" "}
+            to fuzzy-find.
+          </div>
+          <div>
+            Ask the chat with <span className="pn-kbd">⌘L</span>, run the agent,
+            or open AI settings with <span className="pn-kbd">⌘⇧,</span>.
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function EditorLoading({ label }: { label: string }) {
+  return (
+    <div className="h-full w-full grid place-items-center bg-noir-canvas font-sans text-[11.5px] text-noir-mute">
+      {label}…
     </div>
   );
 }
@@ -1740,10 +1934,8 @@ function Welcome({
       <div className="relative z-10 flex h-full items-center justify-center px-6 py-8">
         <div className="pn-welcome-grid w-full max-w-5xl gap-6 items-center">
           <section className="min-w-0 text-center xl:text-left">
-            <img
-              src="/brand/pointer-logo-wide.png"
-              alt="Pointer"
-              draggable={false}
+            <PointerWordmarkSvg
+              title="Pointer"
               className="pn-brand-logo mx-auto mb-5 h-auto w-[min(430px,100%)] select-none xl:mx-0"
             />
             <h1 className="sr-only">Pointer</h1>
@@ -1861,7 +2053,7 @@ function Welcome({
 
 function OverlayLoading({ label }: { label: string }) {
   return (
-    <div className="fixed inset-0 z-pn-modal flex items-center justify-center bg-black/40 backdrop-blur-md">
+    <div className="fixed inset-0 z-pn-modal flex items-center justify-center bg-black/55">
       <div className="rounded-md border border-noir-line bg-noir-panel px-3 py-2 text-[11px] font-sans text-noir-subtext shadow-soft">
         {label}…
       </div>

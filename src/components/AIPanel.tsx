@@ -1,5 +1,5 @@
-import { useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
-import { createPortal } from "react-dom";
+import { useEffect, useLayoutEffect, useMemo, useRef, useState } from "@/lib/preactSignalCompat";
+import { createPortal } from "@/lib/preactSignalDomCompat";
 import {
   AlertCircle,
   Bot,
@@ -16,7 +16,7 @@ import {
   TriangleAlert,
   X,
   Zap,
-} from "lucide-react";
+} from "@/lib/lucide";
 import {
   ipc,
   listenEvent,
@@ -28,8 +28,10 @@ import {
 } from "@/lib/ipc";
 import {
   useSettings,
+  LSP_AUTO_STOP_PRESETS_MS,
   featureBlockReason,
   featureCapability,
+  isModelInInstalledList,
   type AiFeature,
 } from "@/store/settings";
 import { modelFitness } from "@/lib/modelFitness";
@@ -144,12 +146,14 @@ export function AIPanelView() {
   const embedModel = useSettings((s) => s.embedModel);
   const fimEnabled = useSettings((s) => s.fimEnabled);
   const fimDebounceMs = useSettings((s) => s.fimDebounceMs);
+  const fimTriggerMode = useSettings((s) => s.fimTriggerMode);
   const setChatModel = useSettings((s) => s.setChatModel);
   const setFimModel = useSettings((s) => s.setFimModel);
   const setAgentModel = useSettings((s) => s.setAgentModel);
   const setEmbedModel = useSettings((s) => s.setEmbedModel);
   const setFimEnabled = useSettings((s) => s.setFimEnabled);
   const setFimDebounceMs = useSettings((s) => s.setFimDebounceMs);
+  const setFimTriggerMode = useSettings((s) => s.setFimTriggerMode);
 
   // Feature gates + daemon control.
   const chatEnabled = useSettings((s) => s.chatEnabled);
@@ -185,11 +189,15 @@ export function AIPanelView() {
   const editorWordWrap = useSettings((s) => s.editorWordWrap);
   const editorRenderWhitespace = useSettings((s) => s.editorRenderWhitespace);
   const editorFormatOnSave = useSettings((s) => s.editorFormatOnSave);
+  const lspAutoStopEnabled = useSettings((s) => s.lspAutoStopEnabled);
+  const lspAutoStopIdleMs = useSettings((s) => s.lspAutoStopIdleMs);
   const setEditorFontSize = useSettings((s) => s.setEditorFontSize);
   const setEditorTabSize = useSettings((s) => s.setEditorTabSize);
   const setEditorWordWrap = useSettings((s) => s.setEditorWordWrap);
   const setEditorRenderWhitespace = useSettings((s) => s.setEditorRenderWhitespace);
   const setEditorFormatOnSave = useSettings((s) => s.setEditorFormatOnSave);
+  const setLspAutoStopEnabled = useSettings((s) => s.setLspAutoStopEnabled);
+  const setLspAutoStopIdleMs = useSettings((s) => s.setLspAutoStopIdleMs);
 
   // Hardware profile is read once at mount — it changes only when the user
   // physically reseats RAM, so polling is wasteful.
@@ -886,6 +894,42 @@ export function AIPanelView() {
                 />
               </div>
               <div>
+                <div className="mb-3">
+                  <div className="flex items-center justify-between text-[11px] text-noir-mute mb-1">
+                    <span className="flex items-center gap-1">
+                      <Sparkles size={10} aria-hidden="true" /> Trigger
+                    </span>
+                    <span className="font-mono">
+                      {fimTriggerMode === "automatic" ? "automatic" : "manual"}
+                    </span>
+                  </div>
+                  <div className="grid grid-cols-2 overflow-hidden rounded-md border border-noir-line bg-noir-bg/60">
+                    <button
+                      type="button"
+                      onClick={() => setFimTriggerMode("automatic")}
+                      className={`px-2 py-1.5 text-[11px] transition-colors ${
+                        fimTriggerMode === "automatic"
+                          ? "bg-noir-accent/15 text-noir-accent"
+                          : "text-noir-mute hover:text-noir-text hover:bg-noir-ridge/50"
+                      }`}
+                      aria-pressed={fimTriggerMode === "automatic"}
+                    >
+                      Automatic
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => setFimTriggerMode("manual")}
+                      className={`border-l border-noir-line px-2 py-1.5 text-[11px] transition-colors ${
+                        fimTriggerMode === "manual"
+                          ? "bg-noir-accent/15 text-noir-accent"
+                          : "text-noir-mute hover:text-noir-text hover:bg-noir-ridge/50"
+                      }`}
+                      aria-pressed={fimTriggerMode === "manual"}
+                    >
+                      Manual ⌘⇧Space
+                    </button>
+                  </div>
+                </div>
                 <label
                   htmlFor="fim-debounce-slider"
                   className="flex items-center justify-between text-[11px] text-noir-mute mb-1"
@@ -912,6 +956,23 @@ export function AIPanelView() {
                   raise this on slower machines.
                 </p>
               </div>
+            </div>
+          </Section>
+
+          <Section title="Language servers" hint="Memory efficiency">
+            <div className="rounded-lg border border-noir-line divide-y divide-noir-line/60 overflow-hidden">
+              <ToggleRow
+                label="Auto-stop unused language servers"
+                hint="Stops external language-server processes when Pointer is idle, unfocused, or no editor needs that language, then restarts them when a matching file opens."
+                value={lspAutoStopEnabled}
+                onChange={setLspAutoStopEnabled}
+              />
+              {lspAutoStopEnabled && (
+                <LspAutoStopControls
+                  value={lspAutoStopIdleMs}
+                  onChange={setLspAutoStopIdleMs}
+                />
+              )}
             </div>
           </Section>
 
@@ -1162,6 +1223,72 @@ function truncateLabel(s: string, n: number): string {
   return s.length > n ? `${s.slice(0, n - 1)}…` : s;
 }
 
+function LspAutoStopControls({
+  value,
+  onChange,
+}: {
+  value: number;
+  onChange: (v: number) => void;
+}) {
+  const minutes = Math.max(1, Math.round(value / 60000));
+  return (
+    <div className="px-3 py-3 bg-noir-canvas/30">
+      <div className="mb-2 flex items-center justify-between gap-3 text-[11px] text-noir-mute">
+        <span>Stop after</span>
+        <span className="font-mono text-noir-text">{formatDuration(value)}</span>
+      </div>
+      <div className="grid grid-cols-2 gap-1.5 sm:grid-cols-4">
+        {LSP_AUTO_STOP_PRESETS_MS.map((preset) => {
+          const active = Math.abs(preset - value) < 1000;
+          return (
+            <button
+              key={preset}
+              type="button"
+              onClick={() => onChange(preset)}
+              className={`rounded-md border px-2 py-1.5 text-[11px] transition-colors ${
+                active
+                  ? "border-noir-accent/50 bg-noir-accent/15 text-noir-accent"
+                  : "border-noir-line bg-noir-bg/50 text-noir-subtext hover:border-noir-accent/35 hover:text-noir-text"
+              }`}
+              aria-pressed={active}
+            >
+              {formatDuration(preset)}
+            </button>
+          );
+        })}
+      </div>
+      <label className="mt-3 flex items-center justify-between gap-3 text-[11px] text-noir-mute">
+        <span>Custom minutes</span>
+        <input
+          type="number"
+          min={1}
+          max={120}
+          step={1}
+          value={minutes}
+          onChange={(e) => {
+            const next = Number(e.target.value);
+            if (Number.isFinite(next)) onChange(next * 60000);
+          }}
+          className="pn-input w-20 font-mono text-right"
+          aria-label="Language server auto-stop idle minutes"
+        />
+      </label>
+      <p className="mt-2 text-[10.5px] leading-snug text-noir-mute">
+        Applies to app inactivity, focus loss, editor-free sessions, and languages
+        no open editor currently needs.
+      </p>
+    </div>
+  );
+}
+
+function formatDuration(ms: number): string {
+  const minutes = Math.max(1, Math.round(ms / 60000));
+  if (minutes < 60) return `${minutes} min`;
+  const hours = Math.floor(minutes / 60);
+  const remainder = minutes % 60;
+  return remainder === 0 ? `${hours} hr` : `${hours} hr ${remainder} min`;
+}
+
 function NumberRow({
   label,
   hint,
@@ -1243,7 +1370,7 @@ function Assignment({
   } | null>(null);
 
   const unset = !value;
-  const missing = !unset && models.length > 0 && !models.includes(value);
+  const missing = !unset && models.length > 0 && !isModelInInstalledList(value, models);
   const flag = unset || missing;
   // Score the current pick. We hide the chip entirely for "good" — silence
   // is the reward for picking well. For "ok" and "warn" we show the

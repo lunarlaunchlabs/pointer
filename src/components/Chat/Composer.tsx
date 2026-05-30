@@ -7,14 +7,14 @@
  * its parent (Sidebar / AgentPanel) decides what `onSend` does.
  */
 
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "@/lib/preactSignalCompat";
 import {
   ArrowUp,
   FileUp,
   Loader2,
   Paperclip,
   Square,
-} from "lucide-react";
+} from "@/lib/lucide";
 import { open as openDialog } from "@tauri-apps/plugin-dialog";
 import type { Reference } from "@/store/chat";
 import { useEditorStore } from "@/store/editor";
@@ -35,6 +35,7 @@ import {
   probeMention,
 } from "@/lib/mentions";
 import { MentionInput } from "@/components/Mention/MentionInput";
+import type { MentionInputSelection } from "@/components/Mention/MentionInput";
 import {
   MentionPicker,
   type MentionSelection,
@@ -159,6 +160,11 @@ export function Composer({
   };
 
   const onKeyDown: React.KeyboardEventHandler<HTMLTextAreaElement> = (e) => {
+    const native = e.nativeEvent as KeyboardEvent & {
+      isComposing?: boolean;
+      keyCode?: number;
+    };
+    if (native.isComposing || native.keyCode === 229) return;
     // Let the picker swallow Enter / Arrow keys when it's open — it
     // installs its own window-level keydown listener above us, so we
     // simply don't touch Enter while the probe is open with rows.
@@ -170,10 +176,9 @@ export function Composer({
     }
   };
 
-  const onChange = (next: string) => {
+  const onChange = (next: string, selectionMeta: MentionInputSelection) => {
     setText(next);
-    const ta = taRef.current;
-    const caret = ta?.selectionStart ?? next.length;
+    const caret = selectionMeta.selectionStart;
     const p = probeMention(next, caret);
     setProbe(p);
   };
@@ -498,7 +503,7 @@ export function Composer({
         setDragActive(false);
         markAssistantDropTarget(false);
       }}
-      className={`border-t border-noir-line bg-noir-chrome/60 p-3 space-y-2 transition-colors ${
+      className={`border-t border-noir-line bg-noir-chrome/60 p-3 space-y-2 transition-colors min-w-0 ${
         dragActive ? "ring-1 ring-inset ring-noir-accent/60 bg-noir-accent/5" : ""
       }`}
     >
@@ -518,7 +523,7 @@ export function Composer({
         references={references}
         onRemove={onRemoveReference}
       />
-      <div className="relative">
+      <div className="relative min-w-0 rounded-lg border border-noir-line bg-noir-canvas/40 focus-within:border-noir-accent/45 focus-within:ring-1 focus-within:ring-noir-accent/20">
         <MentionInput
           ref={taRef}
           value={text}
@@ -532,6 +537,8 @@ export function Composer({
           }
           disabled={disabled}
           ariaLabel={placeholder ?? "Message — type @ to reference files, selection, or codebase"}
+          className="pn-chat-composer-input"
+          textareaClassName="block"
         />
         <div className="absolute right-2 bottom-2 flex items-center gap-1">
           <button
@@ -613,8 +620,8 @@ export function Composer({
           />
         )}
       </div>
-      <div className="text-[10px] font-sans text-noir-mute flex justify-between">
-        <span>
+      <div className="text-[10px] font-sans text-noir-mute flex flex-wrap items-center justify-between gap-x-3 gap-y-1 min-w-0">
+        <span className="min-w-0">
           {disabled ? (
             <span className="text-noir-err">
               Ollama isn't running — Setup from ⌘⇧P.
@@ -627,7 +634,7 @@ export function Composer({
             </>
           )}
         </span>
-        <span>
+        <span className="min-w-0">
           <span className="pn-kbd">@</span> mention ·{" "}
           <span className="pn-kbd">file</span> upload images / PDFs / sheets
         </span>

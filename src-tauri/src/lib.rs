@@ -34,6 +34,7 @@ pub fn run() {
             commands::fs::create_dir,
             commands::fs::delete_path,
             commands::fs::rename_path,
+            commands::fs::copy_path,
             commands::fs::search_files,
             commands::fs::search_directories,
             commands::fs::search_text,
@@ -118,6 +119,7 @@ pub fn run() {
             // repo-local/PATH language servers, with Monaco fallbacks
             // on the frontend when no external server is available.
             commands::lsp::lsp_status,
+            commands::lsp::lsp_stop_idle,
             commands::lsp::lsp_did_open,
             commands::lsp::lsp_did_change,
             commands::lsp::lsp_hover,
@@ -126,6 +128,10 @@ pub fn run() {
             commands::lsp::lsp_completion,
             commands::lsp::lsp_completion_resolve,
             commands::lsp::lsp_document_symbols,
+            commands::lsp::lsp_signature_help,
+            commands::lsp::lsp_document_highlight,
+            commands::lsp::lsp_inlay_hints,
+            commands::lsp::lsp_rename,
             // Agent
             commands::agent::agent_run,
             commands::agent::agent_continue,
@@ -142,6 +148,7 @@ pub fn run() {
             commands::fast_apply::ollama_fast_apply,
             // System monitor
             commands::system::system_snapshot,
+            commands::system::system_load_snapshot,
             commands::system::kill_owned_process,
             commands::system::hardware_profile,
             // File ingestion (images, PDFs, spreadsheets)
@@ -160,6 +167,8 @@ pub fn run() {
             commands::mcp::mcp_call_tool,
             commands::mcp::mcp_get_logs,
             // Factory reset
+            commands::app_icon::set_app_icon_theme,
+            commands::app_icon::set_theme_menu_active,
             commands::app_state::reset_app_state,
         ])
         .on_window_event(|window, event| {

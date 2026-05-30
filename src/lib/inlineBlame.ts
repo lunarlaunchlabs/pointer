@@ -1,4 +1,4 @@
-import { useEffect, useRef } from "react";
+import { useEffect, useRef } from "@/lib/preactSignalCompat";
 import type * as monaco from "monaco-editor";
 import { ipc, type GitBlameLine } from "@/lib/ipc";
 import { useWorkspace } from "@/store/workspace";

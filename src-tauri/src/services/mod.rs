@@ -8,3 +8,4 @@ pub mod merkle;
 pub mod opencode;
 pub mod prompt;
 pub mod skills;
+pub mod workspace_filter;

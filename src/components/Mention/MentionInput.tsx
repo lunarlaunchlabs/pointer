@@ -13,12 +13,23 @@
  * job, and bouncing the colour around would feel jittery.
  */
 
-import { forwardRef, useMemo, useRef } from "react";
+import {
+  forwardRef,
+  useCallback,
+  useLayoutEffect,
+  useMemo,
+  useRef,
+} from "@/lib/preactSignalCompat";
 import { buildMentionRegex } from "@/lib/mentions";
+
+export type MentionInputSelection = {
+  selectionStart: number;
+  selectionEnd: number;
+};
 
 export type MentionInputProps = {
   value: string;
-  onChange: (next: string) => void;
+  onChange: (next: string, selection: MentionInputSelection) => void;
   onKeyDown?: React.KeyboardEventHandler<HTMLTextAreaElement>;
   /** Tokens to highlight in the mirror. Order doesn't matter; the
    *  matcher dedupes & sorts them by length (longest first). */
@@ -53,19 +64,35 @@ export const MentionInput = forwardRef<HTMLTextAreaElement, MentionInputProps>(
     },
     forwardedRef,
   ) {
-    const fallbackRef = useRef<HTMLTextAreaElement | null>(null);
-    const taRef = (forwardedRef ??
-      fallbackRef) as React.MutableRefObject<HTMLTextAreaElement | null>;
+    const taRef = useRef<HTMLTextAreaElement | null>(null);
     const mirrorRef = useRef<HTMLDivElement | null>(null);
 
+    const setTextAreaRef = useCallback(
+      (node: HTMLTextAreaElement | null) => {
+        taRef.current = node;
+        if (typeof forwardedRef === "function") {
+          forwardedRef(node);
+        } else if (forwardedRef) {
+          forwardedRef.current = node;
+        }
+      },
+      [forwardedRef],
+    );
+
+    useLayoutEffect(() => {
+      resizeTextarea(taRef.current, maxHeightPx);
+    }, [maxHeightPx, value]);
+
     // Autosize the textarea on every change (capped by maxHeightPx). We
-    // re-measure on each render rather than on a useEffect so the mirror
-    // and textarea stay perfectly aligned even mid-keystroke.
+    // also re-measure in a layout effect above so programmatic clears
+    // (send/cancel/session switches) collapse the input immediately.
     const onChangeInternal = (e: React.ChangeEvent<HTMLTextAreaElement>) => {
-      onChange(e.target.value);
       const ta = e.currentTarget;
-      ta.style.height = "auto";
-      ta.style.height = `${Math.min(ta.scrollHeight, maxHeightPx)}px`;
+      onChange(ta.value, {
+        selectionStart: ta.selectionStart,
+        selectionEnd: ta.selectionEnd,
+      });
+      resizeTextarea(ta, maxHeightPx);
     };
 
     // Sync mirror's scroll position with the textarea — when the user
@@ -106,7 +133,7 @@ export const MentionInput = forwardRef<HTMLTextAreaElement, MentionInputProps>(
           <span>{"\u200B"}</span>
         </div>
         <textarea
-          ref={taRef}
+          ref={setTextAreaRef}
           value={value}
           onChange={onChangeInternal}
           onKeyDown={onKeyDown}
@@ -121,6 +148,16 @@ export const MentionInput = forwardRef<HTMLTextAreaElement, MentionInputProps>(
     );
   },
 );
+
+function resizeTextarea(
+  ta: HTMLTextAreaElement | null,
+  maxHeightPx: number,
+) {
+  if (!ta) return;
+  ta.style.height = "auto";
+  ta.style.height = `${Math.min(ta.scrollHeight, maxHeightPx)}px`;
+  ta.style.overflowY = ta.scrollHeight > maxHeightPx ? "auto" : "hidden";
+}
 
 /** Split `text` into segments — each segment is either a literal run or
  *  a mention token. Used by the mirror to wrap tokens in styled spans. */

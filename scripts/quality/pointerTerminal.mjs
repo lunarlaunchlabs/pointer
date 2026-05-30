@@ -13,12 +13,25 @@ import path from "node:path";
 import readline from "node:readline/promises";
 import { stdin as input, stdout as output } from "node:process";
 import { spawn } from "node:child_process";
-import { MODEL, QUALITY_NUM_CTX, bar, emoji, generateRaw } from "./lib.mjs";
+import {
+  MODEL,
+  QUALITY_NUM_CTX,
+  applyHunks,
+  bar,
+  emoji,
+  generateRaw,
+  parseSearchReplace,
+} from "./lib.mjs";
 import { VirtualFs } from "./evalAgent.mjs";
 
 const DEFAULT_REPO =
   fs.existsSync("/Users/sameer/express") ? "/Users/sameer/express" : process.cwd();
 const OPENCODE_TIMEOUT_MS = Number(process.env.POINTER_OPENCODE_TIMEOUT_MS || 480_000);
+const AGENT_SUPERVISOR_MAX_CONTINUES = Number(process.env.POINTER_AGENT_SUPERVISOR_MAX_CONTINUES || 4);
+const AGENT_SUPERVISOR_READ_LIMIT = Number(process.env.POINTER_AGENT_SUPERVISOR_READ_LIMIT || 2);
+const AGENT_SUPERVISOR_STALL_MS = Number(process.env.POINTER_AGENT_SUPERVISOR_STALL_MS || 120_000);
+const AGENT_SUPERVISOR_ATTEMPT_TIMEOUT_MS = Number(process.env.POINTER_AGENT_SUPERVISOR_ATTEMPT_TIMEOUT_MS || 180_000);
+const AGENT_FALLBACK_TIMEOUT_MS = Number(process.env.POINTER_AGENT_FALLBACK_TIMEOUT_MS || 120_000);
 const CRITIC_TIMEOUT_MS = Number(process.env.POINTER_CRITIC_TIMEOUT_MS || 120_000);
 
 const IGNORE_DIRS = new Set([
@@ -320,8 +333,9 @@ class PointerTerminal {
     }
     const context = this.buildAskContext(prompt);
     const researchPrompt = isResearchPrompt(prompt);
-    const askFileLimit = researchPrompt ? 4 : 5;
-    const askFileChars = researchPrompt ? 2800 : 7000;
+    const fileExplanation = isFileExplanationPrompt(prompt);
+    const askFileLimit = fileExplanation ? 3 : researchPrompt ? 4 : 5;
+    const askFileChars = fileExplanation ? 3600 : researchPrompt ? 2800 : 7000;
     const contextFiles = orderContextFilesForAsk(context.files, prompt, this.activeFile, this.fs_).slice(0, askFileLimit);
     const attachFiles = orderContextFilesForAsk(context.attachFiles, prompt, this.activeFile, this.fs_)
       .filter((p) => !this.fs_.has(p) || this.fs_.read(p).length <= 24_000)
@@ -363,34 +377,34 @@ class PointerTerminal {
   async plan(prompt, opts = {}) {
     if (this.verbose) console.log(bar("Plan"));
     const context = this.buildAskContext(prompt);
-    const orderedContextFiles = orderContextFilesForPlan(context.files, this.activeFile, prompt).slice(0, 9);
+    const orderedContextFiles = orderPlanContextFiles(context.files, this.activeFile, prompt, this.fs_).slice(0, 5);
     if (this.verbose) console.log(`plan context files: ${orderedContextFiles.join(", ") || "(none)"}`);
     const contextDigest = orderedContextFiles
       .filter((p) => this.fs_.has(p))
-      .map((p) => fileBlock(p, compactFileForPrompt(p, this.fs_.read(p), prompt, 2500)))
+      .map((p) => fileBlock(p, compactFileForPrompt(p, this.fs_.read(p), prompt, 1800)))
       .join("\n\n");
     const evidence = planEvidenceForPrompt(orderedContextFiles, this.fs_, prompt);
+    const opencodePrompt = renderAgentRunPrompt({
+      workspace: this.root,
+      mode: "plan",
+      goal: prompt,
+      openTabs: this.openTabs,
+      activeFile: this.activeFile,
+      context: orderedContextFiles.length
+        ? [
+            `Pointer preflight selected these relevant files:\n${orderedContextFiles.map((p) => `- ${p}`).join("\n")}`,
+            evidence ? `Authoritative evidence:\n${evidence}` : "",
+            contextDigest ? `Focused evidence snippets:\n${contextDigest}` : "",
+          ].filter(Boolean).join("\n\n")
+        : "",
+    });
     const run = await runOpenCode({
       repo: this.root,
       model: opts.model ?? MODEL,
       mode: "plan",
-      prompt: renderAgentRunPrompt({
-        workspace: this.root,
-        mode: "plan",
-        goal: prompt,
-        openTabs: this.openTabs,
-        activeFile: this.activeFile,
-          context: orderedContextFiles.length
-          ? [
-              `Pointer attached these relevant files via --file:\n${orderedContextFiles.map((p) => `- ${p}`).join("\n")}`,
-              context.memoryDigest ? `Context brain retained memory:\n${context.memoryDigest}` : "",
-              evidence ? `Authoritative evidence:\n${evidence}` : "",
-              contextDigest ? `Focused evidence snippets:\n${contextDigest}` : "",
-            ].filter(Boolean).join("\n\n")
-          : "",
-      }),
+      prompt: opencodePrompt,
       title: "Pointer Plan",
-      files: orderContextFilesForPlan(context.attachFiles, this.activeFile, prompt),
+      files: orderedContextFiles,
     });
     const result = {
       mode: "plan",
@@ -421,22 +435,120 @@ class PointerTerminal {
   async agent(prompt, opts = {}) {
     const mode = opts.mode ?? this.mode;
     if (this.verbose) console.log(bar(mode === "agent-ask" ? "Agent with approvals" : "Agent"));
+    const context = this.buildAskContext(prompt);
+    const orderedContextFiles = orderPlanContextFiles(context.files, this.activeFile, prompt, this.fs_).slice(0, 5);
+    const contextDigest = orderedContextFiles
+      .filter((p) => this.fs_.has(p))
+      .map((p) => fileBlock(p, compactFileForPrompt(p, this.fs_.read(p), prompt, 1600)))
+      .join("\n\n");
+    const evidence = planEvidenceForPrompt(orderedContextFiles, this.fs_, prompt);
+    const opencodePrompt = renderAgentRunPrompt({
+      workspace: this.root,
+      mode: "agent",
+      goal: prompt,
+      openTabs: this.openTabs,
+      activeFile: this.activeFile,
+      context: [
+        orderedContextFiles.length
+          ? `Pointer preflight selected these relevant files:\n${orderedContextFiles.map((p) => `- ${p}`).join("\n")}`
+          : "",
+        evidence ? `Authoritative evidence:\n${evidence}` : "",
+        contextDigest ? `Focused evidence snippets:\n${contextDigest}` : "",
+      ].filter(Boolean).join("\n\n"),
+    });
     const run = await runOpenCode({
       repo: this.root,
       model: opts.model ?? MODEL,
       mode: "agent",
-      prompt: renderAgentRunPrompt({
-        workspace: this.root,
-        mode: "agent",
-        goal: prompt,
-        openTabs: this.openTabs,
-        activeFile: this.activeFile,
-      }),
+      prompt: opencodePrompt,
       title: "Pointer Agent",
       dangerous: true,
-      files: this.buildAskContext(prompt).attachFiles,
+      files: orderedContextFiles,
     });
     this.syncFromDisk();
+    if (needsDeterministicPatchFallback(run, this)) {
+      const fallbackApplied = [];
+      for (let i = 0; i < 3; i += 1) {
+        const fallback = await runDeterministicPatchFallback({
+          terminal: this,
+          prompt,
+          contextFiles: orderedContextFiles,
+          pass: i + 1,
+        });
+        if (!fallback.applied.length) {
+          if (fallback.raw.trim()) {
+            run.events.push({
+              type: "pointer_supervisor",
+              reason: "deterministic_patch_fallback_no_apply",
+              raw: fallback.raw.slice(0, 1200),
+            });
+          }
+          break;
+        }
+        fallbackApplied.push(...fallback.applied);
+        run.events.push({
+          type: "pointer_supervisor",
+          reason: "deterministic_patch_fallback",
+          pass: i + 1,
+          applied: fallback.applied,
+        });
+        this.syncFromDisk();
+        if (createdSourceFilesNeedingIntegration(this).length) break;
+        if (this.changedFiles().length) break;
+      }
+      if (fallbackApplied.length) {
+        run.text = [
+          run.text?.trim(),
+          `Pointer deterministic patch fallback applied ${mergeUnique(fallbackApplied).length} file update${mergeUnique(fallbackApplied).length === 1 ? "" : "s"}.`,
+        ].filter(Boolean).join("\n\n");
+      }
+    }
+    const structuralIntegration = runDeterministicStructuralIntegration({
+      terminal: this,
+      prompt,
+      contextFiles: orderedContextFiles,
+    });
+    if (structuralIntegration.applied.length) {
+      run.events.push({
+        type: "pointer_supervisor",
+        reason: "deterministic_structural_integration",
+        createdFiles: structuralIntegration.createdFiles,
+        candidateFiles: structuralIntegration.candidateFiles,
+        applied: structuralIntegration.applied,
+      });
+      run.text = [
+        run.text?.trim(),
+        `Pointer structural integration completed ${mergeUnique(structuralIntegration.applied).length} file update${mergeUnique(structuralIntegration.applied).length === 1 ? "" : "s"}.`,
+      ].filter(Boolean).join("\n\n");
+      this.syncFromDisk();
+    }
+    const integration = await runDeterministicIntegrationFallback({
+      terminal: this,
+      prompt,
+      contextFiles: orderedContextFiles,
+    });
+    if (integration.applied.length) {
+      run.events.push({
+        type: "pointer_supervisor",
+        reason: "deterministic_integration_fallback",
+        createdFiles: integration.createdFiles,
+        candidateFiles: integration.candidateFiles,
+        applied: integration.applied,
+      });
+      run.text = [
+        run.text?.trim(),
+        `Pointer integration fallback completed ${mergeUnique(integration.applied).length} additional file update${mergeUnique(integration.applied).length === 1 ? "" : "s"}.`,
+      ].filter(Boolean).join("\n\n");
+      this.syncFromDisk();
+    } else if (integration.raw.trim()) {
+      run.events.push({
+        type: "pointer_supervisor",
+        reason: "deterministic_integration_fallback_no_apply",
+        createdFiles: integration.createdFiles,
+        candidateFiles: integration.candidateFiles,
+        raw: integration.raw.slice(0, 1200),
+      });
+    }
     if (this.changedFiles().length && !collectBashRecords(run.events).length && hasProjectVerificationConfig(this.fs_)) {
       const fallback = await runDeterministicVerificationFallback(this.root, this.fs_);
       if (fallback) {
@@ -553,7 +665,7 @@ class PointerTerminal {
         ...tests,
         ...discovered,
         ...manifests,
-      ]).filter((p) => !isGeneratedContextFile(p) && !isUnrequestedDocContextFile(p, prompt)),
+      ]).filter((p) => !isGeneratedContextFile(p) && !isLowSignalContextFile(p, prompt) && !isUnrequestedDocContextFile(p, prompt)),
       prompt,
       this.activeFile,
       this.fs_,
@@ -671,9 +783,9 @@ ASK MODE OUTPUT CONTRACT:
   provided context. Never list more than 8 identifiers and never repeat one.
 - Never copy identifier examples from these instructions into the answer unless
   they appear in the supplied repository context.
-- When explaining core framework/runtime files, name concrete configuration
-  defaults, compatibility hooks, and routing/middleware paths visible in the
-  file instead of smoothing them into generic summaries.
+- When explaining core runtime, platform, or configuration files, name concrete
+  defaults, compatibility hooks, and behavior paths visible in the file instead
+  of smoothing them into generic summaries.
 - Name important top-level functions, methods, and literal setting keys by their
   exact identifiers when they are central to the file.
 - For direct edit requests ("change this file", "fix this", "add X"),
@@ -693,29 +805,12 @@ ${
 function renderAskRunPrompt({ messages, context }) {
   const out = [
     "ASK MODE CONTRACT:",
-    "- Answer from the repository files OpenCode reads or receives via --file.",
-    "- If Attached context contains relevant file blocks or literal evidence lines that answer the question, answer directly from that context without using additional tools.",
-    "- For file explanation questions, name the file's purpose, important imports/exports, state or data flow, and notable risks or neighboring files.",
-    "- For interface code, call out important state owners, event handlers, and conditional rendered UI when they are present.",
-    "- For routing questions, name the exact router components visible in the file, including Switch when it is present.",
-    "- For theme persistence questions, name the exact storage import/local variable and storage calls when they are visible, for example local-storage-fallback, storage.getItem, or storage.setItem only if those names appear in repository context.",
-    "- For editor or media-heavy components, mention file operations, upload/image handling, export, and persistence flows when those symbols are visible.",
-    "- For codebase research questions that ask where a behavior is configured, compiled, consumed, or flows through the project, use search/read tools to trace at least the definition file and consumer file before answering.",
-    "- For codebase research or source-path answers, name exact repository-relative file paths for each hop; do not stop at import specifiers such as ./utils.",
-    "- If a search finds the symbol or behavior, read the matching file before answering; do not answer from search snippets alone.",
-    "- Unless the user explicitly asks for code samples, do not emit fenced code blocks in Ask mode; describe short code facts inline with backticks instead.",
-    "- Include a compact Key identifiers sentence with 4-8 exact symbols, dotted assignments, method names, and configuration keys visible in the file. Format it as a comma-separated list. Never list more than 8 identifiers and never repeat an identifier. If more than 8 are possible, choose the 8 most important.",
-    "- Key identifiers must be real identifiers or setting keys from the file, not synthesized property chains.",
-    "- If a Visible symbols inventory is supplied, do not name methods or exports that are absent from that inventory unless they are shown verbatim in another evidence line.",
-    "- Prefer exact local names over paraphrases: if a file defines a symbol or setting key, use that exact spelling.",
-    "- If a file defines dotted exported assignments such as object.method = function, name the dotted assignment exactly instead of only the bare method name.",
-    "- When a file defines default/configuration methods, name the important literal setting keys and defaults visible in those methods.",
-    "- If Literal evidence includes app.defaultConfiguration, app.set(...), or setting keys, name the important literal setting keys in the prose.",
-    "- Do not list bare prior-version method names such as mount or lazyrouter unless the file defines that exact method/export in the visible context.",
-    "- Preserve literal identifiers exactly as they appear in files. Never copy identifier examples from these instructions into the answer unless OpenCode actually saw them in repository content.",
-    "- Never output internal progress blocks or headings like ## Goal, ## Progress, Constraints, Next Steps, or Continue if you have next steps.",
-    "- Do not claim you lack access to a named, active, or attached file.",
-    "- Do not modify files in Ask mode.",
+    "- Answer only from attached context or repository files OpenCode reads.",
+    "- Use retained memory/evidence first, and do not invent unseen code.",
+    "- For named-file questions, read/use that file first, then explain purpose, important imports/exports, data flow, adjacent files, and risks when visible.",
+    "- For behavior-flow questions, trace definition-to-consumer hops with exact repository-relative paths and read matches before answering.",
+    "- Mention exact visible symbols/settings only; preserve spelling and include a compact Key identifiers sentence with 4-8 real identifiers when useful.",
+    "- Avoid fenced code unless requested. Do not output internal progress headings, claim missing access to named files, or modify files.",
     "",
     "Conversation:",
   ];
@@ -741,42 +836,33 @@ function renderAgentRunPrompt({ workspace, mode, goal, openTabs, activeFile, con
   if (context?.trim()) out.push(`Attached context:\n${context.trim()}`);
   out.push(`User goal:\n${goal.trim()}`);
   if (mode === "plan") {
-    const activeBase = activeFile ? basename(activeFile).replace(/\.[^.]+$/, "") : "";
+    const activeBase = activeFile && !manifestFilesFor([activeFile]).length
+      ? basename(activeFile).replace(/\.[^.]+$/, "")
+      : "";
     const refactorRequest = /\b(refactor|cleanup|clean up|feature|implement|creative|improve)\b/i.test(goal);
     out.push(
       [
-        "Plan mode contract: gather bounded context, then stop searching and answer.",
+        "Plan mode contract: inspect only the context needed to create an executable plan, then stop.",
         refactorRequest
           ? "This is a change-planning request: the final Plan must include source changes and must not answer no source changes needed merely because current behavior works."
           : "",
-        "Required reads before final: the active file when relevant; the directly related implementation file; the directly related test/spec file; package/config files needed for verification.",
-        "For interface work, include both the state/logic file and the file that renders the affected UI.",
+        "Read the active/named file when relevant, directly related implementation files, nearby examples for additive work, likely tests/specs/fixtures, and project config for verification.",
         activeBase
           ? `Because the active file basename is ${activeBase}, search for tests/specs containing ${activeBase} in the filename or contents before finalizing.`
           : "",
-        "Use the repository's own structure and naming conventions to discover tests, specs, examples, snapshots, fixtures, or validation commands; do not assume a language, framework, package manager, or test runner.",
-        "Do not finalize until relevant verification context has been read or you explicitly state what you checked and that none exists.",
+        "Use repository structure to discover validation; do not assume a language, framework, package manager, test runner, or bug.",
         "Treat attached repository context and Authoritative evidence as binding; do not make a claim that contradicts it.",
-        "Do not propose framework or router API migrations unless package/config context proves the installed major version supports the target API; preserve current dependency major versions for behavior-preserving refactors.",
-        "For theme/refactor plans, distinguish styled-components ThemeProvider from a custom React context. Do not claim components consume a custom context unless the code shows a hook/provider; if props are used, say props are used.",
-        "When naming files or implementation areas, cite exact symbols visible in context instead of generic descriptions.",
-        "Do not assume a reported bug exists: compare the proposed fix to the code you read. If the code already contains the proposed source change, do not claim it is missing; produce a no-source-change or regression-test-only plan and cite the exact existing behavior.",
-        "If the user explicitly asks for a refactor or cleanup, produce a concrete behavior-preserving refactor plan; do not answer no-source-change merely because the current behavior works.",
-        "If the user asks for a refactor, cleanup, feature, or creative change, do not no-op merely because the current behavior works; produce a behavior-preserving implementation plan.",
-        "If the evidence disproves the suspected bug, do not restate that suspected bug as true anywhere in the final answer.",
-        "If the final plan is no-source-change, the Assessment must not say the reported bug exists, remains visible, does not re-render, or still needs a source fix.",
+        "When using tools, prefer repository-relative paths returned by list/glob/read output. Do not invent absolute paths or rewrite the workspace path. If a read fails, list the parent and retry with the exact relative path before finalizing.",
+        "When naming files or implementation areas, cite exact visible symbols instead of generic descriptions.",
         "Final response format: Context read: exact paths; Assessment: what the code proves; Plan: exact changes or no-source-change rationale; Verification: exact narrow command.",
-        "In the Assessment or Plan, name the exact symbols or exported values you will change.",
-        "Final output must be under 180 words and contain no internal debate, self-correction, or discarded hypotheses.",
-        "Verification must name an actual project command from repository configuration when available. Prefer the narrowest existing verification that covers the touched behavior. If no focused verification exists for a refactor, prefer the repository's configured build or validation command.",
-        "Plan verification commands must be executable by Agent mode without package executors: never use npx, npm exec, pnpm dlx, yarn dlx, or bunx in a plan. Prefer package scripts such as npm test, npm run test:run, npm run build, cargo test, go test, pytest, or the repository's configured equivalent.",
+        "Final output must be under 180 words and Verification must name an actual configured command when available.",
       ]
         .filter(Boolean)
         .join(" "),
     );
   } else if (mode === "agent") {
     out.push(
-      "Agent implementation constraints: make the minimal correct change for the goal, preserve unrelated structure and assets, and verify when project commands are available even if the user did not explicitly ask to run tests. If package scripts or equivalent project commands exist, attempt the narrowest relevant command after editing unless a command is explicitly forbidden. After any successful edit, a final answer with zero bash verification attempts is invalid; run a verification command or attempt one and report the real blocker before finalizing. If the user asks to add or update tests, you must edit or create the relevant test/spec file even when verification cannot run. Do not install, add, remove, or update dependencies unless the user explicitly asks; if verification is blocked by missing dependencies, report the blocked command instead of changing dependency state. Never run or even attempt package executors: npx, npm exec, pnpm dlx, yarn dlx, or bunx are forbidden even for eslint, vitest, mocha, or one-off probing. Use scripts already present in package.json such as npm test, npm run test:run, npm run build, npm run lint, or npm run typecheck. If no relevant script exists, use the closest existing script or report that verification is blocked; do not invent an npx command. If package.json, Cargo.toml, pyproject.toml, or similar config defines verification scripts, do not claim verification commands are unavailable; missing dependencies mean verification was blocked or failed, not absent. Final answer: one concise non-repetitive summary under 140 words with changed files and a Verification: sentence naming the exact command attempted or the exact blocked command. Never say verification was skipped because the user did not ask, because the change was minimal, or because of user constraints.",
+      "Agent implementation constraints: gather minimal evidence, make the smallest relevant edit, preserve unrelated code/assets, and verify with the narrowest configured repository command when available. If attached context already contains sufficient evidence, proceed to edits; re-read only files you will modify or files whose exact full contents are needed. For additive/edit tasks with clear target files and one analogous example visible, perform at most two extra reads before the first edit. Do not keep reading examples once one useful local pattern is visible. Do not install/update dependencies or use one-off package executors such as npx, npm exec, pnpm dlx, yarn dlx, or bunx. Final answer: concise changed files plus the real verification command/result.",
     );
   }
   return out.join("\n\n");
@@ -804,53 +890,221 @@ async function runOpenCode({
   fs.mkdirSync(cacheDir, { recursive: true });
   fs.writeFileSync(configPath, JSON.stringify(opencodeConfig(model), null, 2));
   const bin = resolveOpenCodeBin();
-  const args = [
-    "run",
-    "--pure",
-    "--model",
-    opencodeModelArg(model),
-    "--agent",
-    mode === "ask" ? "pointer-ask" : mode === "agent" ? "pointer-agent" : "pointer-plan",
-    "--format",
-    "json",
-    "--title",
-    title ?? `Pointer ${mode}`,
-    prompt,
-  ];
-  for (const file of mergeUnique(files)) {
-    if (mode !== "agent" && isLargeWorkspaceFile(cwd, file)) continue;
-    args.push(`--file=${file}`);
-  }
-  if (dangerous) args.push("--dangerously-skip-permissions");
-
   const events = [];
   let fullText = "";
   let textSinceTool = "";
+  let sessionId = "";
+  let supervisorContinues = 0;
+  let totalReadOnlyCompleted = 0;
+  let sawMutation = false;
   try {
+    for (;;) {
+      const attemptPrompt =
+        supervisorContinues === 0
+          ? prompt
+          : buildAgentSupervisorPrompt({
+              originalPrompt: prompt,
+              readOnlyCompleted: totalReadOnlyCompleted,
+              sawMutation,
+            });
+      const args = [
+        "run",
+        "--pure",
+        "--model",
+        opencodeModelArg(model),
+        ...opencodeVariantArgs(mode),
+        "--agent",
+        mode === "ask" ? "pointer-ask" : mode === "agent" ? "pointer-agent" : "pointer-plan",
+        "--format",
+        "json",
+        "--title",
+        title ?? `Pointer ${mode}`,
+      ];
+      if (sessionId) args.push("--session", sessionId);
+      else if (supervisorContinues > 0) args.push("--continue");
+      args.push(attemptPrompt);
+      if (supervisorContinues === 0) {
+        for (const file of mergeUnique(files)) {
+          if (mode !== "agent" && isLargeWorkspaceFile(cwd, file)) continue;
+          args.push(`--file=${file}`);
+        }
+      }
+      if (dangerous) args.push("--dangerously-skip-permissions");
+
+      const attempt = await runOpenCodeProcess({
+        bin,
+        args,
+        cwd,
+        env: {
+          ...process.env,
+          PWD: cwd,
+          OPENCODE_CONFIG: configPath,
+          XDG_DATA_HOME: dataDir,
+          XDG_STATE_HOME: stateDir,
+          XDG_CACHE_HOME: cacheDir,
+          OPENAI_API_KEY: process.env.OPENAI_API_KEY || "pointer-local",
+          OLLAMA_API_KEY: process.env.OLLAMA_API_KEY || "pointer-local",
+          OLLAMA_CONTEXT_LENGTH: process.env.OLLAMA_CONTEXT_LENGTH || "32768",
+          OLLAMA_NUM_PARALLEL: process.env.OLLAMA_NUM_PARALLEL || "1",
+          OPENCODE_DISABLE_EXTERNAL_SKILLS: "1",
+          OPENCODE_DISABLE_CLAUDE_CODE_SKILLS: "1",
+        },
+        mode,
+        timeoutMs: mode === "agent" ? Math.min(timeoutMs, AGENT_SUPERVISOR_ATTEMPT_TIMEOUT_MS) : timeoutMs,
+        supervise: mode === "agent" && supervisorContinues < AGENT_SUPERVISOR_MAX_CONTINUES,
+        onEvent(event) {
+          events.push(event);
+          if (event.sessionID && !sessionId) sessionId = event.sessionID;
+          if (event.type === "text") {
+            const t = event.part?.text ?? "";
+            fullText += t;
+            textSinceTool += t;
+          } else if (event.type === "tool_use") {
+            textSinceTool = "";
+            console.log(formatOpenCodeToolEvent(event, events.length, cwd));
+            if (opencodeToolStatus(event) === "completed") {
+              const tool = opencodeToolName(event);
+              if (isMutatingOpenCodeTool(tool)) sawMutation = true;
+              else if (isReadOnlyOpenCodeTool(tool)) totalReadOnlyCompleted += 1;
+            }
+          }
+        },
+      });
+      if (attempt.sessionId && !sessionId) sessionId = attempt.sessionId;
+      if (attempt.reason === "supervisor_continue") {
+        supervisorContinues += 1;
+        events.push({
+          type: "pointer_supervisor",
+          reason: attempt.reason,
+          readOnlyCompleted: totalReadOnlyCompleted,
+          sawMutation,
+        });
+        console.log(
+          `Pointer supervisor: continuing OpenCode session after ${totalReadOnlyCompleted} read-only tool(s) without a mutation.`,
+        );
+        continue;
+      }
+      if (attempt.reason === "verification_repair") {
+        supervisorContinues += 1;
+        events.push({
+          type: "pointer_supervisor",
+          reason: attempt.reason,
+          readOnlyCompleted: totalReadOnlyCompleted,
+          sawMutation,
+        });
+        console.log("Pointer supervisor: continuing OpenCode session after verification failed.");
+        continue;
+      }
+      if (
+        mode === "agent" &&
+        attempt.reason === "timeout" &&
+        supervisorContinues < AGENT_SUPERVISOR_MAX_CONTINUES
+      ) {
+        supervisorContinues += 1;
+        events.push({
+          type: "pointer_supervisor",
+          reason: sawMutation ? "mutation_timeout_continue" : "timeout_continue",
+          readOnlyCompleted: totalReadOnlyCompleted,
+          sawMutation,
+        });
+        console.log(
+          sawMutation
+            ? "Pointer supervisor: continuing OpenCode session after a partial edit timed out."
+            : "Pointer supervisor: continuing OpenCode session after a no-progress timeout.",
+        );
+        continue;
+      }
+      if (
+        mode === "agent" &&
+        !sawMutation &&
+        !fullText.trim() &&
+        supervisorContinues < AGENT_SUPERVISOR_MAX_CONTINUES
+      ) {
+        supervisorContinues += 1;
+        events.push({
+          type: "pointer_supervisor",
+          reason: "no_mutation_empty_final",
+          readOnlyCompleted: totalReadOnlyCompleted,
+          sawMutation,
+        });
+        console.log("Pointer supervisor: continuing OpenCode session after Agent stopped without edits or a blocker.");
+        continue;
+      }
+      if (attempt.code !== null && attempt.code !== 0) {
+        if (!["verified_done", "verification_blocked", "verification_failed_final"].includes(attempt.reason)) {
+          throw new Error(stripAnsi(attempt.stderr).trim() || `opencode exited ${attempt.code}`);
+        }
+      }
+      if (attempt.signal) {
+        if (mode === "agent" && attempt.reason === "timeout") {
+          break;
+        }
+        if (!["verified_done", "verification_blocked", "verification_failed_final"].includes(attempt.reason)) {
+          throw new Error(`opencode timed out or was killed (${attempt.signal}) after ${timeoutMs}ms`);
+        }
+      }
+      break;
+    }
+    const answerSource = textSinceTool.trim() ? textSinceTool : fullText;
+    const normalizedText = normalizeFinalText(
+      answerSource.trim() || (mode === "agent" ? buildAgentFallbackFinal(events, cwd) : ""),
+    );
+    const sanitizedText = sanitizeWorkspacePaths(normalizedText, cwd);
+    return {
+      text: polishAssistantText(sanitizeVerificationClaims(sanitizedText, events), { mode }),
+      fullText,
+      events,
+      cwd,
+      sessionId,
+    };
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+}
+
+function runOpenCodeProcess({ bin, args, cwd, env, mode, timeoutMs, supervise, onEvent }) {
+  return new Promise((resolve, reject) => {
     const child = spawn(bin, args, {
       cwd,
-      env: {
-        ...process.env,
-        PWD: cwd,
-        OPENCODE_CONFIG: configPath,
-        XDG_DATA_HOME: dataDir,
-        XDG_STATE_HOME: stateDir,
-        XDG_CACHE_HOME: cacheDir,
-        OPENAI_API_KEY: process.env.OPENAI_API_KEY || "pointer-local",
-        OLLAMA_API_KEY: process.env.OLLAMA_API_KEY || "pointer-local",
-        OPENCODE_DISABLE_EXTERNAL_SKILLS: "1",
-        OPENCODE_DISABLE_CLAUDE_CODE_SKILLS: "1",
-      },
+      env,
       stdio: ["ignore", "pipe", "pipe"],
     });
-    const timer = setTimeout(() => {
-      child.kill("SIGTERM");
-      setTimeout(() => child.kill("SIGKILL"), 2000).unref?.();
-    }, timeoutMs);
     child.stdout.setEncoding("utf8");
     child.stderr.setEncoding("utf8");
     let stdoutBuf = "";
-    let stderrBuf = "";
+    let stderr = "";
+    let sessionId = "";
+    let settled = false;
+    let readOnlyCompleted = 0;
+    let sawMutation = false;
+    let forcedReason = "";
+    const finish = (result) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timeoutTimer);
+      clearTimeout(supervisorTimer);
+      resolve({ sessionId, stderr, ...result });
+    };
+    const killForSupervisor = () => {
+      forcedReason = "supervisor_continue";
+      child.kill("SIGTERM");
+      setTimeout(() => child.kill("SIGKILL"), 2000).unref?.();
+    };
+    const killWithReason = (reason) => {
+      forcedReason = reason;
+      child.kill("SIGTERM");
+      setTimeout(() => child.kill("SIGKILL"), 2000).unref?.();
+    };
+    const timeoutTimer = setTimeout(() => {
+      forcedReason = "timeout";
+      child.kill("SIGTERM");
+      setTimeout(() => child.kill("SIGKILL"), 2000).unref?.();
+    }, timeoutMs);
+    const supervisorTimer = setTimeout(() => {
+      if (supervise && !sawMutation && readOnlyCompleted >= AGENT_SUPERVISOR_READ_LIMIT) {
+        killForSupervisor();
+      }
+    }, AGENT_SUPERVISOR_STALL_MS);
     child.stdout.on("data", (chunk) => {
       stdoutBuf += chunk;
       let nl;
@@ -859,57 +1113,602 @@ async function runOpenCode({
         stdoutBuf = stdoutBuf.slice(nl + 1);
         const event = parseOpenCodeLine(line);
         if (!event) continue;
-        events.push(event);
-        if (event.type === "text") {
-          const t = event.part?.text ?? "";
-          fullText += t;
-          textSinceTool += t;
-        } else if (event.type === "tool_use") {
-          textSinceTool = "";
-          console.log(formatOpenCodeToolEvent(event, events.length, cwd));
+        if (event.sessionID && !sessionId) sessionId = event.sessionID;
+        onEvent(event);
+        if (
+          supervise &&
+          mode === "agent" &&
+          event.type === "tool_use" &&
+          opencodeToolStatus(event) === "completed"
+        ) {
+          const tool = opencodeToolName(event);
+          if (isMutatingOpenCodeTool(tool)) sawMutation = true;
+          else if (isReadOnlyOpenCodeTool(tool)) readOnlyCompleted += 1;
+          if (sawMutation && tool === "bash") {
+            const output = String(event.part?.state?.output ?? "");
+            const status = opencodeToolStatus(event);
+            if (status === "completed") {
+              killWithReason("verified_done");
+            } else if (status === "error") {
+              killWithReason(
+                isMissingDependencyOrBinaryOutput(output)
+                  ? "verification_blocked"
+                  : "verification_repair",
+              );
+            }
+          }
+          if (!sawMutation && readOnlyCompleted >= AGENT_SUPERVISOR_READ_LIMIT) {
+            killForSupervisor();
+          }
         }
       }
     });
     child.stderr.on("data", (chunk) => {
-      stderrBuf += chunk;
+      stderr += chunk;
     });
-    const code = await new Promise((resolve, reject) => {
-      child.on("error", reject);
-      child.on("close", (code, signal) => {
-        clearTimeout(timer);
-        if (signal) {
-          reject(new Error(`opencode timed out or was killed (${signal}) after ${timeoutMs}ms`));
-        } else {
-          resolve(code);
-        }
-      });
-    });
-    if (stdoutBuf.trim()) {
-      const event = parseOpenCodeLine(stdoutBuf);
-      if (event) {
-        events.push(event);
-        if (event.type === "text") {
-          const t = event.part?.text ?? "";
-          fullText += t;
-          textSinceTool += t;
-        } else if (event.type === "tool_use") {
-          textSinceTool = "";
-        }
+    child.on("error", reject);
+    child.on("close", (code, signal) => {
+      if (stdoutBuf.trim()) {
+        const event = parseOpenCodeLine(stdoutBuf);
+        if (event?.sessionID && !sessionId) sessionId = event.sessionID;
+        if (event) onEvent(event);
       }
+      finish({ code, signal, reason: forcedReason || (signal ? "signal" : "closed") });
+    });
+  });
+}
+
+function buildAgentSupervisorPrompt({ originalPrompt, readOnlyCompleted, sawMutation }) {
+  const statusLine = sawMutation
+    ? "Pointer observed that the prior attempt already made at least one repository edit but did not finish the whole task cleanly."
+    : "Pointer observed that the prior attempt gathered read-only context but did not complete the requested edit.";
+  return [
+    "Continue the same Agent task in this OpenCode session.",
+    statusLine,
+    `Original user request: ${originalPrompt.trim()}`,
+    `Observed read-only tool completions so far: ${readOnlyCompleted}. Mutating edit observed: ${sawMutation ? "yes" : "no"}.`,
+    "",
+    "Agnostic execution rule:",
+    sawMutation
+      ? "- Continue from the existing on-disk changes. Do not restart or rewrite unrelated files; complete only missing edits needed for the original request."
+      : "- If the task requires a repository change and no hard blocker exists, your next action must be exactly one mutating tool call such as edit/write/apply_patch.",
+    "- Use repository-relative paths already discovered in this session.",
+    "- Do not read more examples unless the target path is unknown or the edit would be unsafe without one additional file; if you read once, the following action must be the edit or blocker.",
+    "- If impossible, return a concise final blocker naming the missing fact or permission.",
+    "- After editing, run the narrowest configured verification command available in the repository.",
+  ].join("\n");
+}
+
+function buildAgentFallbackFinal(events, workspace) {
+  const changed = [];
+  const verifications = [];
+  for (const event of events) {
+    if (event.type !== "tool_use" || opencodeToolStatus(event) !== "completed") continue;
+    const tool = opencodeToolName(event);
+    if (isMutatingOpenCodeTool(tool)) {
+      const target = describeOpenCodeToolTarget(event.part?.state?.input ?? {}, workspace);
+      changed.push(target || tool);
     }
-    if (code !== 0) {
-      throw new Error(stripAnsi(stderrBuf).trim() || `opencode exited ${code}`);
-    }
-    const normalizedText = normalizeFinalText(textSinceTool.trim() ? textSinceTool : fullText);
-    return {
-      text: polishAssistantText(sanitizeVerificationClaims(normalizedText, events), { mode }),
-      fullText,
-      events,
-      cwd,
-    };
-  } finally {
-    fs.rmSync(root, { recursive: true, force: true });
   }
+  for (const event of events) {
+    if (event.type !== "tool_use" || opencodeToolName(event) !== "bash") continue;
+    const state = event.part?.state ?? {};
+    verifications.push({
+      command: String(state.input?.command ?? ""),
+      status: String(state.status ?? ""),
+      output: String(state.output ?? ""),
+    });
+  }
+  const uniqueChanged = mergeUnique(changed).slice(0, 8);
+  const latestVerification = verifications.at(-1);
+  const summary = uniqueChanged.length
+    ? `Updated ${uniqueChanged.join(", ")}.`
+    : "Agent stopped before applying a repository change.";
+  const verification = latestVerification
+    ? `Verification: \`${latestVerification.command || "verification command"}\` ${
+        latestVerification.status === "completed"
+          ? "completed successfully"
+          : `failed or was blocked: ${firstMeaningfulLine(latestVerification.output)}`
+      }.`
+    : "Verification: not completed before the agent run stopped.";
+  return `${summary}\n\n${verification}`;
+}
+
+function isReadOnlyOpenCodeTool(tool) {
+  return /^(read|grep|glob|list|search|lsp|diagnostic|symbol|view|todo|todowrite)$/i.test(String(tool ?? ""));
+}
+
+function isMutatingOpenCodeTool(tool) {
+  return /^(edit|write|patch|apply_patch|apply_diff|rename|delete|move)$/i.test(String(tool ?? ""));
+}
+
+function isMissingDependencyOrBinaryOutput(output) {
+  return /\b(command not found|not found|cannot find module|module not found|no such file or directory|executable file not found|missing script|is not recognized)\b/i.test(
+    String(output ?? ""),
+  );
+}
+
+function needsDeterministicPatchFallback(run, terminal) {
+  if (!terminal?.root) return false;
+  const text = String(run?.text ?? "");
+  if (!terminal.changedFiles().length) return true;
+  return /\bnot completed before the agent run stopped\b|partial edit|timed out|stopped before applying/i.test(text);
+}
+
+async function runDeterministicPatchFallback({ terminal, prompt, contextFiles, pass = 1 }) {
+  const files = mergeUnique([
+    ...contextFiles,
+    ...terminal.changedFiles(),
+  ])
+    .filter((file) => terminal.fs_.has(file))
+    .slice(0, 5);
+  const fileBlocks = files
+    .map((file) => fileBlock(file, compactFileForPrompt(file, terminal.fs_.read(file), prompt, 1100)))
+    .join("\n\n");
+  const diff = terminal.changedDiffs({ maxFiles: 5, maxChars: 6000 });
+  const patchPrompt = [
+    "Pointer fallback patcher. Output only machine-applicable patch blocks.",
+    "OpenCode stalled or returned partial work.",
+    "",
+    "Rules:",
+    "- Language/framework/library/folder agnostic.",
+    "- Existing files: use SEARCH/REPLACE with SEARCH copied exactly from provided current bytes.",
+    "- New files: use <file path=\"repo/relative/path\">complete bytes</file>.",
+    "- No prose, markdown, or fences.",
+    "- Do not write literal SEARCH/REPLACE markers into file content.",
+    "- Smallest complete patch for the user request.",
+    "- Include integration edits if a new artifact must be referenced by a caller/registry/manifest/export/config to affect behavior.",
+    "Existing edit format: <<<<<<< SEARCH path/to/file\\nexact current bytes\\n=======\\nreplacement bytes\\n>>>>>>> REPLACE",
+    "New file format: <file path=\"path/to/new-file\">complete file bytes</file>",
+    pass > 1
+      ? "- This is a follow-up fallback pass. Use the current changed-file diff to complete missing edits or repair malformed generated content."
+      : "",
+    "",
+    `Original user request:\n${prompt}`,
+    "",
+    diff ? `Current changed-file diff from the stalled agent:\n${diff}` : "Current changed-file diff from the stalled agent: (none)",
+    "",
+    `Current repository context:\n${fileBlocks}`,
+  ].join("\n");
+  const raw = await safeGenerateRaw({
+    prompt: patchPrompt,
+    raw: false,
+    think: false,
+    options: { temperature: 0.05, num_predict: 1200 },
+    timeoutMs: AGENT_FALLBACK_TIMEOUT_MS,
+  });
+  const applied = applySearchReplaceToDisk(terminal.root, raw);
+  return { raw, applied };
+}
+
+async function runDeterministicIntegrationFallback({ terminal, prompt, contextFiles }) {
+  const createdFiles = createdSourceFilesNeedingIntegration(terminal);
+  if (!createdFiles.length) return { raw: "", applied: [], createdFiles: [], candidateFiles: [] };
+  const candidateFiles = integrationCandidateFiles(terminal, prompt, contextFiles, createdFiles);
+  if (!candidateFiles.length) return { raw: "", applied: [], createdFiles, candidateFiles: [] };
+  const createdBlocks = createdFiles
+    .filter((file) => terminal.fs_.has(file))
+    .map((file) => fileBlock(file, compactFileForPrompt(file, terminal.fs_.read(file), prompt, 1800)))
+    .join("\n\n");
+  const candidateBlocks = candidateFiles
+    .filter((file) => terminal.fs_.has(file))
+    .map((file) => fileBlock(file, terminal.fs_.read(file).slice(0, 12000)))
+    .join("\n\n");
+  const diff = terminal.changedDiffs({ maxFiles: 10, maxChars: 10000 });
+  const patchPrompt = [
+    "Pointer integration patcher. Output only SEARCH/REPLACE blocks.",
+    "A prior agent created/changed source artifacts that are not yet referenced by existing repo files.",
+    "Patch existing candidate files only if integration is needed for the original request.",
+    "",
+    "Rules:",
+    "- Language/framework/library/folder/naming agnostic.",
+    "- Use only created files, candidate files, and diff below.",
+    "- If no integration is needed, output nothing.",
+    "- SEARCH must be copied byte-for-byte from a candidate file.",
+    "- Do not emit <file> blocks, prose, markdown, or fences.",
+    "- Preserve visible ordering/style conventions.",
+    "Format: <<<<<<< SEARCH path/to/file\\nexact current bytes\\n=======\\nreplacement bytes\\n>>>>>>> REPLACE",
+    "",
+    `Original user request:\n${prompt}`,
+    "",
+    `Created or unreferenced source artifacts:\n${createdFiles.map((file) => `- ${file}`).join("\n")}`,
+    "",
+    diff ? `Current diff:\n${diff}` : "Current diff: (none)",
+    "",
+    `Created artifact contents:\n${createdBlocks}`,
+    "",
+    `Existing candidate integration files:\n${candidateBlocks}`,
+  ].join("\n");
+  const raw = await safeGenerateRaw({
+    prompt: patchPrompt,
+    raw: false,
+    think: false,
+    options: { temperature: 0.03, num_predict: 1000 },
+    timeoutMs: AGENT_FALLBACK_TIMEOUT_MS,
+  });
+  const applied = applySearchReplaceToDisk(terminal.root, raw, { allowCreates: false, allowedFiles: candidateFiles });
+  return { raw, applied, createdFiles, candidateFiles };
+}
+
+function runDeterministicStructuralIntegration({ terminal, prompt, contextFiles }) {
+  const createdFiles = createdSourceFilesNeedingIntegration(terminal);
+  if (!createdFiles.length) return { applied: [], createdFiles: [], candidateFiles: [] };
+  const candidateFiles = integrationCandidateFiles(terminal, prompt, contextFiles, createdFiles);
+  if (!candidateFiles.length) return { applied: [], createdFiles, candidateFiles: [] };
+  const applied = [];
+  for (const createdFile of createdFiles) {
+    for (const candidateFile of candidateFiles) {
+      const changed = tryIntegrateModuleRegistryFile(terminal, prompt, createdFile, candidateFile);
+      if (!changed.length) continue;
+      applied.push(...changed);
+      terminal.syncFromDisk();
+      break;
+    }
+  }
+  return { applied: mergeUnique(applied), createdFiles, candidateFiles };
+}
+
+function tryIntegrateModuleRegistryFile(terminal, prompt, createdFile, candidateFile) {
+  if (!looksLikeModuleFile(createdFile) || !looksLikeModuleFile(candidateFile)) return [];
+  if (!terminal.fs_.has(createdFile) || !terminal.fs_.has(candidateFile)) return [];
+  const createdBody = terminal.fs_.read(createdFile);
+  const candidateBody = terminal.fs_.read(candidateFile);
+  const symbol = defaultExportSymbol(createdBody);
+  if (!symbol || candidateBody.includes(symbol)) return [];
+  if (!extractRelativeImports(candidateBody).length) return [];
+  const importSpec = relativeModuleSpec(candidateFile, createdFile);
+  const importLine = `import ${symbol} from '${importSpec}';`;
+  let nextCandidate = insertImportDeclaration(candidateBody, importLine);
+  const registry = insertModuleRegistryEntry(nextCandidate, symbol);
+  if (!registry.changed) return [];
+  nextCandidate = registry.text;
+  if (patchWouldCorruptExistingFile(candidateFile, candidateBody, nextCandidate)) return [];
+
+  const writes = [];
+  fs.writeFileSync(path.join(terminal.root, candidateFile), nextCandidate);
+  writes.push(candidateFile);
+
+  if (registry.referencesTitle && !moduleSymbolHasTitle(createdBody, symbol)) {
+    const titled = insertModuleTitleAssignment(createdBody, symbol, titleForCreatedModule(prompt, symbol));
+    if (titled !== createdBody && !patchWouldCorruptExistingFile(createdFile, createdBody, titled)) {
+      fs.writeFileSync(path.join(terminal.root, createdFile), titled);
+      writes.push(createdFile);
+    }
+  }
+  return writes;
+}
+
+function defaultExportSymbol(body) {
+  const text = String(body ?? "");
+  return (
+    /\bexport\s+default\s+function\s+([A-Za-z_$][\w$]*)/.exec(text)?.[1] ??
+    /\bexport\s+default\s+class\s+([A-Za-z_$][\w$]*)/.exec(text)?.[1] ??
+    /\bexport\s+default\s+([A-Za-z_$][\w$]*)\s*;?/.exec(text)?.[1] ??
+    null
+  );
+}
+
+function insertImportDeclaration(body, importLine) {
+  if (body.includes(importLine)) return body;
+  const lines = String(body ?? "").split(/\r?\n/);
+  let insertAt = 0;
+  for (let i = 0; i < lines.length; i += 1) {
+    const line = lines[i].trim();
+    if (/^import(?:\s|["'])/.test(line)) insertAt = i + 1;
+    else if (line && !line.startsWith("//")) break;
+  }
+  lines.splice(insertAt, 0, importLine);
+  return lines.join("\n");
+}
+
+function insertModuleRegistryEntry(body, symbol) {
+  const text = String(body ?? "");
+  if (text.includes(`Component: ${symbol}`) || new RegExp(`\\b${symbol}\\s*,`).test(text)) {
+    return { changed: false, text, referencesTitle: false };
+  }
+  const componentArray = /(const\s+[A-Za-z_$][\w$]*\s*=\s*\[[\s\S]*?)(\n\]\.map|\n\];)/m.exec(text);
+  if (componentArray && /\bComponent\s*:/.test(componentArray[1])) {
+    const referencesTitle = /\b[A-Za-z_$][\w$]*\.title\b/.test(componentArray[1]);
+    const entry = referencesTitle
+      ? `  { Component: ${symbol}, title: ${symbol}.title },`
+      : `  { Component: ${symbol} },`;
+    return {
+      changed: true,
+      referencesTitle,
+      text:
+        text.slice(0, componentArray.index) +
+        componentArray[1].replace(/\s*$/, "\n") +
+        entry +
+        text.slice(componentArray.index + componentArray[1].length),
+    };
+  }
+  const defaultArray = /(export\s+default\s+\[[\s\S]*?)(\n\];)/m.exec(text);
+  if (defaultArray) {
+    return {
+      changed: true,
+      referencesTitle: false,
+      text:
+        text.slice(0, defaultArray.index) +
+        defaultArray[1].replace(/\s*$/, "\n") +
+        `  ${symbol},` +
+        text.slice(defaultArray.index + defaultArray[1].length),
+    };
+  }
+  return { changed: false, text, referencesTitle: false };
+}
+
+function moduleSymbolHasTitle(body, symbol) {
+  const escaped = symbol.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  return new RegExp(`\\b${escaped}\\.title\\s*=`).test(String(body ?? ""));
+}
+
+function insertModuleTitleAssignment(body, symbol, title) {
+  const text = String(body ?? "");
+  const assignment = `${symbol}.title = ${JSON.stringify(title)};`;
+  const exportRe = new RegExp(`\\nexport\\s+default\\s+${symbol}\\s*;?`);
+  if (exportRe.test(text)) {
+    return text.replace(exportRe, `\n${assignment}\n\nexport default ${symbol};`);
+  }
+  return `${text.replace(/\s*$/, "\n\n")}${assignment}\n`;
+}
+
+function titleForCreatedModule(prompt, symbol) {
+  const called = /\bcalled\s+["']?([A-Za-z0-9][A-Za-z0-9 _-]{1,80})["']?/i.exec(String(prompt ?? ""))?.[1];
+  if (called) return titleCaseWords(called.replace(/\bslide\b/gi, "").trim() || called);
+  return splitIdentifierWords(symbol.replace(/(?:Slide|Component|View|Page)$/i, "")) || symbol;
+}
+
+function splitIdentifierWords(value) {
+  return String(value ?? "")
+    .replace(/[_-]+/g, " ")
+    .replace(/([a-z0-9])([A-Z])/g, "$1 $2")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function titleCaseWords(value) {
+  return splitIdentifierWords(value)
+    .split(" ")
+    .filter(Boolean)
+    .map((word) => word.slice(0, 1).toUpperCase() + word.slice(1))
+    .join(" ");
+}
+
+async function safeGenerateRaw(args) {
+  try {
+    return await generateRaw(args);
+  } catch (error) {
+    return `POINTER_GENERATION_FAILED: ${error?.message ?? String(error)}`;
+  }
+}
+
+function applySearchReplaceToDisk(root, raw, options = {}) {
+  return applySearchReplaceToDiskWithOptions(root, raw, options);
+}
+
+function applySearchReplaceToDiskWithOptions(root, raw, { allowCreates = true, allowedFiles = null } = {}) {
+  const applied = [];
+  const hunksByPath = new Map();
+  const allowed = allowedFiles ? new Set(allowedFiles.map((file) => normalizePath(file).toLowerCase())) : null;
+  for (const hunk of parseSearchReplace(raw)) {
+    const rel = normalizePath(stripQuotes(hunk.path ?? ""));
+    if (!rel || path.isAbsolute(rel) || rel.startsWith("..")) continue;
+    if (allowed && !allowed.has(rel.toLowerCase())) continue;
+    const list = hunksByPath.get(rel) ?? [];
+    list.push(hunk);
+    hunksByPath.set(rel, list);
+  }
+  for (const [rel, hunks] of hunksByPath.entries()) {
+    const abs = path.resolve(root, rel);
+    if (!abs.startsWith(root)) continue;
+    fs.mkdirSync(path.dirname(abs), { recursive: true });
+    const existing = fs.existsSync(abs) ? fs.readFileSync(abs, "utf8") : "";
+    const createHunks = hunks.filter((hunk) => !String(hunk.search ?? "").trim());
+    const editHunks = hunks.filter((hunk) => String(hunk.search ?? "").trim());
+    let next = existing;
+    let ok = false;
+    if (editHunks.length) {
+      if (editHunks.some((hunk) => isMalformedPatchPayload(hunk.replace))) continue;
+      const result = applyHunks(next, editHunks);
+      if (result.applied !== editHunks.length) continue;
+      next = result.text;
+      ok = true;
+    }
+    if (allowCreates && createHunks.length && !existing) {
+      next = stripOuterCodeFence(createHunks.at(-1).replace);
+      if (isMalformedPatchPayload(next)) continue;
+      ok = true;
+    }
+    if (ok && patchWouldCorruptExistingFile(rel, existing, next)) continue;
+    if (ok && next !== existing) {
+      fs.writeFileSync(abs, next);
+      applied.push(rel);
+    }
+  }
+  return applied;
+}
+
+function stripOuterCodeFence(value) {
+  const text = String(value ?? "").trim();
+  const match = /^```[\w-]*\s*\n([\s\S]*?)\n```$/.exec(text);
+  return match ? match[1] : value;
+}
+
+function isMalformedPatchPayload(value) {
+  return /(^|\n)\s*(?:<<<<<<<\s*)?SEARCH(?:\s+\S+)?\s*\n|(^|\n)\s*=======\s*\n|(^|\n)\s*(?:>>>>>>>\s*)?REPLACE\s*(\n|$)/.test(
+    String(value ?? ""),
+  );
+}
+
+function patchWouldCorruptExistingFile(filePath, before, after) {
+  if (!before || before === after) return false;
+  if (looksLikeModuleFile(filePath)) {
+    if (hasImportAfterExecutableCode(after)) return true;
+    const beforeDefaultExports = countMatches(before, /\bexport\s+default\b/g);
+    const afterDefaultExports = countMatches(after, /\bexport\s+default\b/g);
+    if (beforeDefaultExports >= 1 && afterDefaultExports > beforeDefaultExports) return true;
+  }
+  const beforeLines = String(before).split(/\r?\n/).filter((line) => line.trim());
+  const afterLines = String(after).split(/\r?\n/).filter((line) => line.trim());
+  if (beforeLines.length > 20 && afterLines.length > beforeLines.length * 1.75) {
+    const repeated = mostCommonLineFrequency(afterLines);
+    if (repeated >= 4) return true;
+  }
+  return false;
+}
+
+function looksLikeModuleFile(filePath) {
+  return /\.(js|jsx|ts|tsx|mjs|cjs|vue|svelte)$/i.test(filePath);
+}
+
+function hasImportAfterExecutableCode(text) {
+  let sawExecutable = false;
+  for (const rawLine of String(text ?? "").split(/\r?\n/)) {
+    const line = rawLine.trim();
+    if (!line || line.startsWith("//") || line.startsWith("/*") || line.startsWith("*")) continue;
+    if (/^import(?:\s|["'])/.test(line)) {
+      if (sawExecutable) return true;
+      continue;
+    }
+    if (/^export\s+(?:type|interface)\b/.test(line)) continue;
+    sawExecutable = true;
+  }
+  return false;
+}
+
+function countMatches(text, re) {
+  return [...String(text ?? "").matchAll(re)].length;
+}
+
+function mostCommonLineFrequency(lines) {
+  const counts = new Map();
+  let max = 0;
+  for (const line of lines) {
+    const key = line.trim();
+    if (key.length < 8) continue;
+    const next = (counts.get(key) ?? 0) + 1;
+    counts.set(key, next);
+    if (next > max) max = next;
+  }
+  return max;
+}
+
+function createdSourceFilesNeedingIntegration(terminal) {
+  if (!terminal?.fs_ || !terminal?.baseline) return [];
+  return terminal.changedFiles()
+    .filter((file) => terminal.fs_.has(file) && !terminal.baseline.has(file))
+    .filter((file) => isIntegratableSourceArtifact(file))
+    .filter((file) => !isFileReferencedInWorkspace(terminal, file))
+    .slice(0, 6);
+}
+
+function isIntegratableSourceArtifact(filePath) {
+  const p = normalizePath(filePath).toLowerCase();
+  if (isGeneratedContextFile(p) || /(?:^|\/)(?:package-lock|yarn|pnpm-lock|bun.lockb)\b/.test(p)) return false;
+  return /\.(astro|c|cc|cpp|cs|css|go|h|hpp|html|java|js|jsx|kt|less|mjs|py|rb|rs|sass|scss|svelte|ts|tsx|vue)$/.test(p);
+}
+
+function isFileReferencedInWorkspace(terminal, targetFile) {
+  const fs_ = terminal.fs_;
+  const target = normalizePath(targetFile);
+  const targetLower = target.toLowerCase();
+  const base = basename(target);
+  const stem = basenameNoExt(target);
+  const content = fs_.has(target) ? fs_.read(target) : "";
+  const symbols = extractContextSymbols(content)
+    .map((symbol) => symbol.split(".").at(-1))
+    .filter((symbol) => symbol && symbol.length >= 4);
+  for (const [file, body] of fs_.files.entries()) {
+    if (normalizePath(file) === target) continue;
+    const lower = String(body ?? "").toLowerCase();
+    if (base.length >= 4 && lower.includes(base.toLowerCase())) return true;
+    if (stem.length >= 4 && lower.includes(stem.toLowerCase())) return true;
+    if (symbols.some((symbol) => lower.includes(symbol.toLowerCase()))) return true;
+    const spec = relativeModuleSpec(file, target);
+    if (spec && mentionsModuleSpec(body, spec)) return true;
+    if (lower.includes(targetLower)) return true;
+  }
+  return false;
+}
+
+function relativeModuleSpec(fromFile, targetFile) {
+  const fromDir = path.posix.dirname(normalizePath(fromFile));
+  const target = normalizePath(targetFile);
+  let rel = normalizePath(path.posix.relative(fromDir, target));
+  if (!rel.startsWith(".")) rel = `./${rel}`;
+  const withoutExt = rel.replace(/\.[^.\/]+$/, "");
+  return withoutExt || rel;
+}
+
+function mentionsModuleSpec(body, spec) {
+  const escaped = spec.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  return new RegExp(`['"]${escaped}(?:\\.[A-Za-z0-9]+)?['"]`).test(String(body ?? ""));
+}
+
+function integrationCandidateFiles(terminal, prompt, contextFiles, createdFiles) {
+  const fs_ = terminal.fs_;
+  const allFiles = [...fs_.files.keys()];
+  const terms = researchTerms(prompt);
+  const scored = new Map();
+  const add = (file, score, reason = "") => {
+    if (!file || !fs_.has(file) || createdFiles.includes(file)) return;
+    if (isGeneratedContextFile(file) || isLowSignalContextFile(file, prompt) || isUnrequestedDocContextFile(file, prompt)) return;
+    if (!isIntegratableSourceArtifact(file) && !manifestFilesFor([file]).length) return;
+    const prev = scored.get(file);
+    if (!prev || prev.score < score) scored.set(file, { file, score, reason });
+  };
+
+  for (const file of contextFiles ?? []) add(file, 50, "preflight context");
+  if (terminal.activeFile) add(terminal.activeFile, 45, "active file");
+  for (const file of manifestFilesFor(allFiles)) add(file, 20, "manifest");
+
+  for (const created of createdFiles) {
+    const createdDir = path.posix.dirname(normalizePath(created));
+    const ancestorDirs = ancestorDirectories(createdDir);
+    for (const file of allFiles) {
+      if (!fs_.has(file) || createdFiles.includes(file)) continue;
+      const body = fs_.read(file);
+      const fileDir = path.posix.dirname(normalizePath(file));
+      const imports = extractRelativeImports(body);
+      const sameDir = fileDir === createdDir;
+      const ancestor = ancestorDirs.includes(fileDir);
+      const importsSibling = imports.some((spec) => {
+        const resolved = resolveRelativeImport(file, spec, allFiles);
+        return resolved && path.posix.dirname(normalizePath(resolved)) === createdDir;
+      });
+      const mentionsSiblingStem = allFiles.some((candidate) => {
+        if (candidate === created || path.posix.dirname(normalizePath(candidate)) !== createdDir) return false;
+        const stem = basenameNoExt(candidate);
+        return stem.length >= 4 && body.toLowerCase().includes(stem.toLowerCase());
+      });
+      let score = 0;
+      if (sameDir) score += 58;
+      if (ancestor) score += 34;
+      if (importsSibling) score += 45;
+      if (mentionsSiblingStem) score += 28;
+      if (isAggregatorContextFile(file, body)) score += 70;
+      if (isEntryContextFile(file, body)) score += 40;
+      if (manifestFilesFor([file]).length) score += 18;
+      score += Math.min(20, researchFileScore(file, body, terms, terminal.activeFile));
+      if (score >= 42) add(file, score, `candidate for ${created}`);
+    }
+  }
+
+  return [...scored.values()]
+    .sort((a, b) => b.score - a.score || pathDepth(a.file) - pathDepth(b.file) || a.file.localeCompare(b.file))
+    .slice(0, 8)
+    .map((item) => item.file);
+}
+
+function ancestorDirectories(dir) {
+  const normalized = normalizePath(dir);
+  if (!normalized || normalized === ".") return [];
+  const parts = normalized.split("/").filter(Boolean);
+  const out = [];
+  for (let i = parts.length; i > 0; i -= 1) {
+    out.push(parts.slice(0, i).join("/"));
+  }
+  return out;
 }
 
 function opencodeConfig(model) {
@@ -929,7 +1728,7 @@ function opencodeConfig(model) {
         models: {
           [modelId]: {
             name: modelId,
-            limit: { context: 32768, output: 4096 },
+            limit: { context: 32768, output: 1536 },
           },
         },
       },
@@ -939,7 +1738,7 @@ function opencodeConfig(model) {
         model: modelRef,
         description: "Pointer Ask mode",
         prompt:
-          "Answer questions about the current codebase using read-only repository context. If the user asks about a named or attached file, read that file first and center the answer on that file rather than giving a broad repository overview. If the user asks how a behavior flows through the codebase, read the directly related definition and consumer files before answering. Unless the user explicitly asks for code samples, do not emit fenced code blocks in Ask mode; describe short code facts inline with backticks instead. Include a compact Key identifiers sentence with 4-8 exact symbols, dotted assignments, method names, and configuration keys visible in the file; never list more than 8 identifiers and never repeat an identifier. Preserve literal identifiers exactly as they appear in files. Never copy identifier examples from instructions into the answer unless OpenCode actually saw them in repository content. Do not claim you lack access to a named, active, or attached file. Do not modify files.",
+          "Ask mode: answer from attached context or repository files you read. For named-file questions, read/use that file first. For behavior-flow questions, trace definition-to-consumer hops with exact repository-relative paths and read matches before answering. Mention exact visible symbols/settings only and include a compact Key identifiers sentence when useful. Avoid fenced code unless requested. Do not modify files.",
         permission: {
           edit: "deny",
           bash: "deny",
@@ -954,7 +1753,7 @@ function opencodeConfig(model) {
         model: modelRef,
         description: "Pointer Plan mode",
         prompt:
-          "Create executable engineering plans for the current codebase. Read the relevant files yourself before finalizing, but keep context gathering bounded: prefer the active file, directly related implementation files, directly related existing verification or specification context when it can be found, and project configuration needed to name the verification command. For interface work, include both the state/logic file and the file that renders the affected UI. Use the repository's own structure and naming conventions to discover tests, specs, examples, snapshots, fixtures, or validation commands; do not assume a language, framework, package manager, or test runner. Do not finalize until relevant verification context has been read or you explicitly state what you checked and that none exists. After reading source, verification context, and project configuration, finalize instead of continuing to search. Do not assume a reported bug exists: compare the proposed fix to the code you read. If the code already contains the proposed source change, do not claim it is missing; produce a no-source-change or regression-test-only plan and cite the exact existing behavior. If the user asks for a refactor, cleanup, feature, or creative change, do not no-op merely because the current behavior works; produce a behavior-preserving implementation plan. If the evidence disproves the suspected bug, do not restate that suspected bug as true anywhere in the final answer. Do not edit, write, delete, rename, run shell commands, create todos, use skills, or delegate to tasks. Final response format: Context read: exact paths; Assessment: what the code proves; Plan: exact changes or no-source-change rationale; Verification: exact narrow command. Final output must be under 180 words and contain no internal debate, self-correction, or discarded hypotheses. Always include at least one exact narrow verification command the user can run; prefer the narrowest existing verification that covers the touched behavior. Plan verification commands must be executable by Agent mode without package executors: never use npx, npm exec, pnpm dlx, yarn dlx, or bunx in a plan. Prefer package scripts such as npm test, npm run test:run, npm run build, cargo test, go test, pytest, or the repository's configured equivalent. If the existing code is already correct, say that directly and cite the files and verification evidence that prove it, plus the exact command to rerun that verification.",
+          "Plan mode: inspect bounded evidence, then produce an executable plan without editing or running shell commands. Read active/named files when relevant, directly related implementation files, analogous examples for additive work, likely tests/specs/fixtures, and project config for verification. Use repository-relative paths returned by tools; if a read fails, list the parent and retry the exact relative path. Do not assume a language, framework, package manager, or bug. Final format under 180 words: Context read; Assessment; Plan; Verification with an exact configured command.",
         permission: {
           edit: "deny",
           bash: "deny",
@@ -969,9 +1768,11 @@ function opencodeConfig(model) {
         model: modelRef,
         description: "Pointer Agent mode",
         prompt:
-          "Implement the user's requested code change in the current repository. Gather the minimum necessary context, edit only files required for the task, preserve unrelated structure and assets, and verify with the narrowest existing project command when available even if the user did not explicitly ask to run tests. If package scripts or equivalent project commands exist, attempt the narrowest relevant command after editing unless a command is explicitly forbidden. After any successful edit, a final answer with zero bash verification attempts is invalid; run a verification command or attempt one and report the real blocker before finalizing. If the user asks to add or update tests, you must edit or create the relevant test/spec file even when verification cannot run. Do not install, add, remove, or update dependencies unless the user explicitly asks; if verification is blocked by missing dependencies, report the blocked command instead of changing dependency state. Never run or even attempt package executors: npx, npm exec, pnpm dlx, yarn dlx, or bunx are forbidden even for eslint, vitest, mocha, or one-off probing. Use scripts already present in package.json such as npm test, npm run test:run, npm run build, npm run lint, or npm run typecheck. If no relevant script exists, use the closest existing script or report that verification is blocked; do not invent an npx command. Do not run destructive git commands, pushes, resets, cleanups, or broad filesystem deletion. Final response must be concise, non-repetitive, and focused on changed files plus a Verification: sentence naming the exact command attempted or the exact blocked command. Never say verification was skipped because the user did not ask, because the change was minimal, or because of user constraints.",
+          "Agent mode: gather minimal evidence, make the smallest relevant edit, preserve unrelated code/assets, and verify with the narrowest configured repository command when available. Use attached context as deterministic evidence; if it is sufficient, proceed to edits and re-read only files you will modify or need in full. For additive/edit tasks with clear target files and one analogous example visible, perform at most two extra reads before the first edit. Do not keep reading examples once one useful local pattern is visible. Do not install/update dependencies or run destructive commands unless explicitly requested. Do not use one-off package executors such as npx, npm exec, pnpm dlx, yarn dlx, or bunx. Final response must concisely list changed files and the real verification command/result.",
         permission: {
           edit: "allow",
+          write: "allow",
+          apply_patch: "allow",
           read: "allow",
           glob: "allow",
           grep: "allow",
@@ -1035,6 +1836,16 @@ function opencodeModelId(model) {
 function opencodeModelArg(model) {
   const trimmed = String(model).trim();
   return trimmed.includes("/") ? trimmed : `ollama/${trimmed}`;
+}
+
+function opencodeVariantArgs(mode) {
+  const modeKey = String(mode ?? "").toUpperCase();
+  const value =
+    process.env[`POINTER_OPENCODE_${modeKey}_VARIANT`] ??
+    process.env.POINTER_OPENCODE_VARIANT ??
+    (mode === "agent" ? "default" : "minimal");
+  const variant = String(value).trim();
+  return variant && variant.toLowerCase() !== "default" ? ["--variant", variant] : [];
 }
 
 function parseOpenCodeLine(line) {
@@ -1124,6 +1935,16 @@ function sanitizeVerificationClaims(text, events = []) {
     out = `${out.trim()}\n\nVerification: not completed; Pointer blocked package executor/dependency commands and the temp workspace did not have the required test binary available.`;
   }
   return out.trim();
+}
+
+function sanitizeWorkspacePaths(text, workspace) {
+  let out = String(text ?? "");
+  if (!workspace) return out;
+  const normalized = normalizePath(path.resolve(expandHome(workspace)));
+  const escaped = normalized.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  out = out.replace(new RegExp(`${escaped}/`, "g"), "");
+  out = out.replace(new RegExp(escaped, "g"), ".");
+  return out;
 }
 
 function polishAssistantText(text, opts = {}) {
@@ -1557,13 +2378,15 @@ function findTestFilesFor(filePath, files) {
 }
 
 function discoverResearchFiles(text, { files, activePath, maxFiles = 4 } = {}) {
-  if (!isResearchPrompt(text) || !files?.size) return [];
+  if (!files?.size) return [];
   const terms = researchTerms(text);
   if (!terms.length) return [];
+  const minScore = isResearchPrompt(text) ? 2 : 4;
   const scored = [];
   for (const [filePath, body] of files.entries()) {
+    if (isGeneratedContextFile(filePath) || isLowSignalContextFile(filePath, text) || isUnrequestedDocContextFile(filePath, text)) continue;
     const score = researchFileScore(filePath, body, terms, activePath);
-    if (score > 1) scored.push({ filePath, score });
+    if (score >= minScore) scored.push({ filePath, score });
   }
   return scored
     .sort((a, b) => b.score - a.score || a.filePath.localeCompare(b.filePath))
@@ -1585,7 +2408,7 @@ function buildContextBrain({ fs_, prompt, activeFile, openTabs = [], primaryFile
   const packets = [];
   const trail = [];
   const enqueue = (file, score, reason) => {
-    if (!file || !fs_.has(file) || isGeneratedContextFile(file) || isUnrequestedDocContextFile(file, prompt)) return;
+    if (!file || !fs_.has(file) || isGeneratedContextFile(file) || isLowSignalContextFile(file, prompt) || isUnrequestedDocContextFile(file, prompt)) return;
     const key = normalizePath(file);
     const prev = enqueued.get(key);
     if (prev && prev.score >= score) return;
@@ -1617,14 +2440,18 @@ function buildContextBrain({ fs_, prompt, activeFile, openTabs = [], primaryFile
     const importScore = Math.max(35, next.score - 18);
     for (const spec of extractRelativeImports(body).slice(0, 12)) {
       const resolved = resolveRelativeImport(next.file, spec, allFiles);
-      enqueue(resolved, importScore, `direct import from ${next.file}`);
+      const sourceIsStyle = /\.(css|scss|sass|less)$/i.test(next.file);
+      const targetIsStyle = /\.(css|scss|sass|less)$/i.test(resolved ?? "");
+      const scoredImport = sourceIsStyle && targetIsStyle ? Math.max(18, importScore - 60) : importScore;
+      enqueue(resolved, scoredImport, `direct import from ${next.file}`);
     }
     for (const test of findTestFilesFor(next.file, allFiles)) {
       enqueue(test, Math.max(42, next.score - 14), `test/spec neighbor for ${next.file}`);
     }
-    if (research || /refactor|bug|fix|feature|implement|where|how|flow|wired/i.test(String(prompt))) {
+    if (research || /refactor|bug|fix|feature|implement|add|create|new|creative|visual|interface|where|how|flow|wired/i.test(String(prompt))) {
+      const additive = /\b(add|create|new|feature|register|insert|include)\b/i.test(String(prompt));
       for (const importer of findReverseImporters(next.file, allFiles, fs_).slice(0, 4)) {
-        enqueue(importer, Math.max(28, next.score - 30), `reverse importer of ${next.file}`);
+        enqueue(importer, additive ? Math.max(128, next.score + 8) : Math.max(28, next.score - 30), `reverse importer of ${next.file}`);
       }
     }
   }
@@ -1679,12 +2506,13 @@ function extractContextEvidenceLines(file, lines, prompt, terms) {
   const generic = [
     /import\s/,
     /export\s/,
+    /\b(?:class|function|const|let|var)\s+[A-Za-z_$][\w$]*/,
     /describe\s*\(/,
     /\bit\s*\(/,
     /test\s*\(/,
-    /app\.set|app\.get|defineGetter|compile|query parser|subdomain offset/i,
-    /ThemeProvider|Switch|Route|storage\.|local-storage-fallback/i,
-    /showDropOverlay|dragDrop|drop-overlay|unsupported/i,
+    /\b(?:state|props|handler|render|template|style|className|config|schema|command|route)\b/i,
+    /"scripts"\s*:/,
+    /"(?:build|test|lint|typecheck|check)"\s*:/,
   ];
   const hits = [];
   lines.forEach((line, idx) => {
@@ -1707,11 +2535,11 @@ function extractContextEvidenceLines(file, lines, prompt, terms) {
 }
 
 function describeContextFileKind(file, body) {
-  if (file === "package.json") return "manifest";
+  if (manifestFilesFor([file]).length) return "manifest";
   if (/(?:^|\/)__tests__\/|\.test\.|\.spec\./.test(file)) return "verification";
-  if (/Route|Router|Switch|ThemeProvider|<template|defineComponent|React/.test(body)) return "ui/source";
-  if (/exports\.|module\.exports|app\.set|defineGetter/.test(body)) return "runtime/source";
   if (/\.(css|scss|sass|less)$/.test(file)) return "style";
+  if (/<[A-Za-z][^>]*>|className=|style=|render|template|component/i.test(body)) return "ui/source";
+  if (/exports\.|module\.exports|\bpub\s+fn\b|\bdef\s+\w+|\bfunc\s+\w+/.test(body)) return "runtime/source";
   return "source";
 }
 
@@ -1782,10 +2610,6 @@ function isResearchPrompt(text) {
 function researchTerms(text) {
   const raw = String(text ?? "");
   const out = [];
-  const lower = raw.toLowerCase();
-  if (/\bquery\b/.test(lower) && /\bparser\b/.test(lower)) out.push("query parser", "queryParser");
-  if (/\bsubdomain\b/.test(lower) && /\boffset\b/.test(lower)) out.push("subdomain offset", "subdomainOffset");
-  if (/\bdrag\b/.test(lower) && /\bdrop\b/.test(lower)) out.push("drag drop", "dragDrop");
   for (const match of raw.matchAll(/[`'"]([^`'"]{3,80})[`'"]/g)) out.push(match[1]);
   for (const match of raw.matchAll(/\b[A-Za-z_$][\w$]*\.[A-Za-z_$][\w$]*\b/g)) out.push(match[0]);
   for (const match of raw.matchAll(/\b[A-Za-z_$][\w$]*[A-Z][\w$]*\b/g)) out.push(match[0]);
@@ -1804,6 +2628,20 @@ function researchTerms(text) {
     "path",
     "current",
     "project",
+    "opened",
+    "existing",
+    "quality",
+    "detailed",
+    "visually",
+    "beautiful",
+    "should",
+    "would",
+    "could",
+    "create",
+    "adding",
+    "add",
+    "new",
+    "plan",
     "through",
   ]);
   const words = raw
@@ -1815,6 +2653,7 @@ function researchTerms(text) {
     if (word.endsWith("ing") && word.length > 6) out.push(word.slice(0, -3), `${word.slice(0, -3)}e`);
     if (word.endsWith("ed") && word.length > 5) out.push(word.slice(0, -2), `${word.slice(0, -1)}e`);
     if (word.endsWith("s") && word.length > 5) out.push(word.slice(0, -1));
+    out.push(`${word}s`);
   }
   return mergeUnique(out).slice(0, 18);
 }
@@ -1823,8 +2662,14 @@ function researchFileScore(filePath, body, terms, activePath) {
   const text = String(body ?? "");
   const haystack = `${filePath}\n${text}`.toLowerCase();
   const compactHaystack = haystack.replace(/[^a-z0-9]+/g, "");
-  const promptTopic = terms.join(" ").toLowerCase();
   let score = filePath === activePath ? 1 : 0;
+  const activeRoot = activePath && normalizePath(activePath).includes("/")
+    ? normalizePath(path.posix.dirname(activePath))
+    : "";
+  if (activeRoot) {
+    const scoped = normalizePath(filePath).startsWith(`${activeRoot}/`) || normalizePath(filePath) === activeRoot;
+    score += scoped ? 4 : -4;
+  }
   for (const term of terms) {
     const needle = String(term ?? "").toLowerCase();
     if (!needle) continue;
@@ -1836,24 +2681,25 @@ function researchFileScore(filePath, body, terms, activePath) {
     if (text.includes(term)) score += 2;
   }
   if (/\b(test|spec|__tests__)\b/i.test(filePath)) score -= 1;
-  if (/^examples\//i.test(filePath)) score -= 5;
+  if (/^examples\//i.test(filePath)) score += 1;
   if (isGeneratedContextFile(filePath)) score -= 20;
   if (/^(history|changelog)(\.|$)/i.test(filePath)) score -= 8;
   if (/\.(md|markdown)$|(^|\/)package\.json$/i.test(filePath)) score -= 3;
   if (/\.(js|jsx|ts|tsx|vue|rs|py|go)$/i.test(filePath)) score += 1;
-  if (promptTopic.includes("query parser")) {
-    if (/compileQueryParser|exports\.compileQueryParser/.test(text)) score += 10;
-    if (/query parser fn|defineGetter\(req,\s*['"]query['"]/.test(text)) score += 9;
-    if (/this\.set\(['"]query parser['"]|case ['"]query parser['"]/.test(text)) score += 8;
-    if (/test\/req\.query|req\.query/.test(filePath) || /describe\([^)]*query parser/i.test(text)) score += 5;
-    if (/lib\/response\.js$|lib\/express\.js$/.test(filePath)) score -= 5;
-  }
   return score;
 }
 
 function isGeneratedContextFile(filePath) {
   return /(?:^|\/)(?:gen|generated)\/.*\.json$/i.test(filePath) ||
     /(?:^|\/)schemas\/.*schema\.json$/i.test(filePath);
+}
+
+function isLowSignalContextFile(filePath, prompt) {
+  const p = normalizePath(filePath).toLowerCase();
+  if (/\b(lockfile|lock file|package lock|dependency lock|exact version|resolved version)\b/i.test(String(prompt ?? ""))) {
+    return false;
+  }
+  return /(?:^|\/)(?:package-lock\.json|npm-shrinkwrap\.json|pnpm-lock\.yaml|yarn\.lock|bun\.lockb|cargo\.lock|gemfile\.lock|poetry\.lock|composer\.lock|mix\.lock)$/i.test(p);
 }
 
 function isUnrequestedDocContextFile(filePath, prompt) {
@@ -1876,7 +2722,7 @@ function isRelevantNeighbor(filePath, query) {
   const base = basenameNoExt(norm).toLowerCase();
   const compactQuery = query.replace(/[^a-z0-9]+/g, "");
   if (base && compactQuery.includes(base.replace(/[^a-z0-9]+/g, ""))) return true;
-  if (/\b(style|render|component|components|composable|composables|ui|interface)\b/.test(query) && /\.(css|scss|sass|less|html|js|jsx|ts|tsx|vue|svelte)$/.test(norm)) {
+  if (/\b(style|render|component|components|view|views|ui|interface|screen|page|template)\b/.test(query) && /\.(css|scss|sass|less|html|js|jsx|ts|tsx|vue|svelte)$/.test(norm)) {
     return true;
   }
   if (base && query.split(/[^a-z0-9]+/).some((term) => term.length >= 4 && base.includes(term))) {
@@ -1889,7 +2735,7 @@ function isDirectImportContextNeighbor(filePath, query, seedFile, activeFile) {
   if (!seedFile || normalizePath(seedFile) !== normalizePath(activeFile ?? "")) return false;
   const norm = normalizePath(filePath).toLowerCase();
   if (!/\.(css|scss|sass|less|html|js|jsx|ts|tsx|vue|svelte)$/.test(norm)) return false;
-  return /\b(component|components|composable|composables|consume|consumes|theme|routing|route|router|state|props|refactor|cleanup|clean|ui|interface|render|wired|flow|drag|drop|overlay|unsupported)\b/.test(query);
+  return /\b(component|components|view|views|consume|consumes|theme|routing|route|router|state|props|refactor|cleanup|clean|ui|interface|render|wired|flow|style|template|screen|page)\b/.test(query);
 }
 
 function compactFileForPrompt(filePath, text, prompt, maxChars = 5000) {
@@ -1909,17 +2755,15 @@ function compactFileForPrompt(filePath, text, prompt, maxChars = 5000) {
     "describe",
     "it(",
     "test(",
-    "vditor",
-    "upload",
-    "image",
-    "dragdrop",
-    "dragdropmanager",
-    "showdropoverlay",
-    "drop-overlay",
-    "theme",
-    "save",
-    "open",
-    "exportto",
+    "class",
+    "function",
+    "component",
+    "style",
+    "render",
+    "template",
+    "state",
+    "props",
+    "config",
     ...queryTerms,
   ]);
   const keep = new Set();
@@ -1967,15 +2811,10 @@ function summarizeLargeFileForPrompt(filePath, text, maxChars = 4500) {
   const stateKeys = [];
   const methodNames = [];
   const hotspots = [];
-  const featurePatterns = [
-    /Vditor/i,
-    /dragDropManager|showDropOverlay|drop-overlay|useDragDrop/i,
-    /upload|uploadToImageHost|uploadToSMMS|getImageHostConfig/i,
-    /imagePathMapper|isImageFile|assets\/images/i,
-    /exportTo|pdf|html/i,
-    /saveMdFile|loadFileByPath|openMdFile|newMdFile|currentFilePath/i,
-    /setVditorTheme|isDarkTheme|theme/i,
-    /scrollMemory|checkUnsavedChanges/i,
+  const structuralPatterns = [
+    /\b(import|export|class|function|const|let|var)\b/,
+    /\b(render|template|style|className|class|state|props|handler|command|route|schema|config)\b/i,
+    /\b(test|describe|it|spec|fixture|snapshot)\b/i,
   ];
   lines.forEach((line, idx) => {
     const trimmed = line.trim();
@@ -1990,7 +2829,7 @@ function summarizeLargeFileForPrompt(filePath, text, maxChars = 4500) {
     if (methodMatch && methodNames.length < 48) {
       methodNames.push(`${idx + 1}: ${methodMatch[1]}()`);
     }
-    if (featurePatterns.some((pattern) => pattern.test(line)) && hotspots.length < 48) {
+    if (structuralPatterns.some((pattern) => pattern.test(line)) && hotspots.length < 48) {
       hotspots.push(`${idx + 1}: ${trimmed.slice(0, 180)}`);
     }
   });
@@ -2008,35 +2847,15 @@ function askEvidenceForPrompt(files, fs_, prompt, maxLines = 24) {
     .map((term) => term.toLowerCase())
     .filter((term) => term.length >= 4);
   const important = [
-    /compileQueryParser/,
-    /exports\.compileQueryParser/,
-    /\breq\.query\b/,
-    /\bdefineGetter\(req,\s*['"]query['"]/,
-    /defaultConfiguration/,
-    /\bapp\.(?:handle|use|route|listen|render|defaultConfiguration)\b/,
-    /\b(?:this|app)\.set\s*\(/,
-    /\b(?:this|app)\.enable\s*\(/,
-    /\b(?:this|app)\.disable\s*\(/,
-    /\btrust proxy\b/,
-    /\bquery parser\b/,
-    /\bsubdomain offset\b/,
-    /\betag\b/,
-    /\bshowDropOverlay\b/,
-    /\bdragDropManager\b/,
-    /\bdrop-overlay\b/,
-    /\bupload\b/i,
-    /\bimagePathMapper\b/,
-    /\bisImageFile\b/,
-    /\bgetImageHostConfig\b/,
-    /\buploadToImageHost\b/,
-    /\bhandleUpload\b/,
-    /\bThemeProvider\b/,
-    /\bSwitch\b/,
-    /\bRoute\b/,
-    /\bBrowserRouter\b/,
-    /\blocal-storage-fallback\b/,
-    /\bstorage\.(?:getItem|setItem)\b/,
-    /\bhistoryTheme\b/,
+    /\bimport\s/,
+    /\bexport\s/,
+    /\b(?:class|function|const|let|var)\s+[A-Za-z_$][\w$]*/,
+    /\b(?:state|props|handler|render|template|style|className|config|schema|command|route)\b/i,
+    /\bdescribe\s*\(/,
+    /\bit\s*\(/,
+    /\btest\s*\(/,
+    /"scripts"\s*:/,
+    /"(?:build|test|lint|typecheck|check)"\s*:/,
   ];
   const hits = [];
   files.forEach((file, fileIndex) => {
@@ -2094,72 +2913,50 @@ function symbolInventoryForPrompt(files, fs_, prompt, maxPerFile = 32) {
 
 function planEvidenceForPrompt(files, fs_, prompt, maxLines = 28) {
   const out = [];
-  const goal = String(prompt ?? "");
-  if (/drag|drop|overlay|unsupported/i.test(goal)) {
-    for (const file of files) {
-      if (!/useDragDrop\.[jt]s$/i.test(file) || !fs_.has(file)) continue;
-      const body = fs_.read(file);
-      if (/if\s*\(\s*type\s*===\s*['"]drop['"]\s*\)\s*{[^}]*showDropOverlay\.value\s*=\s*false/s.test(body)) {
-        out.push(
-          `${file}: FACT - the drop handler already sets showDropOverlay.value = false before unsupported-file handling; do not propose adding that same source reset.`,
-        );
+  const terms = researchTerms(prompt);
+  for (const file of files) {
+    if (!manifestFilesFor([file]).length || !fs_.has(file)) continue;
+    const body = fs_.read(file);
+    try {
+      const parsed = JSON.parse(body);
+      const scripts = parsed?.scripts && typeof parsed.scripts === "object" ? parsed.scripts : null;
+      if (scripts) {
+        for (const [name, command] of Object.entries(scripts)) {
+          if (/^(build|test|test:.*|lint|typecheck|check|verify)$/i.test(name)) {
+            out.push(`${file}: script ${name} = ${command}`);
+            if (out.length >= maxLines) return out.join("\n");
+          }
+        }
+      }
+    } catch {
+      for (const line of body.split(/\r?\n/).slice(0, 80)) {
+        if (/"(?:build|test|lint|typecheck|check)"\s*:/.test(line)) out.push(`${file}: ${line.trim()}`);
+        if (out.length >= maxLines) return out.join("\n");
       }
     }
   }
-  for (const file of files) {
-    if (file !== "package.json" || !fs_.has(file)) continue;
-    const body = fs_.read(file);
-    if (/"react-router-dom"\s*:\s*"[^"]*\b5\./.test(body)) {
-      out.push(
-        `${file}: FACT - react-router-dom is v5.x; preserve BrowserRouter/Switch/Route patterns and do not propose React Router v6 Routes migration unless dependencies change.`,
-      );
-    }
-    const build = body.match(/"build"\s*:\s*"([^"]+)"/)?.[1];
-    const test = body.match(/"test"\s*:\s*"([^"]+)"/)?.[1];
-    if (build) out.push(`${file}: script build = ${build}`);
-    if (test) out.push(`${file}: script test = ${test}`);
-  }
-  for (const file of files) {
-    if (!/src\/App\.[jt]sx?$/i.test(file) || !fs_.has(file)) continue;
-    const body = fs_.read(file);
-    if (/ThemeProvider/.test(body) && /createGlobalStyle/.test(body)) {
-      out.push(`${file}: FACT - theme styling is currently owned by ThemeProvider and DarkTheme/createGlobalStyle; preserve visible behavior while cleaning this structure.`);
-    }
-    if (/<Nav\b/.test(body) && /themeSetter=/.test(body) && /theme=\{theme\}/.test(body)) {
-      out.push(`${file}: FACT - Nav already receives themeSetter and theme props from App; update src/Components/Nav.js if the refactor changes that boundary, do not claim Nav consumes a custom ThemeProvider context.`);
-    }
-  }
   const patterns = [
-    /showDropOverlay/,
-    /drop-overlay/,
-    /onDragDropEvent/,
-    /unsupported/,
+    /import\s/,
+    /export\s/,
+    /\b(?:class|function|const|let|var)\s+[A-Za-z_$][\w$]*/,
     /describe\s*\(/,
     /\bit\s*\(/,
-    /test:run/,
-    /ThemeProvider/,
-    /createGlobalStyle/,
-    /DarkTheme/,
-    /Switch/,
-    /Route/,
-    /BrowserRouter/,
-    /react-router-dom/,
-    /local-storage-fallback/,
-    /storage\.(?:getItem|setItem)/,
-    /historyTheme/,
-    /react-scripts/,
-    /"build":/,
-    /"test":/,
-    /<Nav\b/,
-    /themeSetter/,
-    /theme=\{theme\}/,
+    /\btest\s*\(/,
+    /\b(?:state|props|handler|render|template|style|className|config|schema|command|route|register|registry)\b/i,
   ];
   for (const file of files) {
     if (!fs_.has(file)) continue;
     const lines = fs_.read(file).split(/\r?\n/);
     lines.forEach((line, idx) => {
       if (out.length >= maxLines) return;
-      if (patterns.some((pattern) => pattern.test(line))) {
+      const lower = line.toLowerCase();
+      const compact = lower.replace(/[^a-z0-9]+/g, "");
+      const termHit = terms.some((term) => {
+        const needle = String(term).toLowerCase();
+        const compactNeedle = needle.replace(/[^a-z0-9]+/g, "");
+        return needle && (lower.includes(needle) || (compactNeedle.length >= 5 && compact.includes(compactNeedle)));
+      });
+      if (termHit || patterns.some((pattern) => pattern.test(line))) {
         out.push(`${file}:${idx + 1}: ${line.trim()}`);
       }
     });
@@ -2172,6 +2969,15 @@ function orderContextFilesForPlan(files, activeFile, prompt = "") {
   return mergeUnique(files).sort((a, b) => {
     const ra = planContextRank(a, activeFile, prompt);
     const rb = planContextRank(b, activeFile, prompt);
+    return ra - rb || a.localeCompare(b);
+  });
+}
+
+function orderPlanContextFiles(files, activeFile, prompt, fs_) {
+  const terms = researchTerms(prompt);
+  return mergeUnique(files).sort((a, b) => {
+    const ra = planAttachmentRank(a, activeFile, prompt, fs_, terms);
+    const rb = planAttachmentRank(b, activeFile, prompt, fs_, terms);
     return ra - rb || a.localeCompare(b);
   });
 }
@@ -2195,21 +3001,40 @@ function orderContextFilesForAsk(files, prompt, activeFile, fs_) {
   });
 }
 
+function planAttachmentRank(filePath, activeFile, prompt, fs_, terms) {
+  const p = normalizePath(filePath).toLowerCase();
+  const body = fs_?.has(filePath) ? fs_.read(filePath) : "";
+  const relevance = body ? researchFileScore(filePath, body, terms, activeFile) : 0;
+  if (p === normalizePath(activeFile ?? "").toLowerCase()) return 0;
+  if (manifestFilesFor([filePath]).length) return 1 + pathDepth(filePath) * 0.02;
+  if (isAggregatorContextFile(filePath, body)) return 2 - Math.min(relevance, 12) / 100;
+  if (isEntryContextFile(filePath, body)) return 2.5 - Math.min(relevance, 12) / 100;
+  if (/(?:^|\/)__tests__\/|\.test\.|\.spec\./.test(p)) return 4 - Math.min(relevance, 10) / 10;
+  if (/\.(css|scss|sass|less)$/.test(p)) return 6 - Math.min(relevance, 10) / 10;
+  if (/\.(vue|tsx|jsx|ts|js|mjs|cjs|svelte|rs|py|go|java|kt|cs|rb|php)$/.test(p)) {
+    return 5 - Math.min(relevance, 18) / 10;
+  }
+  return 8 - Math.min(relevance, 10) / 10;
+}
+
+function isAggregatorContextFile(filePath, body) {
+  const imports = extractRelativeImports(body);
+  if (imports.length < 3) return false;
+  const p = normalizePath(filePath).toLowerCase();
+  if (/(?:^|\/)(?:index|registry|routes|manifest|collection|entries)\.[^.]+$/.test(p)) return true;
+  return /\bexport\s+(?:default|const|let|var|function|class)\b/.test(body) && /\[[\s\S]*\]|\{[\s\S]*\}/.test(body);
+}
+
+function isEntryContextFile(filePath, body) {
+  const p = normalizePath(filePath).toLowerCase();
+  if (/(?:^|\/)(?:main|app|application|client|server|index)\.[^.]+$/.test(p) && extractRelativeImports(body).length) return true;
+  return /\b(?:create|mount|render|bootstrap|start|init)\b/i.test(body) && extractRelativeImports(body).length >= 2;
+}
+
 function relatedContextRank(filePath, prompt, activeFile, fs_, terms) {
   const p = normalizePath(filePath).toLowerCase();
-  const q = String(prompt ?? "").toLowerCase();
   if (p === normalizePath(activeFile ?? "").toLowerCase()) return 0;
-  if (/query parser/.test(q)) {
-    if (p === "lib/utils.js") return 1;
-    if (p === "lib/request.js") return 2;
-    if (p === "test/req.query.js") return 3;
-  }
-  if (/drag|drop|overlay|unsupported/.test(q)) {
-    if (/src\/composables\/usedragdrop\.js$/.test(p)) return 1;
-    if (/src\/composables\/__tests__\/usedragdrop\.test\.js$/.test(p)) return 2;
-  }
-  if (/theme|routing|route|router/.test(q) && /src\/components\/nav\.js$/.test(p)) return 1;
-  const researchScore = isResearchPrompt(prompt) && fs_?.has(filePath)
+  const researchScore = fs_?.has(filePath)
     ? researchFileScore(filePath, fs_.read(filePath), terms, activeFile)
     : 0;
   if (/\.(vue|tsx|jsx|ts|js|rs|py|go)$/.test(p) && !/(?:^|\/)__tests__\/|\.test\.|\.spec\./.test(p)) {
@@ -2223,16 +3048,16 @@ function relatedContextRank(filePath, prompt, activeFile, fs_, terms) {
 function askContextRank(filePath, prompt, activeFile, fs_, research, terms) {
   const p = normalizePath(filePath).toLowerCase();
   if (p === normalizePath(activeFile ?? "").toLowerCase()) return 0;
-  const lowerPrompt = String(prompt ?? "").toLowerCase();
-  if (lowerPrompt.includes("query parser")) {
-    if (p === "lib/utils.js") return 1;
-    if (p === "lib/request.js") return 2;
-    if (p === "test/req.query.js") return 3;
-    if (p === "package.json") return 4;
-    if (p === "lib/response.js" || p === "lib/express.js") return 60;
-    if (/(?:^|\/)__tests__\/|\.test\.|\.spec\.|^test\//.test(p)) return 65;
+  if (activeFile && fs_?.has(activeFile)) {
+    const activeImports = extractRelativeImports(fs_.read(activeFile))
+      .map((spec) => resolveRelativeImport(activeFile, spec, [...fs_.files.keys()]))
+      .filter(Boolean)
+      .map((item) => normalizePath(item).toLowerCase());
+    if (activeImports.includes(p)) {
+      return /\.(css|scss|sass|less|pcss|postcss)$/.test(p) ? 4 : 2;
+    }
   }
-  const score = research && fs_?.has(filePath)
+  const score = fs_?.has(filePath)
     ? researchFileScore(filePath, fs_.read(filePath), terms, activeFile)
     : 0;
   const researchRank = research ? Math.max(0, 20 - score) : 20;
@@ -2240,22 +3065,18 @@ function askContextRank(filePath, prompt, activeFile, fs_, research, terms) {
   if (/^examples\//i.test(filePath)) return 75 - score;
   if (/(?:^|\/)__tests__\/|\.test\.|\.spec\./.test(p)) return 25 - score;
   if (p.endsWith("package.json") || p.endsWith("cargo.toml") || p.endsWith("pyproject.toml")) return 35 - score;
+  if (isAggregatorContextFile(filePath, fs_?.has(filePath) ? fs_.read(filePath) : "")) return 18 - score;
   if (/\.(js|jsx|ts|tsx|vue|rs|py|go)$/.test(p)) return researchRank;
   return 50 - score;
 }
 
 function planContextRank(filePath, activeFile, prompt = "") {
   const p = normalizePath(filePath).toLowerCase();
-  const q = String(prompt ?? "").toLowerCase();
   if (p === normalizePath(activeFile ?? "").toLowerCase()) return 0;
-  if (/drag|drop|overlay|unsupported/.test(q) && /src\/composables\/usedragdrop\.js$/.test(p)) return 1;
-  if (/theme|routing|route|router/.test(q) && /src\/components\/nav\.js$/.test(p)) return 1;
-  if (/subdomain/.test(q) && /test\/req\.subdomains\.js$/.test(p)) return 1.5;
   if (/(?:^|\/)__tests__\/|\.test\.|\.spec\./.test(p)) {
-    if (/drag|drop|overlay|unsupported/.test(q) && /usedragdrop\.test\.js$/.test(p)) return 1.5;
     return 4;
   }
-  if (p.endsWith("package.json") || p.endsWith("cargo.toml") || p.endsWith("pyproject.toml")) return 2;
+  if (manifestFilesFor([filePath]).length) return 2 + pathDepth(filePath) * 0.05;
   if (/\.(vue|tsx|jsx|ts|js|rs|py|go)$/.test(p)) return 3;
   if (/\.(css|scss|sass|less)$/.test(p)) return 5;
   return 6;
@@ -2268,13 +3089,16 @@ function basenameNoExt(filePath) {
 
 function guessActiveFile(files) {
   const keys = Object.keys(files);
-  return (
-    keys.find((p) => /^src\/App\.(tsx|jsx|vue|svelte)$/.test(p)) ||
-    keys.find((p) => /^src\/main\.(ts|tsx|js|jsx|vue)$/.test(p)) ||
-    keys.find((p) => /^package\.json$/.test(p)) ||
-    keys[0] ||
-    null
-  );
+  const visible = keys.filter((p) => !normalizePath(p).split("/").some((part) => part.startsWith(".")));
+  const manifests = manifestFilesFor(visible);
+  const entryLike = visible
+    .filter((p) => /\.(js|jsx|ts|tsx|vue|svelte|rs|py|go|java|kt|cs|rb|php|html|css)$/i.test(p))
+    .filter((p) => /(?:^|\/)(?:index|main|app|application|client|server|lib|mod)\.[^.]+$/i.test(p))
+    .sort((a, b) => pathDepth(a) - pathDepth(b) || a.localeCompare(b));
+  const sourceLike = visible
+    .filter((p) => /\.(js|jsx|ts|tsx|vue|svelte|rs|py|go|java|kt|cs|rb|php)$/i.test(p))
+    .sort((a, b) => pathDepth(a) - pathDepth(b) || a.localeCompare(b));
+  return manifests[0] || entryLike[0] || sourceLike[0] || visible[0] || keys[0] || null;
 }
 
 function extractFileMentions(text) {
@@ -2365,8 +3189,7 @@ function summarizeManifest(p, text) {
 }
 
 function manifestFilesFor(files) {
-  const names = new Set(files);
-  return [
+  const manifestNames = new Set([
     "package.json",
     "Cargo.toml",
     "pyproject.toml",
@@ -2377,7 +3200,10 @@ function manifestFilesFor(files) {
     "Gemfile",
     "composer.json",
     "mix.exs",
-  ].filter((p) => names.has(p));
+  ]);
+  return files
+    .filter((p) => manifestNames.has(path.posix.basename(normalizePath(p))))
+    .sort((a, b) => pathDepth(a) - pathDepth(b) || a.localeCompare(b));
 }
 
 function extractLatestBlock(trace, tag) {
@@ -2881,8 +3707,8 @@ function collectInputPathRefs(input, workspace) {
     if (typeof v === "string" && looksPathLike(v)) out.push(normalizePath(v));
   }
   const command = typeof input.command === "string" ? input.command : "";
-  if (command && /\/Users\/sameer\/(?:pointer|express|tauri-markdown|Blog-and-Portfolio)\b/.test(command)) {
-    for (const match of command.matchAll(/\/Users\/sameer\/[^\s"'`|;&)]+/g)) {
+  if (command && /(?:^|\s)\/[^\s"'`|;&)]+/.test(command)) {
+    for (const match of command.matchAll(/\/[^\s"'`|;&)]+/g)) {
       out.push(normalizePath(match[0]));
     }
   }
@@ -3345,6 +4171,57 @@ async function runSelfTest() {
     /Context|Files retained|src\/Deck\.jsx/.test(context.memoryDigest ?? "");
   console.log(`${emoji(brainOk)} context brain import frontier`);
   if (!brainOk) throw new Error(`context brain self-test failed: ${context.files.join(", ")}`);
+
+  const integrationRoot = fs.mkdtempSync(path.join(os.tmpdir(), "pointer-structural-selftest-"));
+  try {
+    fs.mkdirSync(path.join(integrationRoot, "src"), { recursive: true });
+    fs.writeFileSync(
+      path.join(integrationRoot, "src/index.js"),
+      [
+        "import OldWidget from './OldWidget';",
+        "",
+        "const widgets = [",
+        "  { Component: OldWidget, title: OldWidget.title },",
+        "].map((item) => item);",
+        "",
+        "export default widgets;",
+        "",
+      ].join("\n"),
+    );
+    fs.writeFileSync(
+      path.join(integrationRoot, "src/OldWidget.jsx"),
+      "const OldWidget = () => null;\nOldWidget.title = 'Old';\nexport default OldWidget;\n",
+    );
+    const structural = new PointerTerminal({ repo: null, verbose: false });
+    structural.root = integrationRoot;
+    structural.fs_ = new VirtualFs(loadRepoSnapshot(integrationRoot, {
+      maxFiles: 100,
+      maxBytes: 512_000,
+      maxFileBytes: 64_000,
+    }).files);
+    structural.baseline = structural.fs_.snapshot();
+    fs.writeFileSync(
+      path.join(integrationRoot, "src/CreditsWidget.jsx"),
+      "const CreditsWidget = () => null;\nexport default CreditsWidget;\n",
+    );
+    structural.syncFromDisk();
+    const integration = runDeterministicStructuralIntegration({
+      terminal: structural,
+      prompt: "Add a new widget called Credits",
+      contextFiles: ["src/index.js"],
+    });
+    const index = fs.readFileSync(path.join(integrationRoot, "src/index.js"), "utf8");
+    const created = fs.readFileSync(path.join(integrationRoot, "src/CreditsWidget.jsx"), "utf8");
+    const structuralOk =
+      integration.applied.includes("src/index.js") &&
+      index.includes("import CreditsWidget from './CreditsWidget';") &&
+      index.includes("{ Component: CreditsWidget, title: CreditsWidget.title },") &&
+      created.includes('CreditsWidget.title = "Credits";');
+    console.log(`${emoji(structuralOk)} structural integration fallback`);
+    if (!structuralOk) throw new Error(`structural integration self-test failed: ${JSON.stringify(integration)}`);
+  } finally {
+    fs.rmSync(integrationRoot, { recursive: true, force: true });
+  }
 }
 
 async function runInteractive(repo) {
@@ -3456,6 +4333,10 @@ function normalizePath(p) {
   return String(p).replace(/\\/g, "/").replace(/\/+/g, "/");
 }
 
+function pathDepth(p) {
+  return normalizePath(p).split("/").filter(Boolean).length;
+}
+
 function mergeUnique(items) {
   const out = [];
   const seen = new Set();
@@ -3544,5 +4425,6 @@ export {
   evaluatePlan,
   inferImplicitFileReferences,
   loadRepoSnapshot,
+  runDeterministicStructuralIntegration,
   runScenarioSuite,
 };

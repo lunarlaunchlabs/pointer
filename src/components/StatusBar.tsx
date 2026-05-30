@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useState } from "@/lib/preactSignalCompat";
 import {
   Activity,
   AlertCircle,
@@ -12,12 +12,13 @@ import {
   Paperclip,
   Server,
   Sparkles,
-} from "lucide-react";
+} from "@/lib/lucide";
 import { useEditorStore } from "@/store/editor";
 import {
   useSettings,
   isFeatureUsable,
   effectiveAssignedModel,
+  isModelInInstalledList,
 } from "@/store/settings";
 import { useSession } from "@/store/session";
 import { usePulls } from "@/store/pulls";
@@ -28,7 +29,7 @@ import {
   ipc,
   listenEvent,
   type LanguageServerStatus,
-  type SystemSnapshot,
+  type SystemLoadSnapshot,
 } from "@/lib/ipc";
 import { dispatchAction } from "@/lib/actions";
 import { subscribeHistory, type ToastHistoryEntry } from "@/components/Toast";
@@ -62,6 +63,7 @@ export function StatusBar({ onOpenMonitor }: { onOpenMonitor?: () => void } = {}
   const rawFim = useSettings((s) => s.fimModel);
   const installedModels = useSettings((s) => s.installedModels);
   const fimEnabled = useSettings((s) => s.fimEnabled);
+  const fimTriggerMode = useSettings((s) => s.fimTriggerMode);
   // The status-bar pill tracks the *effective* state — "Tab on" only when
   // FIM can actually fire (toggle on + model picked + installed + runtime
   // up). The underlying `fimEnabled` boolean is what the click toggles.
@@ -117,7 +119,7 @@ export function StatusBar({ onOpenMonitor }: { onOpenMonitor?: () => void } = {}
     let alive = true;
     const tick = async () => {
       try {
-        const s: SystemSnapshot = await ipc.systemSnapshot();
+        const s: SystemLoadSnapshot = await ipc.systemLoadSnapshot();
         if (!alive) return;
         setLoad({
           cpu: s.pointer_cpu_percent,
@@ -129,7 +131,7 @@ export function StatusBar({ onOpenMonitor }: { onOpenMonitor?: () => void } = {}
       }
     };
     tick();
-    const id = setInterval(tick, 4000);
+    const id = setInterval(tick, 10_000);
     return () => {
       alive = false;
       clearInterval(id);
@@ -149,7 +151,7 @@ export function StatusBar({ onOpenMonitor }: { onOpenMonitor?: () => void } = {}
         });
     };
     refresh();
-    const id = window.setInterval(refresh, 5000);
+    const id = window.setInterval(refresh, 30_000);
     return () => {
       alive = false;
       window.clearInterval(id);
@@ -185,7 +187,9 @@ export function StatusBar({ onOpenMonitor }: { onOpenMonitor?: () => void } = {}
   const slotLabel = (raw: string) =>
     !raw
       ? "— not set —"
-      : ollamaReady && installedModels.length > 0 && !installedModels.includes(raw)
+      : ollamaReady &&
+        installedModels.length > 0 &&
+        !isModelInInstalledList(raw, installedModels)
       ? `${raw} (not installed)`
       : raw;
   const modelTooltip = [
@@ -208,7 +212,7 @@ export function StatusBar({ onOpenMonitor }: { onOpenMonitor?: () => void } = {}
   //   • The whole bar stays 24px tall regardless of content.
   return (
     <div
-      className="h-6 px-3 flex items-center justify-between gap-3 bg-noir-chrome/92 border-t border-noir-line/80 text-[10px] font-sans text-noir-subtext select-none"
+      className="pn-statusbar relative z-pn-editor-overlay h-6 shrink-0 px-3 flex items-center justify-between gap-3 border-t border-noir-line/80 text-[10px] font-sans text-noir-subtext select-none"
       role="contentinfo"
       aria-label="Status bar"
     >
@@ -252,14 +256,18 @@ export function StatusBar({ onOpenMonitor }: { onOpenMonitor?: () => void } = {}
           aria-pressed={fimUsable}
           title={
             fimUsable
-              ? "Tab completion is on — click to disable."
+              ? fimTriggerMode === "manual"
+                ? "Manual tab completion is on. Press ⌘⇧Space to request — click to disable."
+                : "Automatic tab completion is on — click to disable."
               : !fimEnabled
               ? "Tab completion is off — click to enable."
               : "Tab completion is off (no FIM model configured)."
           }
         >
           <Sparkles size={10} aria-hidden="true" />
-          <span>Tab {fimUsable ? "on" : "off"}</span>
+          <span>
+            Tab {fimUsable ? (fimTriggerMode === "manual" ? "manual" : "auto") : "off"}
+          </span>
         </button>
         {indexProgress && (
           <div
@@ -498,7 +506,9 @@ function normaliseStatusLanguage(language: string): string {
 }
 
 function shortLspLabel(status: LanguageServerStatus): string {
-  if (status.status === "monaco") return "Monaco";
+  if (status.status === "monaco") {
+    return status.label === "TypeScript service" ? "TS service" : "Monaco";
+  }
   if (status.status === "syntax") return "Syntax";
   if (status.status === "missing") return "No LSP";
   return status.label

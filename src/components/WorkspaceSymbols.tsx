@@ -1,6 +1,6 @@
 import { Command } from "cmdk";
-import { useEffect, useMemo, useState } from "react";
-import { Hash, Loader2 } from "lucide-react";
+import { useEffect, useMemo, useState } from "@/lib/preactSignalCompat";
+import { Hash, Loader2 } from "@/lib/lucide";
 import { ipc, type TextHit } from "@/lib/ipc";
 import { useEditorStore } from "@/store/editor";
 import { useWorkspace } from "@/store/workspace";

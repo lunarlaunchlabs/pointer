@@ -1,7 +1,7 @@
-import { useEffect, useState } from "react";
+import { useEffect, useState } from "@/lib/preactSignalCompat";
 import { Command } from "cmdk";
-import { createPortal } from "react-dom";
-import { Bookmark as BookmarkIcon, Trash2 } from "lucide-react";
+import { createPortal } from "@/lib/preactSignalDomCompat";
+import { Bookmark as BookmarkIcon, Trash2 } from "@/lib/lucide";
 import { useBookmarks } from "@/store/bookmarks";
 import { useEditorStore } from "@/store/editor";
 import { useWorkspace } from "@/store/workspace";

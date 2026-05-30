@@ -6,7 +6,65 @@ import { createServer } from "vite";
 
 const execFileAsync = promisify(execFile);
 
+const GENERIC_PATH_FRAGMENT_WORDS = new Set([
+  "app",
+  "apps",
+  "asset",
+  "assets",
+  "bin",
+  "build",
+  "bundle",
+  "cache",
+  "component",
+  "components",
+  "config",
+  "dist",
+  "doc",
+  "docs",
+  "file",
+  "files",
+  "fixture",
+  "fixtures",
+  "helper",
+  "helpers",
+  "icon",
+  "icons",
+  "image",
+  "images",
+  "index",
+  "lib",
+  "main",
+  "mod",
+  "module",
+  "modules",
+  "page",
+  "pages",
+  "public",
+  "route",
+  "routes",
+  "script",
+  "scripts",
+  "source",
+  "src",
+  "static",
+  "store",
+  "stores",
+  "style",
+  "styles",
+  "test",
+  "tests",
+  "type",
+  "types",
+  "util",
+  "utils",
+  "view",
+  "views",
+  "workspace",
+  "workspaces",
+]);
+
 const args = parseArgs(process.argv.slice(2));
+const appRoot = path.resolve(args.app ?? args.appRoot ?? process.cwd());
 const cwd = path.resolve(args.cwd ?? process.cwd());
 const mock = args.mock === true;
 const json = args.json === true;
@@ -14,8 +72,9 @@ const staged = args.unstaged !== true;
 const ollamaBaseUrl = args.ollamaUrl ?? process.env.OLLAMA_HOST ?? "http://127.0.0.1:11434";
 
 const server = await createServer({
+  root: appRoot,
   appType: "custom",
-  configFile: path.join(cwd, "vite.config.ts"),
+  configFile: path.join(appRoot, "vite.config.ts"),
   logLevel: "silent",
   server: { middlewareMode: true },
 });
@@ -131,17 +190,11 @@ try {
         model,
         prompt: workflow.buildDiffChunkSummaryPrompt(chunk),
         title: `chunk ${file.path} ${chunk.index}/${chunk.total}`,
-        numPredict: 72,
-      });
-      const compactChunk = await maybeRetryShortSummary({
-        raw: rawChunk,
-        title: `compress ${file.path} ${chunk.index}/${chunk.total}`,
-        maxWords: 24,
-        maxSentences: 1,
-        model,
+        numPredict: 56,
+        stop: ["\n"],
       });
       const summary = workflow.normalizeChunkSummary(
-        compactChunk,
+        rawChunk,
         file.path,
         file.status,
         chunkFallback,
@@ -182,17 +235,11 @@ try {
             model,
             prompt: workflow.buildFileConsolidationPrompt(file.path, chunkSummaries),
             title: `file ${file.path}`,
-            numPredict: 96,
+            numPredict: 80,
+            stop: ["\n"],
           });
-    const compactFile = await maybeRetryShortSummary({
-      raw: rawFileSummary,
-      title: `shorten ${file.path}`,
-      maxWords: 35,
-      maxSentences: 2,
-      model,
-    });
     const fileSummary = workflow.normalizeFileSummary(
-      compactFile,
+      rawFileSummary,
       file.path,
       file.status,
       fallback,
@@ -226,20 +273,8 @@ try {
     fallback,
   }));
 
-  const rawConsolidated = await generate({
-    model,
-    prompt: workflow.buildChangeConsolidationPrompt(summaries),
-    title: "consolidated summary",
-    numPredict: 180,
-  });
-  const compactConsolidated = await maybeRetryShortSummary({
-    raw: rawConsolidated,
-    title: "shorten consolidated summary",
-    maxWords: 65,
-    maxSentences: 3,
-    model,
-  });
-  const consolidatedSummary = workflow.normalizeChangeSummary(compactConsolidated, summaries);
+  const rawConsolidated = "";
+  const consolidatedSummary = workflow.normalizeChangeSummary("", summaries);
   const fileSummaryMemoryIds = harness.memory
     .byKind("file_summary", { approvedOnly: true })
     .map((memory) => memory.id);
@@ -261,7 +296,7 @@ try {
     model,
     prompt: workflow.buildCommitMessagePrompt(summaries, consolidatedSummary),
     title: "commit message",
-    numPredict: 180,
+    numPredict: 160,
   });
   const rawDraft = harness.rememberDraft(
     "message_drafter",
@@ -377,6 +412,7 @@ function parseArgs(argv) {
     else if (arg === "--fail-on-warnings") out.failOnWarnings = true;
     else if (arg === "--judge") out.judge = true;
     else if (arg === "--trace-harness") out.traceHarness = true;
+    else if (arg === "--app" || arg === "--app-root") out.app = argv[++i];
     else if (arg === "--cwd") out.cwd = argv[++i];
     else if (arg === "--model") out.model = argv[++i];
     else if (arg === "--ollama-url") out.ollamaUrl = argv[++i];
@@ -434,25 +470,7 @@ async function detectOllamaModel() {
   }
 }
 
-async function maybeRetryShortSummary({ raw, title, maxWords, maxSentences, model }) {
-  if (sentenceCount(raw) <= maxSentences && wordCount(raw) <= maxWords + 6) {
-    return raw;
-  }
-  return generate({
-    model,
-    title,
-    numPredict: Math.max(48, Math.min(120, maxWords * 3)),
-    prompt: [
-      "Compress this summary. Return only the compressed summary.",
-      `Use at most ${maxSentences} sentence${maxSentences === 1 ? "" : "s"} and ${maxWords} words.`,
-      "Do not add new facts, file paths, filenames, or changed symbols.",
-      "",
-      raw.trim(),
-    ].join("\n"),
-  });
-}
-
-async function generate({ model, prompt, title, numPredict }) {
+async function generate({ model, prompt, title, numPredict, stop }) {
   if (mock) return mockGenerate(prompt, title);
   const response = await fetch(`${ollamaBaseUrl.replace(/\/$/, "")}/api/generate`, {
     method: "POST",
@@ -460,10 +478,12 @@ async function generate({ model, prompt, title, numPredict }) {
     body: JSON.stringify({
       model,
       prompt,
+      think: false,
       stream: false,
       options: {
         temperature: 0.1,
         num_predict: numPredict,
+        ...(stop ? { stop } : {}),
       },
       system:
         "You are Pointer's git assistant. Be concise, specific, and accurate. Never invent changes not shown in the diff.",
@@ -603,13 +623,6 @@ function analyzeHarnessTrace(transcript) {
       recommendation: "Supersede or reject unused proposed memories after normalization.",
     });
   }
-  if (!/\b(harness|memory|commit|judge|draft|summary)\b/i.test(transcript.commit?.normalized ?? "")) {
-    transcript.polish.push({
-      stage: "message_drafter",
-      issue: "Final message does not name the core commit-generation capability.",
-      recommendation: "Repeat scout evaluation before drafting when subject lacks approved primary-memory terms.",
-    });
-  }
 }
 
 function printTranscript(transcript) {
@@ -683,15 +696,16 @@ function pathFragments(filePath) {
     normalized.replace(/\.[^.]+$/, ""),
     file,
     file.replace(/\.[^.]+$/, ""),
-  ])].filter((item) => item.length >= 4);
+  ])].filter(isDistinctPathFragment);
 }
 
-function sentenceCount(text) {
-  return text.replace(/\s+/g, " ").trim().match(/[^.!?]+[.!?]+|[^.!?]+$/g)?.length ?? 0;
-}
-
-function wordCount(text) {
-  return text.split(/\s+/).filter(Boolean).length;
+function isDistinctPathFragment(fragment) {
+  if (fragment.length < 4) return false;
+  if (GENERIC_PATH_FRAGMENT_WORDS.has(fragment)) return false;
+  if (fragment.includes("/")) return fragment.length >= 8;
+  if (fragment.includes(".")) return fragment.length >= 6;
+  if (/^[a-z]+$/.test(fragment) && fragment.length < 8) return false;
+  return true;
 }
 
 function singleLine(value) {

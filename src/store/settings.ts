@@ -1,6 +1,11 @@
-import { create } from "zustand";
+import { create } from "@/lib/signalStore";
 import { ipc } from "@/lib/ipc";
 import { getItem, persistAsync } from "@/lib/persist";
+import {
+  DEFAULT_APP_THEME_ID,
+  normalizeAppThemeId,
+  type AppThemeId,
+} from "@/theme/themes";
 
 const SETTINGS_KEY = "settings.v1";
 const ONBOARDED_KEY = "onboarded";
@@ -48,6 +53,7 @@ type PersistedSettings = {
 
   // Inline-completion sensitivity.
   fimDebounceMs?: number;
+  fimTriggerMode?: "automatic" | "manual";
 
   // Editor preferences. Live-applied to the Monaco instance.
   editorFontSize?: number;
@@ -76,13 +82,17 @@ type PersistedSettings = {
   editorInsertFinalNewline?: boolean;
   /** Respect prefers-reduced-motion for editor + UI animations. */
   reduceMotion?: boolean;
-  /** Active app theme. Today: "noir" (default) or "light". */
-  appTheme?: "noir" | "light";
+  /** Active app theme. Legacy "noir" / "light" values are migrated at load. */
+  appTheme?: AppThemeId | "noir" | "light";
   /** File-tree sort mode. */
   treeSort?: "type" | "name";
   /** Show git blame for the current cursor line inline at the end
    *  of the line (GitLens-style). Defaults to on. */
   gitInlineBlame?: boolean;
+  /** Stop unused external language-server processes after an idle window. */
+  lspAutoStopEnabled?: boolean;
+  /** Idle window in milliseconds before eligible language servers stop. */
+  lspAutoStopIdleMs?: number;
 };
 
 /**
@@ -147,6 +157,7 @@ type Settings = {
   ollamaAutostart: boolean;
 
   fimDebounceMs: number;
+  fimTriggerMode: "automatic" | "manual";
 
   editorFontSize: number;
   editorTabSize: number;
@@ -163,9 +174,11 @@ type Settings = {
   editorTrimTrailingWhitespace: boolean;
   editorInsertFinalNewline: boolean;
   reduceMotion: boolean;
-  appTheme: "noir" | "light";
+  appTheme: AppThemeId;
   treeSort: "type" | "name";
   gitInlineBlame: boolean;
+  lspAutoStopEnabled: boolean;
+  lspAutoStopIdleMs: number;
 
   init: () => Promise<void>;
   markOnboarded: () => void;
@@ -187,6 +200,7 @@ type Settings = {
   setOllamaAutostart: (b: boolean) => void;
 
   setFimDebounceMs: (ms: number) => void;
+  setFimTriggerMode: (mode: "automatic" | "manual") => void;
   setEditorFontSize: (n: number) => void;
   setEditorTabSize: (n: number) => void;
   setEditorInsertSpaces: (b: boolean) => void;
@@ -202,9 +216,11 @@ type Settings = {
   setEditorTrimTrailingWhitespace: (b: boolean) => void;
   setEditorInsertFinalNewline: (b: boolean) => void;
   setReduceMotion: (b: boolean) => void;
-  setAppTheme: (t: "noir" | "light") => void;
+  setAppTheme: (t: AppThemeId) => void;
   setTreeSort: (m: "type" | "name") => void;
   setGitInlineBlame: (b: boolean) => void;
+  setLspAutoStopEnabled: (b: boolean) => void;
+  setLspAutoStopIdleMs: (ms: number) => void;
 
   setOllamaReady: (b: boolean) => void;
 
@@ -236,6 +252,7 @@ const DEFAULTS = {
   ollamaAutostart: true,
 
   fimDebounceMs: 120,
+  fimTriggerMode: "automatic" as "automatic" | "manual",
 
   editorFontSize: 14,
   editorTabSize: 2,
@@ -248,14 +265,28 @@ const DEFAULTS = {
   editorStickyScroll: false,
   editorBreadcrumbs: true,
   editorHotExit: true,
-  editorMinimap: true,
+  editorMinimap: false,
   editorTrimTrailingWhitespace: false,
   editorInsertFinalNewline: false,
   reduceMotion: false,
-  appTheme: "noir" as "noir" | "light",
+  appTheme: DEFAULT_APP_THEME_ID,
   treeSort: "type" as "type" | "name",
   gitInlineBlame: true,
+  lspAutoStopEnabled: true,
+  lspAutoStopIdleMs: 5 * 60 * 1000,
 };
+
+export const LSP_AUTO_STOP_PRESETS_MS = [
+  60 * 1000,
+  5 * 60 * 1000,
+  15 * 60 * 1000,
+  30 * 60 * 1000,
+] as const;
+
+export function clampLspAutoStopIdleMs(ms: number): number {
+  if (!Number.isFinite(ms)) return DEFAULTS.lspAutoStopIdleMs;
+  return Math.max(30 * 1000, Math.min(2 * 60 * 60 * 1000, Math.round(ms)));
+}
 
 export const useSettings = create<Settings>((set, get) => ({
   ollamaReady: false,
@@ -277,6 +308,10 @@ export const useSettings = create<Settings>((set, get) => ({
     set({
       ...DEFAULTS,
       ...merged,
+      appTheme: normalizeAppThemeId(merged.appTheme),
+      lspAutoStopIdleMs: clampLspAutoStopIdleMs(
+        merged.lspAutoStopIdleMs ?? DEFAULTS.lspAutoStopIdleMs,
+      ),
       hydrated: true,
       onboarded: !!onboarded,
       ollamaReady: !!status?.running,
@@ -313,6 +348,7 @@ export const useSettings = create<Settings>((set, get) => ({
   setOllamaAutostart: (b) => persist(set, get, { ollamaAutostart: b }),
 
   setFimDebounceMs: (ms) => persist(set, get, { fimDebounceMs: ms }),
+  setFimTriggerMode: (mode) => persist(set, get, { fimTriggerMode: mode }),
   setEditorFontSize: (n) => persist(set, get, { editorFontSize: n }),
   setEditorTabSize: (n) => persist(set, get, { editorTabSize: n }),
   setEditorInsertSpaces: (b) => persist(set, get, { editorInsertSpaces: b }),
@@ -335,6 +371,9 @@ export const useSettings = create<Settings>((set, get) => ({
   setAppTheme: (t) => persist(set, get, { appTheme: t }),
   setTreeSort: (m) => persist(set, get, { treeSort: m }),
   setGitInlineBlame: (b) => persist(set, get, { gitInlineBlame: b }),
+  setLspAutoStopEnabled: (b) => persist(set, get, { lspAutoStopEnabled: b }),
+  setLspAutoStopIdleMs: (ms) =>
+    persist(set, get, { lspAutoStopIdleMs: clampLspAutoStopIdleMs(ms) }),
 
   setOllamaReady: (b) => set({ ollamaReady: b }),
 
@@ -343,7 +382,7 @@ export const useSettings = create<Settings>((set, get) => ({
     const s = get();
     const patch: Partial<Settings> = {};
     const check = (label: string, key: keyof Settings, value: string) => {
-      if (value && !installed.includes(value)) {
+      if (value && !isModelInInstalledList(value, installed)) {
         cleared.push(`${label} (${value})`);
         (patch as Record<string, unknown>)[key] = "";
       }
@@ -440,7 +479,7 @@ export function featureCapability(
   if (s.installedModels.length === 0) return "no_models";
   const model = s[featureModelKey(feature)];
   if (!model) return "needs_model";
-  if (!s.installedModels.includes(model)) return "model_missing";
+  if (!isModelInInstalledList(model, s.installedModels)) return "model_missing";
   return "on";
 }
 
@@ -472,7 +511,57 @@ export function isModelInstalled(
 ): boolean {
   if (!model) return false;
   if (!s.ollamaReady) return false;
-  return s.installedModels.includes(model);
+  return isModelInInstalledList(model, s.installedModels);
+}
+
+/**
+ * Return the exact installed Ollama model name that satisfies a configured
+ * assignment. Ollama accepts bare names such as `nomic-embed-text`, while the
+ * runtime list often reports `nomic-embed-text:latest`; treating those as the
+ * same model keeps settings resilient when users pull, remove, or retag local
+ * models outside Pointer.
+ */
+export function resolveInstalledModelName(
+  model: string | undefined | null,
+  installedModels: string[],
+): string {
+  const configured = (model ?? "").trim();
+  if (!configured) return "";
+  const exact = installedModels.find((installed) => installed === configured);
+  if (exact) return exact;
+
+  const configuredParts = splitOllamaModelName(configured);
+  return (
+    installedModels.find((installed) => {
+      const parts = splitOllamaModelName(installed);
+      if (parts.base !== configuredParts.base) return false;
+      if (!configuredParts.tag && parts.tag === "latest") return true;
+      if (configuredParts.tag === "latest" && !parts.tag) return true;
+      return false;
+    }) ?? ""
+  );
+}
+
+export function isModelInInstalledList(
+  model: string | undefined | null,
+  installedModels: string[],
+): boolean {
+  return !!resolveInstalledModelName(model, installedModels);
+}
+
+/**
+ * The model name a runtime call should use right now. This differs from the
+ * raw persisted assignment in one important way: when a user configured
+ * `foo` and Ollama reports `foo:latest`, the call uses the installed name.
+ * Missing/offline/disabled features return an empty string so callers can
+ * block cleanly instead of issuing a doomed request.
+ */
+export function runnableModelForFeature(
+  feature: AiFeature,
+  s: Settings = useSettings.getState(),
+): string {
+  if (featureCapability(feature, s) !== "on") return "";
+  return resolveInstalledModelName(s[featureModelKey(feature)], s.installedModels);
 }
 
 /**
@@ -483,10 +572,9 @@ export function isModelInstalled(
  * should route their model labels through this so they never claim a
  * model is active when it isn't.
  *
- * Note: this is *not* what `ipc.ollamaChat` should send — backend callers
- * keep using the raw slot so the failure surfaces as a real error if the
- * user nuked their model mid-run. This helper is purely for read-only
- * display.
+ * Note: runtime callers that need the exact installed Ollama name should use
+ * `runnableModelForFeature`; this helper is the read-only display form and
+ * preserves the user's configured label.
  */
 export function effectiveAssignedModel(
   feature: AiFeature,
@@ -494,6 +582,19 @@ export function effectiveAssignedModel(
 ): string {
   const m = s[featureModelKey(feature)];
   return isModelInstalled(m, s) ? m : "";
+}
+
+function splitOllamaModelName(model: string): { base: string; tag: string } {
+  const trimmed = model.trim();
+  const slash = trimmed.lastIndexOf("/");
+  const colon = trimmed.lastIndexOf(":");
+  if (colon > slash) {
+    return {
+      base: trimmed.slice(0, colon),
+      tag: trimmed.slice(colon + 1),
+    };
+  }
+  return { base: trimmed, tag: "" };
 }
 
 /** Human-readable explanation of *why* a feature is not "on". Empty when the
@@ -541,6 +642,7 @@ function persist(
     indexingEnabled: s.indexingEnabled,
     ollamaAutostart: s.ollamaAutostart,
     fimDebounceMs: s.fimDebounceMs,
+    fimTriggerMode: s.fimTriggerMode,
     editorFontSize: s.editorFontSize,
     editorTabSize: s.editorTabSize,
     editorInsertSpaces: s.editorInsertSpaces,
@@ -559,5 +661,7 @@ function persist(
     appTheme: s.appTheme,
     treeSort: s.treeSort,
     gitInlineBlame: s.gitInlineBlame,
+    lspAutoStopEnabled: s.lspAutoStopEnabled,
+    lspAutoStopIdleMs: s.lspAutoStopIdleMs,
   });
 }

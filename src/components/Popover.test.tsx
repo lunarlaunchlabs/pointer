@@ -17,7 +17,7 @@
  * token, the z-index class) and the structural escape into body.
  */
 
-import { useRef, useState } from "react";
+import { useRef, useState } from "@/lib/preactSignalCompat";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { fireEvent, render, screen } from "@testing-library/react";
 import { Popover, type PopoverLayer } from "./Popover";

@@ -133,7 +133,12 @@ async function runAskProbe() {
     "Ask implicit App.jsx context",
     response,
     [/App\.jsx|App/i, /Header/i, /Counter/i, /useState|state|count/i],
-    [/do(?:n't| not) have access/i, /share (?:the )?contents/i, /switch to Agent mode/i],
+    [
+      /```/,
+      /do(?:n't| not) have access/i,
+      /share (?:the )?contents/i,
+      /switch to Agent mode/i,
+    ],
   );
   return response.trim();
 }

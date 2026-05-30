@@ -1,4 +1,4 @@
-import { create } from "zustand";
+import { create } from "@/lib/signalStore";
 
 /** Stores the file path the user marked via "Select for Compare". A
  *  second pick triggers the side-by-side diff and clears the slot.

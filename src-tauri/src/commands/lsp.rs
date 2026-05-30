@@ -1,11 +1,23 @@
 use crate::error::{AppError, AppResult};
 use crate::services::lsp::{
-    LanguageServerStatus, LspCompletionItem, LspCompletionResolveRequest, LspDocumentRequest,
-    LspDocumentSymbol, LspHover, LspLocation, LspTextDocumentRequest,
+    LanguageServerStatus, LspCompletionItem, LspCompletionResolveRequest, LspDocumentHighlight,
+    LspDocumentRequest, LspDocumentSymbol, LspFileTextEdit, LspHover, LspInlayHint,
+    LspInlayHintsRequest, LspLocation, LspRenameRequest, LspSignatureHelp, LspTextDocumentRequest,
+    StoppedLanguageServer,
 };
 use crate::state::AppState;
+use serde::Deserialize;
 use std::path::PathBuf;
 use tauri::{AppHandle, State};
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LspStopIdleRequest {
+    pub workspace: Option<String>,
+    pub stop_all: bool,
+    #[serde(default)]
+    pub languages: Vec<String>,
+}
 
 #[tauri::command]
 pub async fn lsp_status(
@@ -14,6 +26,18 @@ pub async fn lsp_status(
 ) -> AppResult<Vec<LanguageServerStatus>> {
     let root = resolve_workspace(&state, workspace)?;
     Ok(state.lsp.statuses(&root).await)
+}
+
+#[tauri::command]
+pub async fn lsp_stop_idle(
+    state: State<'_, AppState>,
+    request: LspStopIdleRequest,
+) -> AppResult<Vec<StoppedLanguageServer>> {
+    let root = resolve_workspace(&state, request.workspace)?;
+    Ok(state
+        .lsp
+        .stop_idle(&root, request.stop_all, &request.languages)
+        .await)
 }
 
 #[tauri::command]
@@ -124,6 +148,62 @@ pub async fn lsp_document_symbols(
     state
         .lsp
         .document_symbols(app, &root, doc)
+        .await
+        .map_err(AppError::Msg)
+}
+
+#[tauri::command]
+pub async fn lsp_signature_help(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    req: LspTextDocumentRequest,
+) -> AppResult<Option<LspSignatureHelp>> {
+    let root = resolve_workspace_for_path(&state, &req.path)?;
+    state
+        .lsp
+        .signature_help(app, &root, req)
+        .await
+        .map_err(AppError::Msg)
+}
+
+#[tauri::command]
+pub async fn lsp_document_highlight(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    req: LspTextDocumentRequest,
+) -> AppResult<Vec<LspDocumentHighlight>> {
+    let root = resolve_workspace_for_path(&state, &req.path)?;
+    state
+        .lsp
+        .document_highlight(app, &root, req)
+        .await
+        .map_err(AppError::Msg)
+}
+
+#[tauri::command]
+pub async fn lsp_inlay_hints(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    req: LspInlayHintsRequest,
+) -> AppResult<Vec<LspInlayHint>> {
+    let root = resolve_workspace_for_path(&state, &req.path)?;
+    state
+        .lsp
+        .inlay_hints(app, &root, req)
+        .await
+        .map_err(AppError::Msg)
+}
+
+#[tauri::command]
+pub async fn lsp_rename(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    req: LspRenameRequest,
+) -> AppResult<Vec<LspFileTextEdit>> {
+    let root = resolve_workspace_for_path(&state, &req.path)?;
+    state
+        .lsp
+        .rename(app, &root, req)
         .await
         .map_err(AppError::Msg)
 }

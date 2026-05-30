@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef } from "react";
+import { useEffect, useMemo, useRef } from "@/lib/preactSignalCompat";
 import type * as monaco from "monaco-editor";
 import { useBookmarks } from "@/store/bookmarks";
 

@@ -1,6 +1,6 @@
-import { useCallback, useEffect, useState } from "react";
-import { createPortal } from "react-dom";
-import { KeyRound, X } from "lucide-react";
+import { useCallback, useEffect, useState } from "@/lib/preactSignalCompat";
+import { createPortal } from "@/lib/preactSignalDomCompat";
+import { KeyRound, X } from "@/lib/lucide";
 
 type SecretPromptOptions = {
   title: string;

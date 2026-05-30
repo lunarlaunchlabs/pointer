@@ -21,7 +21,7 @@
  * occluded.
  */
 
-import { useState } from "react";
+import { useState } from "@/lib/preactSignalCompat";
 import { useRefactorSuggestions } from "@/store/refactorSuggestions";
 import { applyRenameAcrossWorkspace } from "@/lib/applyRename";
 

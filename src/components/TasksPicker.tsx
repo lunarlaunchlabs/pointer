@@ -1,7 +1,7 @@
-import { useEffect, useState } from "react";
+import { useEffect, useState } from "@/lib/preactSignalCompat";
 import { Command } from "cmdk";
-import { createPortal } from "react-dom";
-import { Play, Pencil, FilePlus2, Hammer } from "lucide-react";
+import { createPortal } from "@/lib/preactSignalDomCompat";
+import { Play, Pencil, FilePlus2, Hammer } from "@/lib/lucide";
 import {
   ensureWorkspaceTasksFile,
   loadWorkspaceTasks,

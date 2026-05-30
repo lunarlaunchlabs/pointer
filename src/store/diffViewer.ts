@@ -1,4 +1,4 @@
-import { create } from "zustand";
+import { create } from "@/lib/signalStore";
 
 /**
  * Active diff viewer state — when set, the editor area shows a Monaco

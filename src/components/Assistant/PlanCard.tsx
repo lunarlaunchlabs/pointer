@@ -13,8 +13,8 @@
  * with the streamed reasoning, but the Execute button only makes
  * sense for plan output.
  */
-import { useMemo } from "react";
-import { Play, Sparkles } from "lucide-react";
+import { useMemo } from "@/lib/preactSignalCompat";
+import { Play, Sparkles } from "@/lib/lucide";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import { latestPlanText, planStepCount } from "@/lib/assistantPlans";

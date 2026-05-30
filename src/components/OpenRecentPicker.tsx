@@ -1,6 +1,6 @@
 import { Command } from "cmdk";
-import { useEffect } from "react";
-import { Folder, FolderOpen, X } from "lucide-react";
+import { useEffect } from "@/lib/preactSignalCompat";
+import { Folder, FolderOpen, X } from "@/lib/lucide";
 import { useSession } from "@/store/session";
 
 /**

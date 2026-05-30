@@ -7,10 +7,11 @@ import {
   openE2EFile,
   paths,
   test,
+  writeE2EFile,
 } from "./fixtures/pointerApp";
 
 const languageCases = [
-  ["React TSX", paths.app, "tsx"],
+  ["React TSX", paths.app, "typescript"],
   ["TypeScript", paths.greeting, "typescript"],
   ["Node/Express JavaScript", paths.server, "javascript"],
   ["Python/FastAPI", paths.python, "python"],
@@ -66,6 +67,103 @@ test.describe("editor language intelligence", () => {
         return JSON.stringify(markers);
       })
       .toContain("E2E JSX prop type mismatch");
+  });
+
+  test("keeps inline JSX child text on the default foreground after cold boot", async ({
+    appPage: page,
+  }) => {
+    const jsxPath = paths.app.replace("/src/App.tsx", "/src/InlineJsxTextProbe.tsx");
+    await writeE2EFile(
+      page,
+      jsxPath,
+      [
+        "export function InlineJsxTextProbe() {",
+        "  return (",
+        "    <div className=\"ad-mockup-title\">",
+        "      sports<span>move</span> News",
+        "    </div>",
+        "  );",
+        "}",
+      ].join("\n"),
+    );
+    await openE2EFile(page, jsxPath);
+    await expect.poll(() => editorLanguage(page)).toBe("typescript");
+
+    await expect
+      .poll(
+        () =>
+          page.evaluate(() => {
+            const styles = window.__POINTER_E2E__?.editor?.tokenStylesForLine?.(4) ?? [];
+            const defaultColor = canonicalColor(
+              getComputedStyle(document.documentElement).getPropertyValue("--pn-code-fg"),
+            );
+            const prose = styles.filter((item) =>
+              ["sports", "move", "News"].some((word) => item.text.includes(word)),
+            );
+            return (
+              prose.length >= 3 &&
+              prose.every((item) => canonicalColor(item.color) === defaultColor)
+            );
+
+            function canonicalColor(value: string): string {
+              const raw = value.trim().toLowerCase();
+              const rgb = raw.match(/^rgba?\((\d+),\s*(\d+),\s*(\d+)/);
+              if (rgb) {
+                return [rgb[1], rgb[2], rgb[3]]
+                  .map((part) => Number(part).toString(16).padStart(2, "0"))
+                  .join("");
+              }
+              return raw.replace(/^#/, "").slice(0, 6);
+            }
+          }),
+        { timeout: 5000 },
+      )
+      .toBe(true);
+  });
+
+  test("marks missing dependencies across ecosystems without flagging installed packages", async ({
+    appPage: page,
+  }) => {
+    const cases = [
+      { path: paths.missingDepsTs, missing: "left-pad", installed: "react" },
+      { path: paths.missingDepsPython, missing: "requests", installed: "fastapi" },
+      { path: paths.missingDepsRust, missing: "anyhow", installed: "serde" },
+      {
+        path: paths.missingDepsGo,
+        missing: "github.com/labstack/echo/v4",
+        installed: "github.com/gin-gonic/gin",
+      },
+      {
+        path: paths.missingDepsJava,
+        missing: "org.apache.commons.lang3",
+        installed: "com.google.common",
+      },
+      { path: paths.missingDepsCsharp, missing: "Dapper", installed: "Newtonsoft" },
+      { path: paths.missingDepsPhp, missing: "GuzzleHttp", installed: "Monolog" },
+      { path: paths.missingDepsRuby, missing: "httparty", installed: "faraday" },
+      { path: paths.missingDepsDart, missing: "riverpod", installed: "http" },
+      { path: paths.missingDepsSwift, missing: "ArgumentParser", installed: "Alamofire" },
+    ];
+
+    for (const item of cases) {
+      await openE2EFile(page, item.path);
+      await expect
+        .poll(async () => {
+          const markers = await editorMarkers(page);
+          return JSON.stringify(
+            markers.filter((marker: { source?: string }) => marker.source === "pointer-deps"),
+          );
+        })
+        .toContain(item.missing);
+
+      const dependencyMarkers = await editorMarkers(page);
+      const serialized = JSON.stringify(
+        dependencyMarkers.filter(
+          (marker: { source?: string }) => marker.source === "pointer-deps",
+        ),
+      );
+      expect(serialized).not.toContain(item.installed);
+    }
   });
 
   test("shows LSP completion suggestions in Monaco", async ({ appPage: page }) => {

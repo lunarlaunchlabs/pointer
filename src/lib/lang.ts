@@ -42,17 +42,24 @@ const BASENAME: Record<string, string> = {
   ".stylelintrc": "json",
   ".swcrc": "json",
   ".dockerignore": "plaintext",
+  justfile: "makefile",
+  procfile: "shell",
+  jenkinsfile: "groovy",
   "license": "plaintext",
 };
 
 const EXT: Record<string, string> = {
   // JS/TS family
   ts: "typescript",
-  tsx: "tsx",
+  // Keep React files on Monaco's native JS/TS language ids. Monaco uses the
+  // file extension to parse JSX/TSX, while the language id determines whether
+  // the TypeScript worker supplies hover, completion, diagnostics, and
+  // definitions. Custom `tsx`/`jsx` ids give colour but no semantic service.
+  tsx: "typescript",
   cts: "typescript",
   mts: "typescript",
   js: "javascript",
-  jsx: "jsx",
+  jsx: "javascript",
   mjs: "javascript",
   cjs: "javascript",
   // Other web languages
@@ -103,7 +110,22 @@ const EXT: Record<string, string> = {
   cxx: "cpp",
   hpp: "cpp",
   hxx: "cpp",
-  zig: "rust", // close enough until monaco ships zig grammar
+  zig: "zig",
+  zon: "zig",
+  nix: "nix",
+  hs: "haskell",
+  lhs: "haskell",
+  erl: "erlang",
+  hrl: "erlang",
+  elm: "elm",
+  ml: "ocaml",
+  mli: "ocaml",
+  re: "ocaml",
+  rei: "ocaml",
+  cr: "crystal",
+  nim: "nim",
+  nims: "nim",
+  d: "d",
   // Scripts
   py: "python",
   pyi: "python",
@@ -112,12 +134,14 @@ const EXT: Record<string, string> = {
   php: "php",
   lua: "lua",
   pl: "perl",
+  pm: "perl",
   dart: "dart",
   ex: "elixir",
   exs: "elixir",
   jl: "julia",
   r: "r",
   rmd: "r",
+  rkt: "racket",
   // JVM
   java: "java",
   kt: "kotlin",
@@ -157,6 +181,10 @@ const EXT: Record<string, string> = {
   prisma: "prisma",
   sol: "solidity",
   wgsl: "wgsl",
+  styl: "stylus",
+  stylus: "stylus",
+  tex: "latex",
+  latex: "latex",
   qs: "qsharp",
   tsp: "typespec",
   sv: "system-verilog",

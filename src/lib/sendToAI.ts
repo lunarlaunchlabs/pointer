@@ -20,7 +20,7 @@
 
 import type { Reference } from "@/store/chat";
 import { useAssistant, type AssistantMode } from "@/store/assistant";
-import { useSettings } from "@/store/settings";
+import { runnableModelForFeature, useSettings } from "@/store/settings";
 import { useSession } from "@/store/session";
 import { useDiagnostics, type Diagnostic } from "@/store/diagnostics";
 import type { Breakpoint, DebugValue } from "@/store/debugger";
@@ -162,7 +162,10 @@ function stage(target: AiTarget, ref: Reference, what: string) {
   // a new session if the active one is busy keeps a chip from landing
   // mid-stream where the user can't see it.
   const settings = useSettings.getState();
-  const model = settings.chatModel;
+  const model =
+    mode === "agent" || mode === "plan"
+      ? runnableModelForFeature("agent", settings) || settings.agentModel
+      : runnableModelForFeature("chat", settings) || settings.chatModel;
   const active = assistant.getActive();
   if (!active || active.status === "running") {
     assistant.newSession({ mode, model });

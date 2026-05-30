@@ -1,4 +1,4 @@
-import { lazy, Suspense, useEffect, useState } from "react";
+import { lazy, Suspense, useEffect, useMemo, useState } from "@/lib/preactSignalCompat";
 import {
   Activity,
   Bot,
@@ -8,12 +8,13 @@ import {
   GitBranch,
   History,
   Settings2,
-} from "lucide-react";
+} from "@/lib/lucide";
 import { useSession, type DockView } from "@/store/session";
 import { useSettings, isFeatureUsable } from "@/store/settings";
 import { useGit } from "@/store/git";
 import { useAssistant } from "@/store/assistant";
 import { useDebuggerStore } from "@/store/debugger";
+import { useModelWorkflows } from "@/store/modelWorkflows";
 import { ipc, listenEvent, type InferenceSnapshot } from "@/lib/ipc";
 
 const AssistantView = lazy(() =>
@@ -43,6 +44,8 @@ const DebugPanel = lazy(() =>
   })),
 );
 
+const RETAINED_DOCK_VIEW_LIMIT = 2;
+
 /** The right-hand dock. A persistent rail with view buttons + an optionally-
  *  collapsible panel area. The rail is always visible so the user can never
  *  lose access to the Assistant, history, or AI settings.
@@ -56,9 +59,21 @@ export function RightDock() {
   const setDockView = useSession((s) => s.noteDockView);
   const chatWidth = useSession((s) => s.chatWidth);
   const noteChatWidth = useSession((s) => s.noteChatWidth);
-  const [mountedViews, setMountedViews] = useState<
-    Set<Exclude<DockView, null>>
-  >(() => (dockView ? new Set([dockView]) : new Set()));
+  const assistantPhase = useAssistant((s) => s.phase.kind);
+  const hasActiveCommitWorkflow = useModelWorkflows((s) =>
+    s.workflows.some((workflow) => workflow.kind === "git_commit"),
+  );
+  const hasActiveAssistantWorkflow = useModelWorkflows((s) =>
+    s.workflows.some(
+      (workflow) =>
+        workflow.kind === "assistant" ||
+        workflow.kind === "agent" ||
+        workflow.kind === "plan",
+    ),
+  );
+  const [recentViews, setRecentViews] = useState<Exclude<DockView, null>[]>(
+    () => (dockView ? [dockView] : []),
+  );
 
   // Hydrate the unified assistant store once. Migration from the
   // legacy chat/agent stores runs inside `init()` if needed.
@@ -74,20 +89,39 @@ export function RightDock() {
   };
   useEffect(() => {
     if (!dockView) return;
-    setMountedViews((current) => {
-      if (current.has(dockView)) return current;
-      const next = new Set(current);
-      next.add(dockView);
-      return next;
-    });
+    setRecentViews((current) =>
+      [dockView, ...current.filter((candidate) => candidate !== dockView)].slice(
+        0,
+        RETAINED_DOCK_VIEW_LIMIT,
+      ),
+    );
   }, [dockView]);
+  const mountedViews = useMemo(() => {
+    const next = new Set<Exclude<DockView, null>>();
+    if (panelOpen) {
+      for (const view of recentViews) next.add(view);
+    }
+    if (assistantPhase !== "idle" || hasActiveAssistantWorkflow) {
+      next.add("assistant");
+    }
+    if (hasActiveCommitWorkflow) {
+      next.add("scm");
+    }
+    return next;
+  }, [
+    assistantPhase,
+    hasActiveAssistantWorkflow,
+    hasActiveCommitWorkflow,
+    panelOpen,
+    recentViews,
+  ]);
   // Feature gates: the rail icon stays visible (so the user can see
   // it exists) but dims when chat isn't usable. Clicking still
   // opens the view, which renders a precise banner with the reason.
   const chatUsable = useSettings((s) => isFeatureUsable("chat", s));
 
   return (
-    <div className="h-full flex shrink-0 border-l border-noir-line/80 bg-noir-panel/92 backdrop-blur-xl shadow-[-1px_0_0_rgba(255,255,255,0.02)]">
+    <div className="h-full flex shrink-0 border-l border-noir-line/50 bg-noir-panel shadow-[-1px_0_0_rgba(0,0,0,0.28)]">
       {mountedViews.size > 0 && (
         <PanelContainer
           width={chatWidth ?? 420}
@@ -129,7 +163,7 @@ export function RightDock() {
         </PanelContainer>
       )}
       <nav
-        className="w-11 shrink-0 border-l border-noir-line/70 bg-noir-canvas/45 flex flex-col items-center py-2 gap-1"
+        className="w-11 shrink-0 border-l border-noir-line/45 bg-noir-canvas/45 flex flex-col items-center py-2 gap-1"
         aria-label="Right dock"
         role="tablist"
         aria-orientation="vertical"
@@ -341,7 +375,9 @@ function InferenceBadge() {
         });
     };
     refresh();
-    const id = window.setInterval(refresh, 1500);
+    // Event updates carry the real-time signal. The interval is only a
+    // recovery heartbeat for missed events or a renderer wake from sleep.
+    const id = window.setInterval(refresh, 10_000);
     return () => {
       alive = false;
       off?.();

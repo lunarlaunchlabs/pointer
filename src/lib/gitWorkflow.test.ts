@@ -116,6 +116,18 @@ describe("git workflow helpers", () => {
     expect(summary).toBe("Adds agent orchestrator and permission engine.");
   });
 
+  it("repairs grammar when path stripping removes a document subject", () => {
+    const summary = normalizeFileSummary(
+      "The README is updated to describe the SportsMove investor deck as a Vite-powered slide presentation.",
+      "README.md",
+      "modified",
+      "Updates sports move investor deck.",
+    );
+    expect(summary).toBe(
+      "Updates the SportsMove investor deck as a Vite-powered slide presentation.",
+    );
+  });
+
   it("rejects file summaries that leak unrelated paths", () => {
     const summary = normalizeFileSummary(
       "Updates src/lib/harnessCore.",
@@ -177,6 +189,20 @@ describe("git workflow helpers", () => {
         "+.loading-indicator-orbit { animation: spin; }",
       ),
     ).toBe("Updates loading indicator orbit.");
+  });
+
+  it("extracts concise prose intent from documentation diffs", () => {
+    expect(
+      fallbackSummaryFromDiff(
+        "README.md",
+        "modified",
+        [
+          "+SportsMove investor deck",
+          "+",
+          "+This deck presents the SportsMove thesis, founders, market structure, and appendix material.",
+        ].join("\n"),
+      ),
+    ).toBe("Updates sports move investor deck.");
   });
 
   it("does not treat CSS utility class strings as feature summaries", () => {

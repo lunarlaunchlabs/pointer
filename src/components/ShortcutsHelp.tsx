@@ -1,5 +1,5 @@
-import { useEffect, useMemo, useState } from "react";
-import { Search, X } from "lucide-react";
+import { useEffect, useMemo, useState } from "@/lib/preactSignalCompat";
+import { Search, X } from "@/lib/lucide";
 
 /**
  * Keyboard shortcuts cheat sheet. Single source of truth for the
@@ -84,6 +84,7 @@ const GROUPS: Group[] = [
       { keys: `${MOD} L`, label: "Toggle Assistant / send selection to Ask" },
       { keys: `${MOD} ${SHIFT} L`, label: "Send selection to Agent" },
       { keys: `${MOD} K`, label: "Inline edit (selection or current line)" },
+      { keys: `${MOD} ${SHIFT} Space`, label: "Request tab completion" },
       { keys: `${MOD} ${SHIFT} ,`, label: "AI control panel" },
     ],
   },

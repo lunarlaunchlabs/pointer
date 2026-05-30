@@ -1,5 +1,8 @@
 import type { Config } from "tailwindcss";
 
+const pn = (name: string, fallback: string) =>
+  `rgb(var(--pn-${name}-rgb, ${fallback}) / <alpha-value>)`;
+
 export default {
   content: ["./index.html", "./src/**/*.{ts,tsx}"],
   darkMode: "class",
@@ -11,19 +14,31 @@ export default {
         // fallbacks live in :root and body.pn-theme-light in
         // index.css; the values below are just the lookup keys.
         noir: {
-          canvas: "var(--pn-canvas)",
-          panel: "var(--pn-panel)",
-          chrome: "var(--pn-chrome)",
-          ridge: "var(--pn-ridge)",
-          line: "var(--pn-line)",
-          mute: "var(--pn-mute)",
-          text: "var(--pn-text)",
-          subtext: "var(--pn-subtext)",
-          accent: "var(--pn-accent)",
-          accentSoft: "#FF2D7E22",
-          ok: "var(--pn-ok)",
-          warn: "var(--pn-warn)",
-          err: "var(--pn-err)",
+          bg: pn("body-bg", "5 4 7"),
+          canvas: pn("canvas", "8 7 11"),
+          panel: pn("panel", "14 12 16"),
+          chrome: pn("chrome", "21 18 26"),
+          ridge: pn("ridge", "33 23 34"),
+          line: pn("line", "67 34 56"),
+          mute: pn("mute", "141 127 139"),
+          text: pn("text", "242 237 245"),
+          subtext: pn("subtext", "199 187 203"),
+          accent: pn("accent", "255 45 126"),
+          accentSoft: pn("accent", "255 45 126"),
+          ok: pn("ok", "124 232 183"),
+          warn: pn("warn", "255 211 122"),
+          err: pn("err", "255 92 134"),
+        },
+        pn: {
+          surface: pn("panel", "14 12 16"),
+          "surface-2": pn("chrome", "21 18 26"),
+          "surface-3": pn("ridge", "33 23 34"),
+          border: pn("line", "67 34 56"),
+          text: pn("text", "242 237 245"),
+          "text-muted": pn("mute", "141 127 139"),
+          danger: pn("err", "255 92 134"),
+          accent: pn("accent", "255 45 126"),
+          "accent-foreground": pn("canvas", "8 7 11"),
         },
       },
       fontFamily: {

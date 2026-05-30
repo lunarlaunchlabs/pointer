@@ -3,6 +3,8 @@ use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
+use crate::services::workspace_filter::workspace_walker;
+
 #[derive(Default, Clone, Serialize, Deserialize)]
 pub struct MerkleSnapshot {
     pub files: BTreeMap<PathBuf, String>,
@@ -45,11 +47,7 @@ impl MerkleSnapshot {
 
     pub fn build(root: &Path) -> Self {
         let mut files = BTreeMap::new();
-        let walker = ignore::WalkBuilder::new(root)
-            .git_ignore(true)
-            .ignore(true)
-            .hidden(false)
-            .build();
+        let walker = workspace_walker(root).build();
         for dent in walker.flatten() {
             if !dent.file_type().map(|t| t.is_file()).unwrap_or(false) {
                 continue;

@@ -3,8 +3,8 @@ import { languageFromPath } from "./lang";
 
 describe("languageFromPath", () => {
   it("recognises common code extensions", () => {
-    expect(languageFromPath("src/App.tsx")).toBe("tsx");
-    expect(languageFromPath("src/App.jsx")).toBe("jsx");
+    expect(languageFromPath("src/App.tsx")).toBe("typescript");
+    expect(languageFromPath("src/App.jsx")).toBe("javascript");
     expect(languageFromPath("src/app.js")).toBe("javascript");
     expect(languageFromPath("main.rs")).toBe("rust");
     expect(languageFromPath("module.py")).toBe("python");
@@ -59,6 +59,18 @@ describe("languageFromPath", () => {
     expect(languageFromPath("component.cshtml")).toBe("razor");
     expect(languageFromPath("types/main.tsp")).toBe("typespec");
     expect(languageFromPath("hdl/top.sv")).toBe("system-verilog");
+    expect(languageFromPath("src/main.zig")).toBe("zig");
+    expect(languageFromPath("flake.nix")).toBe("nix");
+    expect(languageFromPath("app/Main.hs")).toBe("haskell");
+    expect(languageFromPath("src/server.erl")).toBe("erlang");
+    expect(languageFromPath("src/Main.elm")).toBe("elm");
+    expect(languageFromPath("lib/parser.mli")).toBe("ocaml");
+    expect(languageFromPath("src/shard.cr")).toBe("crystal");
+    expect(languageFromPath("src/main.nim")).toBe("nim");
+    expect(languageFromPath("source/app.d")).toBe("d");
+    expect(languageFromPath("styles/app.styl")).toBe("stylus");
+    expect(languageFromPath("paper/main.tex")).toBe("latex");
+    expect(languageFromPath("lang/main.rkt")).toBe("racket");
   });
 
   it("falls back to plaintext on unknown extensions", () => {

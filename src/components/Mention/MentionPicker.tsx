@@ -11,7 +11,7 @@
  *     unit-testable in isolation and free of IPC noise.
  */
 
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "@/lib/preactSignalCompat";
 import {
   AlertCircle,
   Code2,
@@ -21,7 +21,7 @@ import {
   Search,
   ScrollText,
   Sparkles,
-} from "lucide-react";
+} from "@/lib/lucide";
 import {
   CATEGORY_REGISTRY,
   intentFromQuery,
@@ -35,6 +35,7 @@ import { rankFileCandidates } from "@/lib/mentionRanker";
 import { useRecentEdits } from "@/store/recentEdits";
 import { useEditorStore } from "@/store/editor";
 import { useDebuggerStore, type Breakpoint, type DebugValue } from "@/store/debugger";
+import { useWorkspace } from "@/store/workspace";
 
 export type MentionSelection =
   | { kind: "category"; category: MentionCategory; remainder: string }
@@ -149,6 +150,7 @@ export function MentionPicker({
   // user pulls up new files in adjacent tabs without re-typing.
   const recentEntries = useRecentEdits((s) => s.entries);
   const openTabs = useEditorStore((s) => s.tabs);
+  const workspaceRoot = useWorkspace((s) => s.root);
   const recentPaths = useMemo(
     () => recentEntries.map((e) => ({ path: e.path })),
     [recentEntries],
@@ -339,6 +341,18 @@ export function MentionPicker({
   // so the textarea doesn't also move the caret or insert a newline.
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
+      if (e.isComposing || e.keyCode === 229) return;
+      const target = e.target instanceof Node ? e.target : null;
+      const anchor = anchorRef.current;
+      const container = containerRef.current;
+      if (
+        target &&
+        anchor &&
+        target !== anchor &&
+        !container?.contains(target)
+      ) {
+        return;
+      }
       if (rows.length === 0) return;
       if (e.key === "ArrowDown") {
         e.preventDefault();
@@ -443,7 +457,7 @@ export function MentionPicker({
                 e.preventDefault();
                 commit(row);
               }}
-              className={`w-full text-left px-3 py-1.5 flex items-center gap-2 text-[12px] ${
+              className={`w-full text-left px-3 py-2 flex items-center gap-2 text-[12px] min-w-0 ${
                 selected
                   ? "bg-noir-accent/15 text-noir-text"
                   : "text-noir-text hover:bg-noir-ridge/60"
@@ -455,10 +469,16 @@ export function MentionPicker({
               title={
                 row.kind === "category" && row.disabled
                   ? row.disabledReason
+                  : row.kind === "file" || row.kind === "folder"
+                  ? row.path
                   : undefined
               }
             >
-              <RowBody row={row} attached={attached} />
+              <RowBody
+                row={row}
+                attached={attached}
+                workspaceRoot={workspaceRoot}
+              />
             </button>
           );
         })}
@@ -489,16 +509,18 @@ function dirname(p: string): string {
 function RowBody({
   row,
   attached,
+  workspaceRoot,
 }: {
   row: Row;
   attached: Reference[];
+  workspaceRoot: string | null;
 }) {
   if (row.kind === "category") {
     return (
       <>
         <span className="text-noir-accent shrink-0">{row.icon}</span>
-        <span className="font-mono text-[12px] text-noir-accent">{row.label}</span>
-        <span className="text-noir-mute text-[11px] truncate">
+        <span className="font-mono text-[12px] text-noir-accent shrink-0">{row.label}</span>
+        <span className="text-noir-mute text-[11px] truncate min-w-0">
           {row.description}
         </span>
       </>
@@ -508,10 +530,18 @@ function RowBody({
     const dup = attached.some(
       (r) => r.kind === "file" && r.path === row.path,
     );
+    const display = displayPath(row.path, workspaceRoot);
     return (
       <>
-        <FileIconFor name={row.path.split(/[\\/]/).pop() ?? ""} size={11} />
-        <span className="font-mono truncate">{row.path}</span>
+        <FileIconFor name={display.name} size={13} className="shrink-0" />
+        <span className="min-w-0 flex-1">
+          <span className="block truncate font-mono text-[12px] leading-4 text-noir-text">
+            {display.name}
+          </span>
+          <span className="block truncate font-mono text-[10.5px] leading-3 text-noir-mute">
+            {display.parent || "workspace root"}
+          </span>
+        </span>
         {dup && (
           <span className="ml-auto text-[10px] text-noir-mute shrink-0">attached</span>
         )}
@@ -519,11 +549,19 @@ function RowBody({
     );
   }
   if (row.kind === "folder") {
+    const display = displayPath(row.path, workspaceRoot);
     return (
       <>
-        <Folder size={11} className="text-noir-accent" />
-        <span className="font-mono truncate">{row.path}/</span>
-        <span className="text-noir-mute text-[10.5px] ml-auto">directory</span>
+        <Folder size={13} className="text-noir-accent shrink-0" />
+        <span className="min-w-0 flex-1">
+          <span className="block truncate font-mono text-[12px] leading-4 text-noir-text">
+            {display.name}/
+          </span>
+          <span className="block truncate font-mono text-[10.5px] leading-3 text-noir-mute">
+            {display.parent || "workspace root"}
+          </span>
+        </span>
+        <span className="text-noir-mute text-[10.5px] ml-auto shrink-0">folder</span>
       </>
     );
   }
@@ -618,4 +656,30 @@ function RowBody({
 
 function shorten(p: string): string {
   return p.split(/[\\/]/).slice(-2).join("/");
+}
+
+function basename(p: string): string {
+  const trimmed = p.replace(/[\\/]+$/, "");
+  const i = Math.max(trimmed.lastIndexOf("/"), trimmed.lastIndexOf("\\"));
+  return i === -1 ? trimmed : trimmed.slice(i + 1);
+}
+
+function displayPath(
+  path: string,
+  workspaceRoot: string | null,
+): { name: string; parent: string } {
+  const rel = relativeToRoot(path, workspaceRoot);
+  const name = basename(rel) || basename(path) || path;
+  return { name, parent: dirname(rel) };
+}
+
+function relativeToRoot(path: string, workspaceRoot: string | null): string {
+  if (!workspaceRoot) return path;
+  const normalizedPath = path.replace(/\\/g, "/");
+  const normalizedRoot = workspaceRoot.replace(/\\/g, "/").replace(/\/+$/, "");
+  if (normalizedPath === normalizedRoot) return basename(normalizedRoot);
+  if (normalizedPath.startsWith(normalizedRoot + "/")) {
+    return normalizedPath.slice(normalizedRoot.length + 1);
+  }
+  return path;
 }

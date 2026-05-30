@@ -1,7 +1,12 @@
-import { useEffect, useMemo, useRef, useState } from "react";
-import { AlertCircle, Loader2, Sparkles } from "lucide-react";
+import { useEffect, useMemo, useRef, useState } from "@/lib/preactSignalCompat";
+import { AlertCircle, Loader2, Sparkles } from "@/lib/lucide";
 import { ipc, listenEvent, newRequestId } from "@/lib/ipc";
-import { useSettings } from "@/store/settings";
+import {
+  featureBlockReason,
+  isFeatureUsable,
+  runnableModelForFeature,
+  useSettings,
+} from "@/store/settings";
 import { useEditorStore } from "@/store/editor";
 import { useDiagnostics, type Diagnostic } from "@/store/diagnostics";
 import { applyHunks, parseSearchReplace } from "@/lib/diff";
@@ -26,7 +31,9 @@ export function InlineEdit({
   const [streaming, setStreaming] = useState(false);
   const [partial, setPartial] = useState("");
   const [error, setError] = useState<string | null>(null);
-  const chatModel = useSettings((s) => s.chatModel);
+  const chatModel = useSettings(
+    (s) => runnableModelForFeature("inlineEdit", s) || s.chatModel,
+  );
   const active = useEditorStore((s) => s.getActive());
 
   // Diagnostics intersecting the current selection. When present, we
@@ -55,6 +62,13 @@ export function InlineEdit({
   const submit = async () => {
     const instruction = prompt.trim();
     if (!instruction || !active || streaming) return;
+    if (!isFeatureUsable("inlineEdit") || !chatModel) {
+      setError(
+        featureBlockReason("inlineEdit") ||
+          "Inline edit needs an installed chat model.",
+      );
+      return;
+    }
     setStreaming(true);
     streamBufferRef.current = "";
     setPartial("");

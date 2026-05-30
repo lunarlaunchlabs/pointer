@@ -1,5 +1,5 @@
-import { useMemo } from "react";
-import { ChevronRight, Folder } from "lucide-react";
+import { useMemo } from "@/lib/preactSignalCompat";
+import { ChevronRight, Folder } from "@/lib/lucide";
 import { useEditorStore } from "@/store/editor";
 import { useWorkspace } from "@/store/workspace";
 import { useSettings } from "@/store/settings";

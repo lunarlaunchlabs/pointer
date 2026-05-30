@@ -1,10 +1,11 @@
 import { DiffEditor, type Monaco } from "@monaco-editor/react";
 import type { editor } from "monaco-editor";
-import { useCallback, useRef } from "react";
-import { ArrowLeftRight, ExternalLink, X } from "lucide-react";
-import { POINTER_NOIR_ID } from "@/theme/pointer-noir";
+import { useCallback, useRef } from "@/lib/preactSignalCompat";
+import { ArrowLeftRight, ExternalLink, X } from "@/lib/lucide";
+import { setPointerMonacoTheme } from "@/lib/shikiMonaco";
 import { useDiffViewer } from "@/store/diffViewer";
 import { useEditorStore } from "@/store/editor";
+import { useSettings } from "@/store/settings";
 
 /**
  * Side-by-side diff viewer rendered in place of the regular Monaco
@@ -22,14 +23,16 @@ export function DiffView() {
   const spec = useDiffViewer((s) => s.spec);
   const close = useDiffViewer((s) => s.close);
   const openFile = useEditorStore((s) => s.openFile);
+  const appTheme = useSettings((s) => s.appTheme);
   const editorRef = useRef<editor.IStandaloneDiffEditor | null>(null);
   const swapRef = useRef(false);
 
   const onMount = useCallback(
-    (e: editor.IStandaloneDiffEditor, _m: Monaco) => {
+    (e: editor.IStandaloneDiffEditor, m: Monaco) => {
       editorRef.current = e;
+      setPointerMonacoTheme(m, appTheme);
     },
-    [],
+    [appTheme],
   );
 
   if (!spec) return null;
@@ -94,7 +97,8 @@ export function DiffView() {
           original={original}
           modified={modified}
           language={spec.language || "plaintext"}
-          theme={POINTER_NOIR_ID}
+          theme={appTheme}
+          beforeMount={(monaco) => setPointerMonacoTheme(monaco, appTheme)}
           onMount={onMount}
           options={{
             readOnly: spec.readOnly,

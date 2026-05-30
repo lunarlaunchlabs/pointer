@@ -1,6 +1,6 @@
 use crate::error::{AppError, AppResult};
+use crate::services::workspace_filter::{path_has_noise_component_under, workspace_walker};
 use crate::state::AppState;
-use ignore::WalkBuilder;
 use notify::{RecommendedWatcher, RecursiveMode, Watcher};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
@@ -47,6 +47,42 @@ fn dunce_like_canonicalize(p: &Path) -> AppResult<PathBuf> {
     }
 }
 
+fn destination_within(workspace: &Path, target: &Path) -> AppResult<PathBuf> {
+    let workspace = dunce_like_canonicalize(workspace).unwrap_or_else(|_| workspace.to_path_buf());
+    let abs = if target.is_absolute() {
+        target.to_path_buf()
+    } else {
+        workspace.join(target)
+    };
+    let parent = abs
+        .parent()
+        .ok_or_else(|| AppError::Msg(format!("invalid destination: {}", abs.display())))?;
+    let parent = std::fs::canonicalize(parent)?;
+    if !parent.starts_with(&workspace) {
+        return Err(AppError::Forbidden(abs.display().to_string()));
+    }
+    let name = abs
+        .file_name()
+        .ok_or_else(|| AppError::Msg(format!("invalid destination: {}", abs.display())))?;
+    Ok(parent.join(name))
+}
+
+fn copy_dir_recursive(from: &Path, to: &Path) -> AppResult<()> {
+    std::fs::create_dir_all(to)?;
+    for entry in std::fs::read_dir(from)? {
+        let entry = entry?;
+        let src = entry.path();
+        let dst = to.join(entry.file_name());
+        let md = entry.metadata()?;
+        if md.is_dir() {
+            copy_dir_recursive(&src, &dst)?;
+        } else {
+            std::fs::copy(&src, &dst)?;
+        }
+    }
+    Ok(())
+}
+
 #[tauri::command]
 pub async fn read_workspace_tree(
     state: State<'_, AppState>,
@@ -68,12 +104,7 @@ pub async fn read_workspace_tree(
     let root = std::fs::canonicalize(&root).unwrap_or(root);
 
     let mut out: Vec<FsEntry> = Vec::new();
-    let walker = WalkBuilder::new(&root)
-        .max_depth(Some(1))
-        .git_ignore(true)
-        .ignore(true)
-        .hidden(false)
-        .build();
+    let walker = workspace_walker(&root).max_depth(Some(1)).build();
     for dent in walker.flatten() {
         if dent.path() == root {
             continue;
@@ -211,6 +242,39 @@ pub async fn rename_path(state: State<'_, AppState>, from: String, to: String) -
     Ok(())
 }
 
+#[tauri::command]
+pub async fn copy_path(state: State<'_, AppState>, from: String, to: String) -> AppResult<()> {
+    let ws = state.workspace.lock().clone();
+    let (source, dest) = match ws {
+        Some(w) => (
+            canonical_within(&w, Path::new(&from))?,
+            destination_within(&w, Path::new(&to))?,
+        ),
+        None => (PathBuf::from(&from), PathBuf::from(&to)),
+    };
+    let md = std::fs::metadata(&source)?;
+    if dest.exists() {
+        return Err(AppError::Msg(format!(
+            "destination already exists: {}",
+            dest.display()
+        )));
+    }
+    if md.is_dir() {
+        if dest.starts_with(&source) {
+            return Err(AppError::Msg(
+                "cannot copy a folder into itself".to_string(),
+            ));
+        }
+        copy_dir_recursive(&source, &dest)?;
+    } else {
+        if let Some(parent) = dest.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        std::fs::copy(&source, &dest)?;
+    }
+    Ok(())
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 pub struct FileHit {
     pub path: String,
@@ -232,11 +296,7 @@ pub async fn search_files(
     let limit = limit.unwrap_or(50);
     let mut hits = Vec::new();
 
-    let walker = WalkBuilder::new(&root)
-        .git_ignore(true)
-        .ignore(true)
-        .hidden(false)
-        .build();
+    let walker = workspace_walker(&root).build();
 
     for dent in walker.flatten() {
         if !dent.file_type().map(|t| t.is_file()).unwrap_or(false) {
@@ -283,11 +343,7 @@ pub async fn search_directories(
     let limit = limit.unwrap_or(50);
     let mut hits = Vec::new();
 
-    let walker = WalkBuilder::new(&root)
-        .git_ignore(true)
-        .ignore(true)
-        .hidden(false)
-        .build();
+    let walker = workspace_walker(&root).build();
 
     for dent in walker.flatten() {
         if !dent.file_type().map(|t| t.is_dir()).unwrap_or(false) {
@@ -403,11 +459,7 @@ pub async fn search_text(
     };
 
     let mut hits = Vec::new();
-    let walker = WalkBuilder::new(&root)
-        .git_ignore(true)
-        .ignore(true)
-        .hidden(false)
-        .build();
+    let walker = workspace_walker(&root).build();
     'outer: for dent in walker.flatten() {
         if hits.len() >= limit {
             break;
@@ -535,11 +587,7 @@ pub async fn replace_text(
 
     let mut files_changed = 0u32;
     let mut replacements = 0u32;
-    let walker = WalkBuilder::new(&root)
-        .git_ignore(true)
-        .ignore(true)
-        .hidden(false)
-        .build();
+    let walker = workspace_walker(&root).build();
     for dent in walker.flatten() {
         if !dent.file_type().map(|t| t.is_file()).unwrap_or(false) {
             continue;
@@ -678,8 +726,12 @@ pub async fn watch_workspace(
                     let paths: Vec<String> = event
                         .paths
                         .into_iter()
+                        .filter(|p| !path_has_noise_component_under(&path_buf, p))
                         .map(|p| p.display().to_string())
                         .collect();
+                    if paths.is_empty() {
+                        continue;
+                    }
                     let kind = format!("{:?}", event.kind);
                     let _ = app_handle.emit(
                         "fs:change",

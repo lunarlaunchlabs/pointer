@@ -15,9 +15,10 @@ describe("fileNavigation", () => {
     });
   });
 
-  it("ignores package imports that are not files", () => {
+  it("recognises package imports without treating ordinary strings as files", () => {
     const line = `import React from "react";`;
-    expect(extractPathTarget(line, line.indexOf("react") + 2)).toBeNull();
+    expect(extractPathTarget(`const name = "react";`, 15)).toBeNull();
+    expect(extractPathTarget(line, line.indexOf("react") + 2)?.raw).toBe("react");
   });
 
   it("expands extensionless relative imports like modern JS tooling", () => {
@@ -101,5 +102,116 @@ describe("fileNavigation", () => {
         p === "/repo/public/export-theme-switcher.js" ? "file" : null,
     });
     expect(resolved?.path).toBe("/repo/public/export-theme-switcher.js");
+  });
+
+  it("resolves bare package imports into node_modules only in import-like contexts", async () => {
+    const line = `import React from "react";`;
+    const target = extractPathTarget(line, line.indexOf("react") + 2)!;
+    const resolved = await resolvePathTarget({
+      target,
+      sourcePath: "/repo/src/App.tsx",
+      workspaceRoot: "/repo",
+      exists: async (p) =>
+        p === "/repo/node_modules/react/package.json" ? "file" : null,
+    });
+    expect(resolved?.path).toBe("/repo/node_modules/react/package.json");
+
+    const scoped = candidatePaths("@scope/pkg/sub/module", "/repo/src/App.ts", "/repo");
+    expect(scoped).toContain("/repo/node_modules/@scope/pkg/sub/module.ts");
+  });
+
+  it("resolves project path aliases from tsconfig paths", async () => {
+    const target = extractPathTarget(`import { api } from "@domain/api/client"`, 22)!;
+    const resolved = await resolvePathTarget({
+      target,
+      sourcePath: "/repo/apps/web/src/App.tsx",
+      workspaceRoot: "/repo",
+      readTextFile: async (p) => {
+        if (p === "/repo/tsconfig.json") {
+          return JSON.stringify({
+            compilerOptions: {
+              baseUrl: ".",
+              paths: {
+                "@domain/*": ["packages/domain/src/*"],
+              },
+            },
+          });
+        }
+        throw new Error("missing");
+      },
+      exists: async (p) =>
+        p === "/repo/packages/domain/src/api/client.ts" ? "file" : null,
+    });
+
+    expect(resolved?.path).toBe("/repo/packages/domain/src/api/client.ts");
+  });
+
+  it("resolves package imports from package.json imports maps", async () => {
+    const line = `import shared from "#shared/colors"`;
+    const target = extractPathTarget(line, line.indexOf("#shared") + 2)!;
+    const resolved = await resolvePathTarget({
+      target,
+      sourcePath: "/repo/src/theme.ts",
+      workspaceRoot: "/repo",
+      readTextFile: async (p) => {
+        if (p === "/repo/package.json") {
+          return JSON.stringify({
+            imports: {
+              "#shared/*": "./packages/shared/src/*",
+            },
+          });
+        }
+        throw new Error("missing");
+      },
+      exists: async (p) =>
+        p === "/repo/packages/shared/src/colors.ts" ? "file" : null,
+    });
+
+    expect(resolved?.path).toBe("/repo/packages/shared/src/colors.ts");
+  });
+
+  it("resolves resolver aliases declared in build configs", async () => {
+    const line = `import Button from "~ui/Button"`;
+    const target = extractPathTarget(line, line.indexOf("~ui") + 2)!;
+    const resolved = await resolvePathTarget({
+      target,
+      sourcePath: "/repo/src/App.tsx",
+      workspaceRoot: "/repo",
+      readTextFile: async (p) => {
+        if (p === "/repo/vite.config.ts") {
+          return `export default { resolve: { alias: { "~ui": path.resolve(__dirname, "src/ui") } } }`;
+        }
+        throw new Error("missing");
+      },
+      exists: async (p) => (p === "/repo/src/ui/Button.tsx" ? "file" : null),
+    });
+
+    expect(resolved?.path).toBe("/repo/src/ui/Button.tsx");
+  });
+
+  it("uses package exports before falling back to package.json", async () => {
+    const target = extractPathTarget(`import { createRoot } from "react-dom/client"`, 31)!;
+    const resolved = await resolvePathTarget({
+      target,
+      sourcePath: "/repo/src/App.tsx",
+      workspaceRoot: "/repo",
+      readTextFile: async (p) => {
+        if (p === "/repo/node_modules/react-dom/package.json") {
+          return JSON.stringify({
+            exports: {
+              "./client": {
+                types: "./client.d.ts",
+                default: "./client.js",
+              },
+            },
+          });
+        }
+        throw new Error("missing");
+      },
+      exists: async (p) =>
+        p === "/repo/node_modules/react-dom/client.d.ts" ? "file" : null,
+    });
+
+    expect(resolved?.path).toBe("/repo/node_modules/react-dom/client.d.ts");
   });
 });

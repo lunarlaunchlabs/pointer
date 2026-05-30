@@ -23,7 +23,7 @@
  * may consult it, so we don't want async IO in the hot path.
  */
 
-import { create } from "zustand";
+import { create } from "@/lib/signalStore";
 
 export type RecentEntry = {
   path: string;

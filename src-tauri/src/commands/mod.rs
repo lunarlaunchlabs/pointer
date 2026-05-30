@@ -1,5 +1,6 @@
 pub mod agent;
 pub mod agent_changes;
+pub mod app_icon;
 pub mod app_state;
 pub mod assistant;
 pub mod context;
